@@ -38,6 +38,8 @@ _HEADLINE = re.compile(
     r"^(?:[A-Za-z_][\w.]*(?:Error|Exception)|Error|Exception|panic:|fatal error:)",
     re.IGNORECASE,
 )
+_PIP_ERROR = re.compile(r"^ERROR:", re.IGNORECASE)
+_TRACEBACK_HINT = re.compile(r'File "|Traceback|(?:^|\s)at\s')
 _ELIDE = "… {n} frames elided …"
 
 
@@ -158,7 +160,7 @@ def _stack_traces(lines: list[str]) -> list[StackTrace]:
             ):
                 frames.append(physical)
                 continue
-            if _HEADLINE.match(physical.strip()):
+            if _is_stack_headline(physical):
                 headline = physical.strip()
                 if frames:
                     frames.append(physical)
@@ -172,6 +174,16 @@ def _stack_traces(lines: list[str]) -> list[StackTrace]:
 
 def _is_frame(line: str) -> bool:
     return _FRAME.match(line) is not None
+
+
+def _is_stack_headline(line: str) -> bool:
+    stripped = line.strip()
+    if not _HEADLINE.match(stripped):
+        return False
+    # pip "ERROR: No matching distribution..." is not a traceback.
+    if _PIP_ERROR.match(stripped) and not _TRACEBACK_HINT.search(stripped):
+        return False
+    return True
 
 
 def _truncate(headline: str | None, frames: list[str]) -> StackTrace:

@@ -43,6 +43,21 @@ def test_dependency() -> None:
     assert hit.matched_line == 2
 
 
+def test_pip_no_matching_distribution() -> None:
+    lines = [
+        "Collecting this-package-does-not-exist-9f3a",
+        "  Downloading <unavailable>",
+        "ERROR: Could not find a version that satisfies the requirement this-package-does-not-exist-9f3a (from versions: none)",
+        "ERROR: No matching distribution found for this-package-does-not-exist-9f3a",
+        "##[error]Process completed with exit code 1.",
+        "Post job cleanup",
+    ]
+    hit = classify_lines(lines)
+    assert hit.category == "dependency"
+    assert hit.confidence in {"medium", "high"}
+    assert hit.is_infra_vs_code == "code"
+
+
 def test_infra_runner_pattern() -> None:
     raw = "The runner has received a shutdown signal\nmore log\n"
     hit = check_runner_health(

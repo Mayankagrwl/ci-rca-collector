@@ -23,7 +23,7 @@ _CODE_CATEGORIES = frozenset({"dependency", "compile", "test_failure", "crash"})
 
 _RUNNER_RES = [re.compile(p, re.IGNORECASE) for p in RUNNER_FAILURE_PATTERNS]
 _RULE_RES = [
-    (rule["category"], re.compile(rule["pattern"]), rule["confidence"])
+    (rule["category"], re.compile(rule["pattern"], re.IGNORECASE), rule["confidence"])
     for rule in CLASSIFY_RULES
 ]
 

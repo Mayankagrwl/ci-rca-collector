@@ -82,6 +82,31 @@ CLASSIFY_RULES: list[ClassifyRule] = [
     {"category": "dependency", "pattern": r"ModuleNotFoundError", "confidence": "high"},
     {"category": "dependency", "pattern": r"go: .* not found", "confidence": "high"},
     {"category": "dependency", "pattern": r"Could not find artifact", "confidence": "high"},
+    {
+        "category": "dependency",
+        "pattern": r"Could not find a version that satisfies the requirement",
+        "confidence": "high",
+    },
+    {
+        "category": "dependency",
+        "pattern": r"Could not find a version that satisfies",
+        "confidence": "high",
+    },
+    {
+        "category": "dependency",
+        "pattern": r"No matching distribution found",
+        "confidence": "high",
+    },
+    {
+        "category": "dependency",
+        "pattern": r"ERROR: No matching distribution",
+        "confidence": "high",
+    },
+    {
+        "category": "dependency",
+        "pattern": r"pip: command not found",
+        "confidence": "medium",
+    },
     {"category": "network_dns", "pattern": r"Could not resolve host", "confidence": "high"},
     {"category": "network_dns", "pattern": r"Temporary failure in name resolution", "confidence": "high"},
     {"category": "network_dns", "pattern": r"ECONNREFUSED", "confidence": "high"},
