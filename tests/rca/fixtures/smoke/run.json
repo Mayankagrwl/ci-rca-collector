@@ -1,0 +1,13 @@
+{
+  "id": 1,
+  "name": "CI",
+  "html_url": "https://github.com/example/demo/actions/runs/1",
+  "event": "push",
+  "status": "completed",
+  "conclusion": "failure",
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "head_branch": "main",
+  "run_attempt": 1,
+  "actor": { "login": "tester" },
+  "pull_requests": []
+}

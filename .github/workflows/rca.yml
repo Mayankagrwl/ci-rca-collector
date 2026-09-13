@@ -1,0 +1,61 @@
+name: RCA Collect (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      run-id:        { required: true,  type: string }
+      workflow-name: { required: true,  type: string }
+      conclusion:    { required: true,  type: string }
+      head-branch:   { required: false, type: string, default: '' }
+      default-branch:{ required: false, type: string, default: 'main' }
+      runs-on:       { required: false, type: string, default: 'ubuntu-latest' }
+    outputs:
+      category:      { value: ${{ jobs.collect.outputs.category }} }
+      fingerprint:   { value: ${{ jobs.collect.outputs.fingerprint }} }
+      is-flaky:      { value: ${{ jobs.collect.outputs.is-flaky }} }
+      requires-analysis: { value: ${{ jobs.collect.outputs.requires-analysis }} }
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    outputs:
+      category: ${{ steps.rca.outputs.category }}
+      fingerprint: ${{ steps.rca.outputs.fingerprint }}
+      is-flaky: ${{ steps.rca.outputs.is-flaky }}
+      requires-analysis: ${{ steps.rca.outputs.requires-analysis }}
+    steps:
+      - name: Restore Drain3 baseline
+        uses: actions/cache@v4
+        with:
+          path: .drain/
+          key: drain3-${{ inputs.workflow-name }}-${{ inputs.run-id }}
+          restore-keys: drain3-${{ inputs.workflow-name }}-
+
+      - name: Restore fingerprint history
+        uses: actions/cache@v4
+        with:
+          path: .rca-history/
+          key: rca-history-${{ inputs.run-id }}
+          restore-keys: rca-history-
+
+      - name: Collect
+        id: rca
+        # Pin to this action repository (same ref as the workflow_call).
+        uses: acme/ci-rca-collector@v1
+        with:
+          run-id: ${{ inputs.run-id }}
+          mode: ${{ inputs.conclusion == 'success' && 'train' || 'collect' }}
+          github-api-url: ''
+
+      - name: Upload artifact
+        if: inputs.conclusion == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rca-${{ inputs.run-id }}
+          path: rca/
+          retention-days: 30

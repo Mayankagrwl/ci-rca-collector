@@ -1,0 +1,47 @@
+"""Composite action contract (Slice C)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+ACTION = (ROOT / "action.yml").read_text(encoding="utf-8")
+
+
+def test_action_yml_has_host_overrides_empty_by_default() -> None:
+    assert "github-api-url:" in ACTION
+    assert "github-server-url:" in ACTION
+    assert "default: ''" in ACTION
+
+
+def test_action_yml_forwards_host_and_token_env() -> None:
+    assert "GITHUB_TOKEN: ${{ inputs.github-token }}" in ACTION
+    assert "COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}" in ACTION
+    assert "GITHUB_API_URL: ${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}" in ACTION
+    assert "GITHUB_SERVER_URL: ${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}" in ACTION
+    assert "RCA_GITHUB_API_URL: ${{ inputs.github-api-url }}" in ACTION
+    assert "RCA_GITHUB_HOST: ${{ inputs.github-server-url }}" in ACTION
+    assert "PYTHONPATH: ${{ github.action_path }}" in ACTION
+    assert "$GITHUB_ACTION_PATH" in ACTION
+
+
+def test_action_yml_does_not_checkout_or_hardcode_hosts() -> None:
+    assert "actions/checkout" not in ACTION
+    assert "github.st.com" not in ACTION
+    assert "api.github.com" not in ACTION
+
+
+def test_run_steps_declare_bash() -> None:
+    # Composite `run:` steps must set shell. `uses:` steps cannot.
+    assert ACTION.count("shell: bash") >= 3
+    assert "python --version" in ACTION
+    assert "pip --version" in ACTION
+
+
+def test_reusable_workflow_exists() -> None:
+    text = (ROOT / ".github" / "workflows" / "rca.yml").read_text(encoding="utf-8")
+    assert "workflow_call" in text
+    assert ".drain/" in text
+    assert ".rca-history/" in text
+    assert "github.st.com" not in text
+    assert "api.github.com" not in text

@@ -1,0 +1,52 @@
+name: Self-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          python --version
+          pip --version
+          pip install --disable-pip-version-check -r requirements.txt pytest
+
+      - name: Unit tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/rca -q
+
+      - name: Collect from fixtures
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for d in tests/rca/fixtures/*; do
+            if [ ! -d "$d" ] || [ ! -f "$d/run.json" ]; then
+              continue
+            fi
+            name="$(basename "$d")"
+            echo "collect --from-fixture $d"
+            python -m tools.rca.cli collect \
+              --from-fixture "$d" \
+              --out "rca-out/$name" \
+              --history-backend none
+            test -f "rca-out/$name/summary.json"
+            test -f "rca-out/$name/summary.md"
+          done

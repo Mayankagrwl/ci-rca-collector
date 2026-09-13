@@ -1,0 +1,38 @@
+{
+  "jobs": [
+    {
+      "id": 77,
+      "name": "build (node-20)",
+      "conclusion": "failure",
+      "created_at": "2026-09-08T12:30:00Z",
+      "started_at": "2026-09-08T12:30:08Z",
+      "completed_at": "2026-09-08T12:32:22Z",
+      "runner_name": "arc-linux-xl",
+      "runner_group_name": "default",
+      "labels": ["self-hosted", "linux"],
+      "steps": [
+        {
+          "number": 1,
+          "name": "Set up job",
+          "conclusion": "success",
+          "started_at": "2026-09-08T12:30:08Z",
+          "completed_at": "2026-09-08T12:30:11Z"
+        },
+        {
+          "number": 2,
+          "name": "Restore node_modules cache",
+          "conclusion": "success",
+          "started_at": "2026-09-08T12:30:11.000Z",
+          "completed_at": "2026-09-08T12:30:11.400Z"
+        },
+        {
+          "number": 3,
+          "name": "Install dependencies",
+          "conclusion": "failure",
+          "started_at": "2026-09-08T12:30:12Z",
+          "completed_at": "2026-09-08T12:32:20Z"
+        }
+      ]
+    }
+  ]
+}

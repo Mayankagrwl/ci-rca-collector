@@ -1,0 +1,18 @@
+{
+  "id": 4821,
+  "run_attempt": 1,
+  "name": "CI",
+  "html_url": "https://github.com/acme/widgets/actions/runs/4821",
+  "event": "pull_request",
+  "actor": {"login": "dsharma"},
+  "head_sha": "a3f9c21deadbeef",
+  "head_branch": "feature/parser-rewrite",
+  "pull_requests": [
+    {
+      "number": 418,
+      "html_url": "https://github.com/acme/widgets/pull/418"
+    }
+  ],
+  "repository": {"full_name": "acme/widgets"},
+  "head_repository": {"full_name": "acme/widgets", "fork": false}
+}

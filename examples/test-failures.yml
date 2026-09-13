@@ -1,0 +1,126 @@
+# Optional dogfood workflow for a consuming repo.
+# Copy to .github/workflows/test-failures.yml — not enabled in this action repo.
+name: Test Failure Scenarios
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        type: choice
+        options: [compile, test, dependency, oom, timeout, disk, network, crash, baseline, noisy, depleted, secrets, all]
+        default: all
+
+jobs:
+  compile:
+    if: contains(fromJSON('["compile","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat > bad.py <<'EOF'
+          def broken(
+          EOF
+          python bad.py
+
+  test:
+    if: contains(fromJSON('["test","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: pip install pytest
+      - run: |
+          mkdir -p t && cat > t/test_x.py <<'EOF'
+          def test_pass(): assert True
+          def test_fail(): assert [1,2] == [1,2,3], "list mismatch"
+          def test_raise(): raise ValueError("boom in nested call")
+          EOF
+      - run: pytest t/ --junitxml=junit.xml
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: test-results, path: junit.xml }
+
+  dependency:
+    if: contains(fromJSON('["dependency","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: pip install this-package-does-not-exist-9f3a
+
+  oom:
+    if: contains(fromJSON('["oom","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          python -c "x=[]
+          while True: x.append(' ' * 10_000_000)"
+
+  timeout:
+    if: contains(fromJSON('["timeout","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: sleep 300
+
+  disk:
+    if: contains(fromJSON('["disk","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: fallocate -l 200G /tmp/big || dd if=/dev/zero of=/tmp/big bs=1M
+
+  network:
+    if: contains(fromJSON('["network","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl --fail --max-time 10 https://this-host-does-not-exist-9f3a.invalid/
+
+  crash:
+    if: contains(fromJSON('["crash","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat > c.go <<'EOF'
+          package main
+          func main() { var p *int; _ = *p }
+          EOF
+          go run c.go
+
+  baseline:
+    # Passes on purpose. Trains Drain3 so `noisy` has a healthy shape to diff.
+    # Run this on main BEFORE noisy.
+    if: contains(fromJSON('["baseline","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          for i in $(seq 1 20000); do echo "INFO processing record $i of 20000 [ok]"; done
+          for i in $(seq 1 5000); do echo "INFO cleanup task $i complete"; done
+          echo "INFO run complete, 0 errors"
+
+  noisy:
+    if: contains(fromJSON('["noisy","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          for i in $(seq 1 20000); do echo "INFO processing record $i of 20000 [ok]"; done
+          echo "Exception: Connection refused to db-7f9c2:5432"
+          for d in 1 2 4 8 16 30 30 30 30 30 30 30 30 30; do echo "Retrying connection in ${d}s"; done
+          echo "ERROR failed to flush buffer: connection reset by peer"
+          for i in $(seq 1 5000); do echo "INFO cleanup task $i complete"; done
+          exit 1
+
+  depleted:
+    if: contains(fromJSON('["depleted","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for i in $(seq 1 1000); do echo "INFO processing record $i of 20000 [ok]"; done
+          echo "ERROR failed to flush buffer: connection reset by peer"
+          exit 1
+
+  secrets:
+    if: contains(fromJSON('["secrets","all"]'), inputs.scenario)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "Calling API with Authorization: Bearer sk-live-abc123def456"
+          echo "connecting user=admin password=hunter2 host=db.internal"
+          echo "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
+          exit 1

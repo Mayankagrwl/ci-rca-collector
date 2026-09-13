@@ -1,0 +1,4 @@
+﻿2026-09-12T12:00:10.0000000Z ##[group]Run pip install
+2026-09-12T12:00:11.0000000Z npm ERR! code ERESOLVE
+2026-09-12T12:00:12.0000000Z npm ERR! ERESOLVE could not resolve
+2026-09-12T12:00:13.0000000Z ##[error]Process completed with exit code 1.

@@ -1,0 +1,173 @@
+name: 'CI Failure Context Collector'
+description: 'Collects and summarises GitHub Actions failure context for root-cause analysis.'
+author: 'acme'
+
+branding:
+  icon: 'search'
+  color: 'orange'
+
+inputs:
+  run-id:
+    description: 'Workflow run ID to analyse. Usually github.event.workflow_run.id.'
+    required: true
+  repository:
+    description: 'owner/repo to analyse.'
+    required: false
+    default: ${{ github.repository }}
+  mode:
+    description: 'collect | train. "train" builds the Drain3 baseline from a successful run.'
+    required: false
+    default: 'collect'
+  github-token:
+    description: 'Token with actions:read and contents:read.'
+    required: false
+    default: ${{ github.token }}
+  github-api-url:
+    description: 'Override GitHub REST API base. Leave empty to use GITHUB_API_URL / autodetect.'
+    required: false
+    default: ''
+  github-server-url:
+    description: 'Override GitHub server URL. Leave empty to use GITHUB_SERVER_URL / autodetect.'
+    required: false
+    default: ''
+  output-dir:
+    description: 'Directory for summary.json and summary.md, relative to the workspace.'
+    required: false
+    default: 'rca'
+  token-budget:
+    description: 'Total evidence token budget. See §8.'
+    required: false
+    default: '6000'
+  drain-cache-dir:
+    description: 'Drain3 baseline state directory. Caller is responsible for caching it.'
+    required: false
+    default: '.drain'
+  history-dir:
+    description: 'Fingerprint history directory, used by the cache backend. Caller caches it.'
+    required: false
+    default: '.rca-history'
+  history-backend:
+    description: 'Where failure memory is stored: cache | issues | redis | none. See §10.4.'
+    required: false
+    default: 'cache'
+  history-redis-url:
+    description: 'Connection URL when history-backend is redis. Pass via a secret.'
+    required: false
+    default: ''
+  python-version:
+    description: 'Python to set up. Ignored when setup-python is false.'
+    required: false
+    default: '3.12'
+  setup-python:
+    description: 'Set false on self-hosted images that already ship a suitable Python.'
+    required: false
+    default: 'true'
+  write-job-summary:
+    description: 'Append summary.md to $GITHUB_STEP_SUMMARY.'
+    required: false
+    default: 'true'
+  fail-on-error:
+    description: 'Fail the step if collection itself errors. Default false — see §13.'
+    required: false
+    default: 'false'
+
+outputs:
+  summary-path:
+    description: 'Path to summary.md.'
+    value: ${{ steps.collect.outputs.summary-path }}
+  json-path:
+    description: 'Path to summary.json.'
+    value: ${{ steps.collect.outputs.json-path }}
+  category:
+    description: 'Heuristic classification: oom, dependency, compile, test_failure, etc.'
+    value: ${{ steps.collect.outputs.category }}
+  confidence:
+    description: 'high | medium | low.'
+    value: ${{ steps.collect.outputs.confidence }}
+  is-infra-vs-code:
+    description: 'infra | code | unknown.'
+    value: ${{ steps.collect.outputs.is-infra-vs-code }}
+  is-flaky:
+    description: 'true when the same SHA passed in another run.'
+    value: ${{ steps.collect.outputs.is-flaky }}
+  short-circuit:
+    description: 'infra_runner | flake_same_sha_passed | no_failed_jobs | empty string.'
+    value: ${{ steps.collect.outputs.short-circuit }}
+  requires-analysis:
+    description: 'false when a deterministic verdict was reached. Phase 2 gates the LLM call on this.'
+    value: ${{ steps.collect.outputs.requires-analysis }}
+  fingerprint:
+    description: '16-hex-char failure fingerprint.'
+    value: ${{ steps.collect.outputs.fingerprint }}
+  seen-count:
+    description: 'Times this fingerprint has been seen before.'
+    value: ${{ steps.collect.outputs.seen-count }}
+  recurrence:
+    description: 'new | similar | exact. See §10.2.'
+    value: ${{ steps.collect.outputs.recurrence }}
+  failed-job-count:
+    description: 'Number of failed jobs found.'
+    value: ${{ steps.collect.outputs.failed-job-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      if: inputs.setup-python == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install collector dependencies
+      shell: bash
+      run: |
+        python --version
+        pip --version
+        pip install --disable-pip-version-check -r "$GITHUB_ACTION_PATH/requirements.txt"
+
+    - name: Run collector
+      id: collect
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}
+        GITHUB_API_URL: ${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}
+        GITHUB_SERVER_URL: ${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}
+        RCA_GITHUB_API_URL: ${{ inputs.github-api-url }}
+        RCA_GITHUB_HOST: ${{ inputs.github-server-url }}
+        PYTHONPATH: ${{ github.action_path }}
+        RCA_DRAIN_CONFIG: ${{ github.action_path }}/drain3.ini
+        RCA_REDIS_URL: ${{ inputs.history-redis-url }}
+        RCA_MODE: ${{ inputs.mode }}
+        RCA_RUN_ID: ${{ inputs.run-id }}
+        RCA_REPO: ${{ inputs.repository }}
+        RCA_OUT: ${{ inputs.output-dir }}
+        RCA_TOKEN_BUDGET: ${{ inputs.token-budget }}
+        RCA_DRAIN_DIR: ${{ inputs.drain-cache-dir }}
+        RCA_HISTORY_DIR: ${{ inputs.history-dir }}
+        RCA_HISTORY_BACKEND: ${{ inputs.history-backend }}
+        RCA_STRICT: ${{ inputs.fail-on-error }}
+      run: |
+        extra=()
+        if [ "$RCA_STRICT" = "true" ]; then
+          extra+=(--strict)
+        fi
+        python -m tools.rca.cli "$RCA_MODE" \
+          --run-id "$RCA_RUN_ID" \
+          --repo "$RCA_REPO" \
+          --out "$RCA_OUT" \
+          --token-budget "$RCA_TOKEN_BUDGET" \
+          --drain-dir "$RCA_DRAIN_DIR" \
+          --history-dir "$RCA_HISTORY_DIR" \
+          --history-backend "$RCA_HISTORY_BACKEND" \
+          "${extra[@]}"
+
+    - name: Write job summary
+      if: inputs.write-job-summary == 'true' && inputs.mode == 'collect'
+      shell: bash
+      env:
+        RCA_OUT: ${{ inputs.output-dir }}
+      run: |
+        if [ -f "$RCA_OUT/summary.md" ]; then
+          cat "$RCA_OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+        fi

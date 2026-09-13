@@ -1,0 +1,67 @@
+# Consumer stub — copy to the consuming repo as
+# .github/workflows/rca-collect.yml on its default branch.
+# Pin `uses:` to this action repository.
+name: RCA Collect
+
+on:
+  workflow_run:
+    workflows: ["CI", "Test Failure Scenarios"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: rca-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: >
+      github.event.workflow_run.conclusion == 'failure' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Restore Drain3 baseline
+        uses: actions/cache@v4
+        with:
+          path: .drain/
+          key: drain3-${{ github.event.workflow_run.name }}-${{ github.event.workflow_run.id }}
+          restore-keys: |
+            drain3-${{ github.event.workflow_run.name }}-
+
+      - name: Restore fingerprint history
+        uses: actions/cache@v4
+        with:
+          path: .rca-history/
+          key: rca-history-${{ github.event.workflow_run.id }}
+          restore-keys: |
+            rca-history-
+
+      - name: Collect failure context
+        id: rca
+        uses: acme/ci-rca-collector@v1
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          mode: ${{ github.event.workflow_run.conclusion == 'success' && 'train' || 'collect' }}
+          github-token: ${{ secrets.COMMON_ACTIONS_PAT || github.token }}
+          github-api-url: ''
+
+      - name: Upload artifact
+        if: github.event.workflow_run.conclusion == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rca-${{ github.event.workflow_run.id }}
+          path: rca/
+          retention-days: 30
+
+      - name: Report verdict
+        if: steps.rca.outputs.requires-analysis == 'false'
+        run: |
+          echo "Deterministic verdict: ${{ steps.rca.outputs.short-circuit }}"
+          echo "Category: ${{ steps.rca.outputs.category }} (${{ steps.rca.outputs.confidence }})"
+          echo "Flaky: ${{ steps.rca.outputs.is-flaky }}"
+          echo "Fingerprint ${{ steps.rca.outputs.fingerprint }} seen ${{ steps.rca.outputs.seen-count }}x before"
