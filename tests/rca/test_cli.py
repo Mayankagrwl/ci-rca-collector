@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
+import httpx
+
 from tools.rca.cli import main
+from tools.rca.github_api import GitHubClient
 from tools.rca.outputs import OUTPUT_KEYS
 
 
@@ -203,3 +207,244 @@ def test_train_from_fixture_exits_zero(tmp_path: Path) -> None:
     assert rc == 0
     payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert payload["verdict"]["requires_analysis"] is False
+    notes = " ".join(payload["collection_notes"])
+    assert "no success jobs" in notes
+
+
+def _write_success_train_fixture(root: Path, *, with_log: bool = True) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "logs").mkdir(exist_ok=True)
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "id": 9100,
+                "name": "Test Failure Scenarios",
+                "html_url": "https://github.com/acme/widgets/actions/runs/9100",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+                "head_branch": "main",
+                "run_attempt": 1,
+                "actor": {"login": "tester"},
+                "pull_requests": [],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": 101,
+                        "name": "baseline",
+                        "conclusion": "success",
+                        "status": "completed",
+                        "created_at": "2026-09-13T12:00:00Z",
+                        "started_at": "2026-09-13T12:00:05Z",
+                        "completed_at": "2026-09-13T12:01:10Z",
+                        "steps": [
+                            {
+                                "number": 1,
+                                "name": "Set up job",
+                                "conclusion": "success",
+                            },
+                            {
+                                "number": 2,
+                                "name": "Run noisy log",
+                                "conclusion": "success",
+                            },
+                        ],
+                    },
+                    {
+                        "id": 102,
+                        "name": "skipped-leg",
+                        "conclusion": "skipped",
+                        "status": "completed",
+                    },
+                    {
+                        "id": 103,
+                        "name": "cancelled-leg",
+                        "conclusion": "cancelled",
+                        "status": "completed",
+                    },
+                ]
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "meta.json").write_text(
+        json.dumps({"repo": "acme/widgets", "run_id": 9100}) + "\n",
+        encoding="utf-8",
+    )
+    if with_log:
+        lines = [
+            "2026-09-13T12:00:05.0000000Z Current runner version: '2.329.0'",
+            "2026-09-13T12:00:06.0000000Z ##[group]Run noisy",
+        ]
+        lines.extend(
+            f"2026-09-13T12:00:07.{i:07d}Z INFO processing record {i} of 200 [ok]"
+            for i in range(1, 201)
+        )
+        lines.append("2026-09-13T12:01:10.0000000Z ##[error]Process completed with exit code 0.")
+        (root / "logs" / "101.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return root
+
+
+def test_train_success_baseline_writes_drain_state(tmp_path: Path) -> None:
+    fixture = _write_success_train_fixture(tmp_path / "baseline-success")
+    out = tmp_path / "rca"
+    drain = tmp_path / "drain"
+    rc = main(
+        [
+            "train",
+            "--from-fixture",
+            str(fixture),
+            "--out",
+            str(out),
+            "--drain-dir",
+            str(drain),
+        ]
+    )
+    assert rc == 0
+    bins = [path for path in drain.glob("*.bin") if path.stat().st_size > 0]
+    assert bins, f"expected Drain3 state under {drain}, found {list(drain.iterdir())}"
+    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    notes = " ".join(payload["collection_notes"])
+    match = re.search(r"trained (\d+) jobs", notes)
+    assert match is not None, notes
+    assert int(match.group(1)) >= 1
+    assert "lines" in notes
+    assert payload["verdict"]["requires_analysis"] is False
+
+
+def test_train_success_jobs_without_logs_notes_why(tmp_path: Path) -> None:
+    fixture = _write_success_train_fixture(tmp_path / "baseline-nolog", with_log=False)
+    out = tmp_path / "rca"
+    rc = main(
+        [
+            "train",
+            "--from-fixture",
+            str(fixture),
+            "--out",
+            str(out),
+            "--drain-dir",
+            str(tmp_path / "drain"),
+        ]
+    )
+    assert rc == 0
+    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    notes = " ".join(payload["collection_notes"])
+    assert "no logs" in notes
+
+
+def test_train_drain_dir_uses_workspace_not_action_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "ws"
+    action = tmp_path / "action"
+    workspace.mkdir()
+    action.mkdir()
+    fixture = _write_success_train_fixture(tmp_path / "baseline-success")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(workspace))
+    monkeypatch.setenv("GITHUB_ACTION_PATH", str(action))
+    monkeypatch.chdir(action)
+    rc = main(
+        [
+            "train",
+            "--from-fixture",
+            str(fixture),
+            "--out",
+            str(workspace / "rca"),
+            "--drain-dir",
+            ".drain",
+        ]
+    )
+    assert rc == 0
+    bins = list((workspace / ".drain").glob("*.bin"))
+    assert bins and all(path.stat().st_size > 0 for path in bins)
+    assert not list(action.glob("*.bin"))
+    assert not list((action / ".drain").glob("*.bin")) if (action / ".drain").exists() else True
+
+
+def test_train_live_paginates_and_fetches_success_logs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("COMMON_ACTIONS_PAT", "test-token")
+    log_urls: list[str] = []
+    body = "\n".join(f"INFO processing record {i} of 80 [ok]" for i in range(1, 81))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if re.search(r"/actions/runs/55$", url):
+            return httpx.Response(
+                200, json={"id": 55, "name": "CI", "conclusion": "success"}
+            )
+        if "/actions/runs/55/jobs" in url:
+            if "page=2" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "jobs": [
+                            {"id": 202, "name": "baseline", "conclusion": "success"}
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "jobs": [
+                        {"id": 201, "name": "cancelled-leg", "conclusion": "cancelled"}
+                    ]
+                },
+                headers={
+                    "Link": (
+                        "<https://api.github.com/repos/acme/widgets/actions/runs/55"
+                        '/jobs?per_page=100&page=2>; rel="next"'
+                    )
+                },
+            )
+        if "/actions/jobs/" in url and url.endswith("/logs"):
+            log_urls.append(url)
+            if url.endswith("/actions/jobs/202/logs"):
+                return httpx.Response(200, text=body)
+            return httpx.Response(200, text="cancelled job log")
+        return httpx.Response(404, json={"message": "not found"})
+
+    real = GitHubClient
+
+    def factory(**kwargs):
+        kwargs.setdefault("transport", httpx.MockTransport(handler))
+        kwargs.setdefault("sleep", lambda _d: None)
+        return real(**kwargs)
+
+    monkeypatch.setattr("tools.rca.cli.GitHubClient", factory)
+    drain = tmp_path / "drain"
+    out = tmp_path / "rca"
+    rc = main(
+        [
+            "train",
+            "--run-id",
+            "55",
+            "--repo",
+            "acme/widgets",
+            "--out",
+            str(out),
+            "--drain-dir",
+            str(drain),
+        ]
+    )
+    assert rc == 0
+    assert log_urls == ["https://api.github.com/repos/acme/widgets/actions/jobs/202/logs"]
+    bins = [path for path in drain.glob("*.bin") if path.stat().st_size > 0]
+    assert bins
+    notes = " ".join(
+        json.loads((out / "summary.json").read_text(encoding="utf-8"))["collection_notes"]
+    )
+    match = re.search(r"trained (\d+) jobs", notes)
+    assert match is not None and int(match.group(1)) >= 1

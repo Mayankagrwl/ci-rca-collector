@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -155,6 +156,29 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _resolve_drain_dir(args: argparse.Namespace) -> Path:
+    """Persist Drain3 under the workspace `.drain/`, never github.action_path."""
+    raw = getattr(args, "drain_dir", None) or os.environ.get("RCA_DRAIN_DIR") or ".drain"
+    path = Path(raw)
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    action_path = os.environ.get("GITHUB_ACTION_PATH")
+    if not path.is_absolute():
+        root = Path(workspace) if workspace else Path.cwd()
+        path = root / path
+    path = path.resolve()
+    if action_path:
+        try:
+            under_action = path.is_relative_to(Path(action_path).resolve())
+        except (OSError, ValueError):
+            under_action = False
+        if under_action:
+            fallback = Path(workspace) if workspace else Path.cwd()
+            path = (fallback / ".drain").resolve()
+            _LOG.warning("drain dir was under github.action_path; writing to %s", path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _cmd_capture(args: argparse.Namespace) -> int:
     out = Path(args.out_fixture)
     out.mkdir(parents=True, exist_ok=True)
@@ -283,43 +307,56 @@ def _cmd_collect(args: argparse.Namespace) -> int:
 
 
 def _cmd_train(args: argparse.Namespace) -> int:
-    drain_dir = args.drain_dir or ".drain"
+    drain_dir = _resolve_drain_dir(args)
     notes: list[str] = []
+    note = "Drain3 trained 0 jobs"
     try:
         if args.from_fixture:
             bundle = _load_fixture(Path(args.from_fixture))
         else:
             if not args.run_id or not args.repo:
                 raise ValueError("train requires --from-fixture or both --run-id and --repo")
-            bundle = _fetch_live(
+            bundle = _fetch_train(
                 args.repo, args.run_id, api_url=args.api_url, token=args.token
             )
-            notes.extend(bundle.pop("notes", []))
+        notes.extend(bundle.get("notes") or [])
         workflow = str(bundle["run"].get("name") or "workflow")
-        jobs = bundle["jobs"]
+        jobs = list(bundle.get("jobs") or [])
         logs = bundle.get("logs") or {}
+        success_jobs = [job for job in jobs if job.get("conclusion") == "success"]
         trained = 0
-        for job in jobs:
-            if job.get("conclusion") != "success":
+        line_total = 0
+        for job in success_jobs:
+            job_id = job.get("id")
+            if job_id is None:
                 continue
-            raw = logs.get(int(job["id"]))
+            raw = logs.get(int(job_id))
             if not raw:
                 continue
             cleaned = clean_log(raw).lines
             key = f"{workflow}_{job.get('name') or 'job'}"
             drain_train(cleaned, key, drain_dir=drain_dir)
             trained += 1
-        note = f"Drain3 trained {trained} job log(s) into {drain_dir}"
+            line_total += sum(1 for line in cleaned if str(line).strip())
+        if trained == 0:
+            why = "no success jobs" if not success_jobs else "no logs"
+            note = f"Drain3 trained 0 jobs: {why}"
+        else:
+            note = (
+                f"Drain3 trained {trained} jobs, {line_total} lines, "
+                f"output files under {drain_dir}/"
+            )
         notes.append(note)
         _LOG.info(note)
     except Exception as exc:  # noqa: BLE001
         _LOG.exception("train failed")
         note = f"train error: {exc}"
+        notes.append(note)
         if args.strict:
             raise
     _safe_emit(
         _stub_summary(
-            note=note,
+            note="; ".join(notes) if notes else note,
             run_id=int(args.run_id or 0),
             requires_analysis=False,
         ),
@@ -375,6 +412,37 @@ def _cmd_refingerprint(args: argparse.Namespace) -> int:
     print(f"{changed} of {len(records)} records {'would change' if args.dry_run else 'updated'}")
     store.close()
     return 0
+
+
+def _fetch_train(
+    repo: str,
+    run_id: int,
+    *,
+    api_url: str | None,
+    token: str | None,
+) -> dict[str, Any]:
+    """Load a successful run and every job log needed to train Drain3."""
+    notes: list[str] = []
+    with GitHubClient(api_url=api_url, token=token) as client:
+        run = client.get_run(repo, run_id)
+        jobs = client.list_jobs(repo, run_id)
+        logs: dict[int, str | None] = {}
+        for job in jobs:
+            if job.get("conclusion") != "success":
+                continue
+            job_id = job.get("id")
+            if job_id is None:
+                continue
+            logs[int(job_id)] = client.get_job_log(repo, int(job_id))
+        notes.extend(client.collection_notes)
+        return {
+            "repo": repo,
+            "run": run,
+            "jobs": jobs,
+            "logs": logs,
+            "notes": notes,
+            "from_fixture": False,
+        }
 
 
 def _fetch_live(
@@ -605,7 +673,7 @@ def _build_summary(
     drain_report = None
     fine = ""
     coarse = ""
-    drain_dir = getattr(args, "drain_dir", None) or ".drain"
+    drain_dir = str(_resolve_drain_dir(args))
     try:
         if cleaned_lines and analysed:
             job_name = str(analysed[0].get("name") or "job")
