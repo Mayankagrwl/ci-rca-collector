@@ -26,6 +26,12 @@ _RULE_RES = [
     (rule["category"], re.compile(rule["pattern"], re.IGNORECASE), rule["confidence"])
     for rule in CLASSIFY_RULES
 ]
+_CANCELLED = frozenset({"cancelled", "canceled"})
+_OPERATION_CANCELED_RE = re.compile(r"The operation was canceled", re.IGNORECASE)
+_TERMINATE_ORPHAN_RE = re.compile(r"Terminate orphan process", re.IGNORECASE)
+# timeout-minutes: 1 often lands at ~60–80s including runner teardown.
+_TIMEOUT_SLACK_BEFORE_S = 15
+_TIMEOUT_SLACK_AFTER_S = 30
 
 
 @dataclass
@@ -50,27 +56,88 @@ def _side(category: str) -> str:
     return "unknown"
 
 
+def _is_cancelled(value: str | None) -> bool:
+    return (value or "").lower() in _CANCELLED
+
+
+def _near_workflow_timeout(
+    duration_seconds: int | None,
+    timeout_minutes: int | None,
+) -> bool:
+    if duration_seconds is None or timeout_minutes is None or timeout_minutes <= 0:
+        return False
+    limit = timeout_minutes * 60
+    return (limit - _TIMEOUT_SLACK_BEFORE_S) <= duration_seconds <= (limit + _TIMEOUT_SLACK_AFTER_S)
+
+
+def _is_operation_canceled_pattern(pattern: str) -> bool:
+    return "operation was canceled" in pattern.lower()
+
+
+def _has_timeout_signature(
+    raw_log: str,
+    *,
+    conclusion: str | None = None,
+    step_conclusion: str | None = None,
+    duration_seconds: int | None = None,
+    timeout_minutes: int | None = None,
+) -> bool:
+    """True when the job looks like timeout-minutes, not a dead runner."""
+    cancelled = _is_cancelled(conclusion) or _is_cancelled(step_conclusion)
+    if cancelled and _near_workflow_timeout(duration_seconds, timeout_minutes):
+        return True
+    if _OPERATION_CANCELED_RE.search(raw_log) and _TERMINATE_ORPHAN_RE.search(raw_log):
+        return True
+    if _OPERATION_CANCELED_RE.search(raw_log) and _near_workflow_timeout(
+        duration_seconds, timeout_minutes
+    ):
+        return True
+    for category, compiled, _confidence in _RULE_RES:
+        if category != "timeout":
+            continue
+        if _is_operation_canceled_pattern(compiled.pattern):
+            continue
+        if compiled.search(raw_log):
+            return True
+    return False
+
+
 def check_runner_health(
     raw_log: str,
     *,
     conclusion: str | None,
     failed_step_name: str | None,
     log_lines: int,
+    step_conclusion: str | None = None,
+    duration_seconds: int | None = None,
+    timeout_minutes: int | None = None,
 ) -> ClassificationHit | None:
     """Stage 1. Returns a hit when the job looks like runner infrastructure."""
+    timeout_like = _has_timeout_signature(
+        raw_log,
+        conclusion=conclusion,
+        step_conclusion=step_conclusion,
+        duration_seconds=duration_seconds,
+        timeout_minutes=timeout_minutes,
+    )
     for compiled in _RUNNER_RES:
         match = compiled.search(raw_log)
-        if match:
-            return ClassificationHit(
-                category="infra_runner",
-                confidence="high",
-                matched_pattern=compiled.pattern,
-                is_infra_vs_code="infra",
-                short_circuit="infra_runner",
-                reason=f"runner health matched {match.group(0)!r}",
-                requires_analysis=False,
-            )
+        if not match:
+            continue
+        if timeout_like and _is_operation_canceled_pattern(compiled.pattern):
+            continue
+        return ClassificationHit(
+            category="infra_runner",
+            confidence="high",
+            matched_pattern=compiled.pattern,
+            is_infra_vs_code="infra",
+            short_circuit="infra_runner",
+            reason=f"runner health matched {match.group(0)!r}",
+            requires_analysis=False,
+        )
     if conclusion == "failure" and log_lines < 50 and not failed_step_name:
+        if timeout_like:
+            return None
         return ClassificationHit(
             category="infra_runner",
             confidence="medium",
@@ -148,6 +215,13 @@ def _workflow_name(run: Mapping[str, Any]) -> str:
     return ""
 
 
+def _pad(seq: Sequence[Any] | None, n: int) -> list[Any]:
+    items = list(seq) if seq is not None else []
+    if len(items) < n:
+        items.extend([None] * (n - len(items)))
+    return items[:n]
+
+
 def classify_failure(
     *,
     raw_logs: Sequence[str],
@@ -159,6 +233,9 @@ def classify_failure(
     run_attempt: int = 1,
     prior_same_sha_runs: Sequence[Mapping[str, Any]] | None = None,
     no_failed_jobs: bool = False,
+    step_conclusions: Sequence[str | None] | None = None,
+    durations: Sequence[int | None] | None = None,
+    timeout_minutes: int | None = None,
 ) -> ClassificationHit:
     """Compose Stages 1, 3 and 5. Short-circuits win and skip Stage 5."""
     if no_failed_jobs:
@@ -170,14 +247,29 @@ def classify_failure(
             requires_analysis=False,
         )
 
-    for raw, conclusion, step, count in zip(
-        raw_logs, conclusions, failed_step_names, log_line_counts
+    n = len(raw_logs)
+    step_conclusions = _pad(step_conclusions, n)
+    durations = _pad(durations, n)
+    timeout_like = False
+    for raw, conclusion, step, count, step_conc, duration in zip(
+        raw_logs, conclusions, failed_step_names, log_line_counts, step_conclusions, durations
     ):
+        if _has_timeout_signature(
+            raw,
+            conclusion=conclusion,
+            step_conclusion=step_conc,
+            duration_seconds=duration,
+            timeout_minutes=timeout_minutes,
+        ):
+            timeout_like = True
         infra = check_runner_health(
             raw,
             conclusion=conclusion,
             failed_step_name=step,
             log_lines=count,
+            step_conclusion=step_conc,
+            duration_seconds=duration,
+            timeout_minutes=timeout_minutes,
         )
         if infra is not None:
             return infra
@@ -189,6 +281,13 @@ def classify_failure(
 
     primary_lines: Sequence[str] = cleaned_lines[0] if cleaned_lines else []
     regex = classify_lines(primary_lines)
+    if timeout_like and regex.category == "unknown":
+        regex = ClassificationHit(
+            category="timeout",
+            confidence="medium",
+            matched_pattern="workflow_timeout",
+            is_infra_vs_code="infra",
+        )
 
     if flake is not None:
         regex.is_flaky = True

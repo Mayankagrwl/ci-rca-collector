@@ -62,7 +62,9 @@ class ClassifyRule(TypedDict):
     confidence: str
 
 
-# Ordered; first match wins. Confidence: high for exact signatures, low for generic.
+# Ordered; first match wins. Category order: oom, timeout, disk_space, crash,
+# dependency, network_dns, auth, image_pull, test_failure, compile, unknown.
+# Confidence: high for exact signatures, low for generic.
 CLASSIFY_RULES: list[ClassifyRule] = [
     {"category": "oom", "pattern": r"OOMKilled", "confidence": "high"},
     {"category": "oom", "pattern": r"Killed process", "confidence": "high"},
@@ -74,8 +76,17 @@ CLASSIFY_RULES: list[ClassifyRule] = [
     {"category": "timeout", "pattern": r"context deadline exceeded", "confidence": "high"},
     {"category": "timeout", "pattern": r"ETIMEDOUT", "confidence": "high"},
     {"category": "timeout", "pattern": r"exceeded the maximum execution time", "confidence": "high"},
+    {"category": "timeout", "pattern": r"The operation was canceled", "confidence": "high"},
+    {"category": "timeout", "pattern": r"Terminate orphan process", "confidence": "high"},
     {"category": "disk_space", "pattern": r"no space left on device", "confidence": "high"},
     {"category": "disk_space", "pattern": r"ENOSPC", "confidence": "high"},
+    {"category": "crash", "pattern": r"panic:", "confidence": "high"},
+    {"category": "crash", "pattern": r"SIGSEGV", "confidence": "high"},
+    {"category": "crash", "pattern": r"segmentation violation", "confidence": "high"},
+    {"category": "crash", "pattern": r"Segmentation fault", "confidence": "high"},
+    {"category": "crash", "pattern": r"nil pointer dereference", "confidence": "high"},
+    {"category": "crash", "pattern": r"core dumped", "confidence": "high"},
+    {"category": "crash", "pattern": r"fatal error:", "confidence": "high"},
     {"category": "dependency", "pattern": r"npm ERR!", "confidence": "high"},
     {"category": "dependency", "pattern": r"ERESOLVE", "confidence": "high"},
     {"category": "dependency", "pattern": r"Could not resolve dependency", "confidence": "high"},
@@ -120,18 +131,15 @@ CLASSIFY_RULES: list[ClassifyRule] = [
     {"category": "image_pull", "pattern": r"ErrImagePull", "confidence": "high"},
     {"category": "image_pull", "pattern": r"pull access denied", "confidence": "high"},
     {"category": "image_pull", "pattern": r"manifest unknown", "confidence": "high"},
+    {"category": "test_failure", "pattern": r"AssertionError", "confidence": "high"},
+    {"category": "test_failure", "pattern": r"Test run failed", "confidence": "high"},
+    {"category": "test_failure", "pattern": r"FAILED", "confidence": "medium"},
     {"category": "compile", "pattern": r"error TS", "confidence": "high"},
     {"category": "compile", "pattern": r"cannot find symbol", "confidence": "high"},
     {"category": "compile", "pattern": r"SyntaxError", "confidence": "high"},
     {"category": "compile", "pattern": r"undefined reference to", "confidence": "high"},
-    {"category": "compile", "pattern": r"error:", "confidence": "low"},
-    {"category": "test_failure", "pattern": r"AssertionError", "confidence": "high"},
-    {"category": "test_failure", "pattern": r"Test run failed", "confidence": "high"},
-    {"category": "test_failure", "pattern": r"FAILED", "confidence": "medium"},
-    {"category": "crash", "pattern": r"panic:", "confidence": "high"},
-    {"category": "crash", "pattern": r"Segmentation fault", "confidence": "high"},
-    {"category": "crash", "pattern": r"core dumped", "confidence": "high"},
-    {"category": "crash", "pattern": r"fatal error:", "confidence": "high"},
+    # Negative lookbehind: "runtime error:" is a crash, not a compiler diagnostic.
+    {"category": "compile", "pattern": r"(?<!runtime )error:", "confidence": "low"},
 ]
 
 __all__ = [
