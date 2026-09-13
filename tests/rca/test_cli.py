@@ -574,7 +574,9 @@ def test_noisy_not_test_failure_and_window_skips_script(
     )
     assert rc == 0
     payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert payload["classification"]["category"] == "network_dns"
     assert payload["classification"]["category"] != "test_failure"
+    assert payload["classification"]["category"] != "unknown"
     assert payload["verdict"]["short_circuit"] != "flake_same_sha_passed"
     assert payload["classification"]["is_flaky"] is False
     job = payload["failed_jobs"][0]

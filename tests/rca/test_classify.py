@@ -178,6 +178,34 @@ def test_lowercase_failed_is_not_test_failure() -> None:
     assert hit.category != "test_failure"
 
 
+def test_noisy_first_error_window_is_network_dns() -> None:
+    from tools.rca.extract import extract_from_lines
+
+    lines = [
+        "for i in $(seq 1 20000); do echo \"INFO processing record $i of 20000 [ok]\"; done",
+        "echo \"Exception: Connection refused to db:5432\"",
+        "echo \"ERROR failed to flush buffer: connection reset by peer\"",
+        "exit 1",
+        "shell: /usr/bin/bash -e {0}",
+        "env:",
+        "  pythonLocation: /opt/hostedtoolcache/Python/3.12.7/x64",
+        *[f"INFO processing record {i} of 20000 [ok]" for i in range(1, 81)],
+        "Exception: Connection refused to db:5432",
+        "Retrying connection in 1s",
+        "Retrying connection in 2s",
+        "Retrying connection in 4s",
+        "ERROR failed to flush buffer: connection reset by peer",
+        *[f"INFO cleanup task {i} complete" for i in range(1, 201)],
+    ]
+    extracted = extract_from_lines(lines)
+    window = next(item for item in extracted.windows if item.label == "first_error")
+    hit = classify_lines(window.content.splitlines())
+    assert hit.category == "network_dns"
+    assert hit.category != "test_failure"
+    assert hit.category != "unknown"
+    assert hit.is_infra_vs_code == "infra"
+
+
 def test_uppercase_failed_is_test_failure() -> None:
     hit = classify_lines(["FAILED t/test_x.py::test_fail"])
     assert hit.category == "test_failure"
