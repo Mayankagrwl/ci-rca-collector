@@ -18,18 +18,22 @@ _WindowLabel = Literal["first_error", "tail", "merged"]
 
 ERROR_LINE = re.compile(
     r"ERROR|FAIL|Exception|Traceback|panic:|##\[error\]|FATAL|"
-    r"Segmentation fault|npm ERR!",
+    r"Segmentation fault|npm ERR!|SyntaxError|IndentationError|"
+    r'TypeError|NameError|File "',
     re.IGNORECASE,
 )
+_EXIT_CODE = re.compile(r"Process completed with exit code (\d+)", re.IGNORECASE)
 _FRAME = re.compile(
     r"^(?:"
     r"\s+at "
     r"|\tat "
-    r'|\s*File "'
+    r'|\s+File "'
     r"|\s*Caused by:"
-    r"|\s+\.\.\. \d+ more"
+    r"|\s*\.\.\. \d+ more"
+    r"|Traceback \(most recent call last\):"
     r")"
 )
+_CARET = re.compile(r"^\s+\^+\s*$")
 _HEADLINE = re.compile(
     r"^(?:[A-Za-z_][\w.]*(?:Error|Exception)|Error|Exception|panic:|fatal error:)",
     re.IGNORECASE,
@@ -43,6 +47,15 @@ class Extracted:
     stack_traces: list[StackTrace] = field(default_factory=list)
     error_lines: list[ErrorLine] = field(default_factory=list)
     annotations: list[str] = field(default_factory=list)
+    exit_code: int | None = None
+
+
+def parse_exit_code(text: str | list[str]) -> int | None:
+    blob = text if isinstance(text, str) else "\n".join(text)
+    match = _EXIT_CODE.search(blob)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def extract_from_lines(lines: list[str]) -> Extracted:
@@ -60,6 +73,7 @@ def extract_from_lines(lines: list[str]) -> Extracted:
         stack_traces=stacks,
         error_lines=error_lines,
         annotations=annotations,
+        exit_code=parse_exit_code(lines),
     )
 
 
@@ -122,25 +136,36 @@ def _stack_traces(lines: list[str]) -> list[StackTrace]:
     traces: list[StackTrace] = []
     frames: list[str] = []
     headline: str | None = None
+    in_python = False
 
     def flush() -> None:
-        nonlocal frames, headline
-        if not frames:
-            headline = None
+        nonlocal frames, headline, in_python
+        if not frames and not headline:
             return
         traces.append(_truncate(headline, frames))
         frames = []
         headline = None
+        in_python = False
 
     for record in lines:
         for physical in record.split("\n"):
             if _is_frame(physical):
                 frames.append(physical)
+                in_python = 'File "' in physical or physical.strip().startswith("Traceback")
+                continue
+            if frames and in_python and (
+                _CARET.match(physical) or physical.startswith(" ") or physical.startswith("\t")
+            ):
+                frames.append(physical)
+                continue
+            if _HEADLINE.match(physical.strip()):
+                headline = physical.strip()
+                if frames:
+                    frames.append(physical)
+                flush()
                 continue
             if frames:
                 flush()
-            if _HEADLINE.match(physical.strip()):
-                headline = physical.strip()
     flush()
     return traces
 

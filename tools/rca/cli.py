@@ -892,6 +892,7 @@ def _failed_job_from_api(
     extracted_stacks = []
     extracted_errors = []
     extracted_annotations: list[str] = []
+    extracted_exit: int | None = None
     if raw_log is not None:
         cleaned = clean_log(raw_log, keep_post_cleanup=keep_post)
         extracted = extract_from_lines(cleaned.lines)
@@ -899,6 +900,7 @@ def _failed_job_from_api(
         extracted_stacks = extracted.stack_traces
         extracted_errors = extracted.error_lines
         extracted_annotations = extracted.annotations
+        extracted_exit = extracted.exit_code
 
     queue_seconds = _seconds_between(job.get("created_at"), job.get("started_at"))
     if queue_seconds is not None and queue_seconds >= QUEUE_SECONDS_THRESHOLD:
@@ -920,7 +922,7 @@ def _failed_job_from_api(
         name=str(job.get("name") or ""),
         failed_step_name=failed_step.name if failed_step else None,
         failed_step_number=failed_step.number if failed_step else None,
-        exit_code=None,
+        exit_code=extracted_exit,
         duration_seconds=_seconds_between(job.get("started_at"), job.get("completed_at")),
         log_unavailable=log_unavailable,
         queue_seconds=queue_seconds,

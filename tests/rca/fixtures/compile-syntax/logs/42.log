@@ -1,0 +1,37 @@
+﻿2026-09-12T12:00:05.1234567Z Current runner version: '2.329.0'
+2026-09-12T12:00:05.1234567Z ##[group]Operating System
+2026-09-12T12:00:05.1234567Z Ubuntu
+2026-09-12T12:00:05.1234567Z 24.04.3
+2026-09-12T12:00:05.1234567Z LTS
+2026-09-12T12:00:05.1234567Z ##[endgroup]
+2026-09-12T12:00:05.1234567Z ##[group]Runner Image
+2026-09-12T12:00:05.1234567Z Image: ubuntu-24.04
+2026-09-12T12:00:05.1234567Z Version: 20260907.1.0
+2026-09-12T12:00:05.1234567Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/Ubuntu2404-Readme.md
+2026-09-12T12:00:05.1234567Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24
+2026-09-12T12:00:05.1234567Z ##[endgroup]
+2026-09-12T12:00:05.1234567Z ##[group]Hosted Compute Agent
+2026-09-12T12:00:05.1234567Z Hosted Compute Agent
+2026-09-12T12:00:05.1234567Z Azure Region: East US
+2026-09-12T12:00:05.1234567Z ##[endgroup]
+2026-09-12T12:00:05.1234567Z ##[group]GITHUB_TOKEN Permissions
+2026-09-12T12:00:05.1234567Z Actions: write
+2026-09-12T12:00:05.1234567Z ##[endgroup]
+2026-09-12T12:00:05.1234567Z Secret source: Actions
+2026-09-12T12:00:05.1234567Z Available disk space: 84 GB
+2026-09-12T12:00:06.0000000Z Download action repository 'actions/checkout@v4'
+2026-09-12T12:00:07.0000000Z Complete job name: compile
+2026-09-12T12:00:08.0000000Z ##[group]Run python bad.py
+2026-09-12T12:00:08.1000000Z [36;1mpython bad.py[0m
+2026-09-12T12:00:08.2000000Z shell: /usr/bin/bash -e {0}
+2026-09-12T12:00:08.3000000Z env:
+2026-09-12T12:00:08.4000000Z  pythonLocation: /opt/hostedtoolcache/Python/3.12.7/x64
+2026-09-12T12:00:08.5000000Z ##[endgroup]
+2026-09-12T12:00:09.0000000Z ##[command]python bad.py
+2026-09-12T12:00:09.1000000Z   File "/home/runner/work/widgets/widgets/bad.py", line 1
+2026-09-12T12:00:09.2000000Z     def broken(
+2026-09-12T12:00:09.3000000Z               ^
+2026-09-12T12:00:09.4000000Z SyntaxError: '(' was never closed
+2026-09-12T12:00:09.5000000Z ##[error]Process completed with exit code 1.
+2026-09-12T12:00:10.0000000Z Post job cleanup
+2026-09-12T12:00:10.1000000Z Cleaning up orphan processes

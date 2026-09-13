@@ -1,0 +1,13 @@
+{
+  "id": 9001,
+  "run_attempt": 1,
+  "name": "Test Failure Scenarios",
+  "html_url": "https://github.com/acme/widgets/actions/runs/9001",
+  "event": "workflow_dispatch",
+  "actor": {"login": "dsharma"},
+  "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "head_branch": "main",
+  "pull_requests": [],
+  "repository": {"full_name": "acme/widgets"},
+  "head_repository": {"full_name": "acme/widgets", "fork": false}
+}

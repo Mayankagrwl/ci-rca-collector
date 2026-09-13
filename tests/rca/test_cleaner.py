@@ -88,6 +88,34 @@ def test_joins_stack_continuations() -> None:
     assert result.bytes_raw == len(RAW_LOG.encode("utf-8"))
 
 
+def test_drops_setup_body_keeps_facts() -> None:
+    result = clean_log(RAW_LOG)
+    joined = "\n".join(result.lines)
+    assert "Ubuntu" not in joined
+    assert "Image: ubuntu-24.04" not in joined
+    assert result.setup.image == "ubuntu-24.04@20260818.1.0"
+
+
+def test_does_not_join_shell_header_to_file() -> None:
+    raw = (
+        "2026-09-12T12:00:00.0000000Z ##[group]Run python bad.py\n"
+        "2026-09-12T12:00:00.0000000Z shell: /usr/bin/bash -e {0}\n"
+        '2026-09-12T12:00:00.0000000Z   File "bad.py", line 1\n'
+        "2026-09-12T12:00:00.0000000Z SyntaxError: '(' was never closed\n"
+    )
+    result = clean_log(raw)
+    file_rec = next(line for line in result.lines if 'File "' in line)
+    assert "shell:" not in file_rec
+
+
+def test_strips_utf8_bom() -> None:
+    raw = "\ufeff" + RAW_LOG
+    result = clean_log(raw)
+    joined = "\n".join(result.lines)
+    assert "\ufeff" not in joined
+    assert "2026-09-08T" not in joined
+
+
 def test_cleaner_has_no_github_ids() -> None:
     source = (
         Path(__file__).resolve().parents[2] / "tools" / "rca" / "cleaner.py"
