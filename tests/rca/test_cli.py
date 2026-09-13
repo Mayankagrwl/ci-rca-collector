@@ -448,3 +448,317 @@ def test_train_live_paginates_and_fetches_success_logs(
     )
     match = re.search(r"trained (\d+) jobs", notes)
     assert match is not None and int(match.group(1)) >= 1
+
+
+def _write_noisy_fixture(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "logs").mkdir(exist_ok=True)
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "id": 9200,
+                "name": "Test Failure Scenarios",
+                "html_url": "https://github.com/acme/widgets/actions/runs/9200",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "failure",
+                "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+                "head_branch": "main",
+                "run_attempt": 1,
+                "actor": {"login": "tester"},
+                "pull_requests": [],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": 501,
+                        "name": "noisy",
+                        "conclusion": "failure",
+                        "status": "completed",
+                        "created_at": "2026-09-13T12:00:00Z",
+                        "started_at": "2026-09-13T12:00:05Z",
+                        "completed_at": "2026-09-13T12:02:00Z",
+                        "steps": [
+                            {
+                                "number": 1,
+                                "name": "Set up job",
+                                "conclusion": "success",
+                            },
+                            {
+                                "number": 2,
+                                "name": "Run noisy log",
+                                "conclusion": "failure",
+                            },
+                        ],
+                    }
+                ]
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "meta.json").write_text(
+        json.dumps({"repo": "acme/widgets", "run_id": 9200}) + "\n",
+        encoding="utf-8",
+    )
+    (root / "same_sha_runs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": 9100,
+                    "name": "Test Failure Scenarios",
+                    "conclusion": "success",
+                    "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+                    "jobs": [{"name": "baseline", "conclusion": "success"}],
+                }
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ts = "2026-09-13T12:00:10.0000000Z"
+    lines = [
+        f"{ts} ##[group]Run noisy",
+        f"{ts} for i in $(seq 1 20000); do echo \"INFO processing record $i of 20000 [ok]\"; done",
+        f"{ts} echo \"Exception: Connection refused to db:5432\"",
+        f"{ts} echo \"ERROR failed to flush buffer: connection reset by peer\"",
+        f"{ts} exit 1",
+        f"{ts} shell: /usr/bin/bash -e {{0}}",
+        f"{ts} env:",
+        f"{ts}  pythonLocation: /opt/hostedtoolcache/Python/3.12.7/x64",
+        f"{ts} ##[endgroup]",
+    ]
+    lines.extend(
+        f"{ts} INFO processing record {i} of 20000 [ok]" for i in range(1, 81)
+    )
+    lines.extend(
+        [
+            f"{ts} Exception: Connection refused to db:5432",
+            f"{ts} Retrying connection in 1s",
+            f"{ts} Retrying connection in 2s",
+            f"{ts} Retrying connection in 4s",
+            f"{ts} ERROR failed to flush buffer: connection reset by peer",
+        ]
+    )
+    lines.extend(f"{ts} INFO cleanup task {i} complete" for i in range(1, 201))
+    lines.append(f"{ts} ##[error]Process completed with exit code 1.")
+    (root / "logs" / "501.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return root
+
+
+def test_noisy_not_test_failure_and_window_skips_script(
+    tmp_path: Path,
+) -> None:
+    fixture = _write_noisy_fixture(tmp_path / "noisy")
+    out = tmp_path / "rca"
+    rc = main(
+        [
+            "collect",
+            "--from-fixture",
+            str(fixture),
+            "--out",
+            str(out),
+            "--drain-dir",
+            str(tmp_path / "drain"),
+            "--history-backend",
+            "none",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert payload["classification"]["category"] != "test_failure"
+    assert payload["verdict"]["short_circuit"] != "flake_same_sha_passed"
+    assert payload["classification"]["is_flaky"] is False
+    job = payload["failed_jobs"][0]
+    first = next(w for w in job["windows"] if w["label"] == "first_error")
+    content = first["content"]
+    assert "Exception: Connection refused" in content
+    assert "ERROR failed to flush buffer" in content
+    assert "for i in $(seq 1 20000)" not in content
+    assert "INFO processing record 1 of 20000" not in content
+
+
+def test_collect_uses_drain_fallback_and_notes_it(tmp_path: Path) -> None:
+    drain = tmp_path / "drain"
+    train_fx = _write_success_train_fixture(tmp_path / "baseline-success")
+    assert (
+        main(
+            [
+                "train",
+                "--from-fixture",
+                str(train_fx),
+                "--out",
+                str(tmp_path / "train-out"),
+                "--drain-dir",
+                str(drain),
+            ]
+        )
+        == 0
+    )
+    noisy = _write_noisy_fixture(tmp_path / "noisy")
+    out = tmp_path / "rca"
+    rc = main(
+        [
+            "collect",
+            "--from-fixture",
+            str(noisy),
+            "--out",
+            str(out),
+            "--drain-dir",
+            str(drain),
+            "--history-backend",
+            "none",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert payload["drain"]["baseline_available"] is True
+    notes = " ".join(payload["collection_notes"])
+    assert "drain fallback" in notes
+    assert "job key missing" in notes
+
+
+def test_train_logs_full_bin_path(tmp_path: Path, caplog) -> None:
+    import logging
+
+    fixture = _write_success_train_fixture(tmp_path / "baseline-success")
+    drain = tmp_path / "drain"
+    with caplog.at_level(logging.INFO):
+        rc = main(
+            [
+                "train",
+                "--from-fixture",
+                str(fixture),
+                "--out",
+                str(tmp_path / "rca"),
+                "--drain-dir",
+                str(drain),
+            ]
+        )
+    assert rc == 0
+    logged = "\n".join(caplog.messages)
+    bins = list(drain.glob("*.bin"))
+    assert bins
+    assert str(bins[0].resolve()) in logged
+
+
+def test_collect_parses_junit_artifact(tmp_path: Path) -> None:
+    root = tmp_path / "junit-run"
+    root.mkdir()
+    (root / "logs").mkdir()
+    (root / "artifacts").mkdir()
+    (root / "run.json").write_text(
+        json.dumps(
+            {
+                "id": 9300,
+                "name": "Test Failure Scenarios",
+                "html_url": "https://github.com/acme/widgets/actions/runs/9300",
+                "event": "workflow_dispatch",
+                "conclusion": "failure",
+                "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
+                "head_branch": "main",
+                "run_attempt": 1,
+                "actor": {"login": "tester"},
+                "pull_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": 77,
+                        "name": "test",
+                        "conclusion": "failure",
+                        "created_at": "2026-09-13T12:00:00Z",
+                        "started_at": "2026-09-13T12:00:05Z",
+                        "completed_at": "2026-09-13T12:00:20Z",
+                        "steps": [
+                            {
+                                "number": 1,
+                                "name": "Set up job",
+                                "conclusion": "success",
+                            },
+                            {
+                                "number": 2,
+                                "name": "Run tests",
+                                "conclusion": "failure",
+                            },
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "meta.json").write_text(
+        json.dumps({"repo": "acme/widgets", "run_id": 9300}), encoding="utf-8"
+    )
+    (root / "logs" / "77.log").write_text(
+        "2026-09-13T12:00:10.0000000Z FAILED t/test_x.py::test_fail\n"
+        "2026-09-13T12:00:11.0000000Z AssertionError: list mismatch\n"
+        "2026-09-13T12:00:12.0000000Z ##[error]Process completed with exit code 1.\n",
+        encoding="utf-8",
+    )
+    (root / "artifacts.json").write_text(
+        json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "name": "test-results",
+                        "size_in_bytes": 512,
+                        "expired": False,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "artifacts" / "junit.xml").write_text(
+        """<?xml version="1.0"?>
+<testsuite tests="3" failures="2" errors="0">
+  <testcase classname="t.test_x" name="test_pass"/>
+  <testcase classname="t.test_x" name="test_fail">
+    <failure message="AssertionError: list mismatch">list mismatch</failure>
+  </testcase>
+  <testcase classname="t.test_x" name="test_raise">
+    <failure message="ValueError: boom">boom in nested call</failure>
+  </testcase>
+</testsuite>
+""",
+        encoding="utf-8",
+    )
+    out = tmp_path / "rca"
+    rc = main(
+        [
+            "collect",
+            "--from-fixture",
+            str(root),
+            "--out",
+            str(out),
+            "--history-backend",
+            "none",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    notes = " ".join(payload["collection_notes"])
+    assert "Artifacts and JUnit not collected in this slice" not in notes
+    assert payload["junit"] is not None
+    assert payload["junit"]["total_failures"] == 2
+    assert payload["junit"]["total_tests"] == 3
+    assert len(payload["junit"]["failures"]) == 2
+    assert payload["junit"]["failures"][0]["name"] == "test_fail"
+    names = [a["name"] for a in payload["artifacts"]]
+    assert "test-results" in names
+    assert any(a["parsed"] for a in payload["artifacts"])

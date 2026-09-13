@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import statistics
@@ -25,6 +26,7 @@ from .extract import ERROR_LINE
 from .models import DrainReport, LogTemplate, TemplateVariable
 from .redact import redact_text
 
+_LOG = logging.getLogger(__name__)
 _TIER_ORDER = {"T1": 0, "T2": 1, "T3": 2, "T4": 3, "T5": 4}
 
 
@@ -115,12 +117,41 @@ def persistence_filename(key: str) -> str:
     return f"{safe}.bin"
 
 
+def workflow_bin_prefix(workflow: str) -> str:
+    prefix = re.sub(r"[^\w.-]+", "_", f"{workflow}_")
+    if not prefix.endswith("_"):
+        prefix += "_"
+    return prefix
+
+
+def resolve_state_path(
+    key: str,
+    drain_dir: str | Path,
+    *,
+    workflow: str | None = None,
+) -> tuple[Path, str | None]:
+    """Exact `{workflow}_{job}.bin`, else any `{workflow}_*.bin` fallback."""
+    directory = Path(drain_dir)
+    exact = directory / persistence_filename(key)
+    if exact.exists():
+        return exact, None
+    if not workflow or not directory.is_dir():
+        return exact, None
+    prefix = workflow_bin_prefix(workflow)
+    matches = sorted(path for path in directory.glob("*.bin") if path.name.startswith(prefix))
+    if not matches:
+        return exact, None
+    chosen = matches[0]
+    return chosen, chosen.name
+
+
 @dataclass
 class NoveltyResult:
     report: DrainReport
     fingerprint_fine: str
     fingerprint_coarse: str
     hash_input: list[str] = field(default_factory=list)
+    fallback_file: str | None = None
 
 
 def _load_config(config_path: str | Path) -> TemplateMinerConfig:
@@ -152,7 +183,7 @@ def train(
     *,
     drain_dir: str | Path,
     config_path: str | Path | None = None,
-) -> None:
+) -> Path:
     ini = str(config_path or default_config_path())
     path = Path(drain_dir) / persistence_filename(key)
     miner = _miner(state_path=path, config_path=ini, persist=True)
@@ -160,6 +191,9 @@ def train(
         if line.strip():
             miner.add_log_message(line)
     miner.save_state("train")
+    resolved = path.resolve()
+    _LOG.info("Drain3 wrote %s", resolved)
+    return resolved
 
 
 def novelty(
@@ -168,10 +202,13 @@ def novelty(
     *,
     drain_dir: str | Path,
     config_path: str | Path | None = None,
+    workflow: str | None = None,
 ) -> NoveltyResult:
     ini = str(config_path or default_config_path())
-    path = Path(drain_dir) / persistence_filename(key)
+    path, fallback_file = resolve_state_path(key, drain_dir, workflow=workflow)
     available = path.exists()
+    if fallback_file:
+        _LOG.info("Drain3 fallback %s (job key %s missing)", path, key)
     miner = _miner(state_path=path, config_path=ini, persist=False)
     baseline_counts: dict[str, int] = {}
     if available:
@@ -235,6 +272,7 @@ def novelty(
         fingerprint_fine=fine,
         fingerprint_coarse=coarse,
         hash_input=hash_input,
+        fallback_file=fallback_file,
     )
 
 

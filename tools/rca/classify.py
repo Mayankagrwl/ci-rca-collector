@@ -185,23 +185,32 @@ def classify_lines(lines: Sequence[str]) -> ClassificationHit:
 def check_same_sha_flake(
     prior_runs: Sequence[Mapping[str, Any]],
     workflow_name: str,
+    job_names: Sequence[str] | None = None,
 ) -> ClassificationHit | None:
-    """Stage 3. `prior_runs` must already exclude the current run."""
+    """Stage 3. Same-SHA success counts only for the same job name."""
     if not workflow_name:
+        return None
+    wanted = {name for name in (job_names or []) if name}
+    if not wanted:
         return None
     for run in prior_runs:
         if run.get("conclusion") != "success":
             continue
-        if _workflow_name(run) == workflow_name:
-            return ClassificationHit(
-                category="unknown",
-                confidence="high",
-                is_infra_vs_code="unknown",
-                is_flaky=True,
-                short_circuit="flake_same_sha_passed",
-                reason="same SHA previously succeeded for this workflow",
-                requires_analysis=False,
-            )
+        if _workflow_name(run) != workflow_name:
+            continue
+        for job in run.get("jobs") or []:
+            if not isinstance(job, Mapping):
+                continue
+            if job.get("name") in wanted and job.get("conclusion") == "success":
+                return ClassificationHit(
+                    category="unknown",
+                    confidence="high",
+                    is_infra_vs_code="unknown",
+                    is_flaky=True,
+                    short_circuit="flake_same_sha_passed",
+                    reason="same SHA previously succeeded for this job",
+                    requires_analysis=False,
+                )
     return None
 
 
@@ -236,6 +245,7 @@ def classify_failure(
     step_conclusions: Sequence[str | None] | None = None,
     durations: Sequence[int | None] | None = None,
     timeout_minutes: int | None = None,
+    job_names: Sequence[str] | None = None,
 ) -> ClassificationHit:
     """Compose Stages 1, 3 and 5. Short-circuits win and skip Stage 5."""
     if no_failed_jobs:
@@ -274,7 +284,9 @@ def classify_failure(
         if infra is not None:
             return infra
 
-    flake = check_same_sha_flake(prior_same_sha_runs or [], workflow_name)
+    flake = check_same_sha_flake(
+        prior_same_sha_runs or [], workflow_name, job_names=job_names
+    )
     notes: list[str] = []
     if run_attempt > 1:
         notes.append(f"run_attempt={run_attempt}")

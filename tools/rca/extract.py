@@ -22,6 +22,13 @@ ERROR_LINE = re.compile(
     r'TypeError|NameError|File "',
     re.IGNORECASE,
 )
+# Center the first-error window on executed output, not the step script listing.
+_WINDOW_ERROR = re.compile(
+    r"Exception:|(?<![A-Za-z])ERROR(?![A-Za-z])|panic:|##\[error\]|fatal error:",
+    re.IGNORECASE,
+)
+_SHELL_LINE = re.compile(r"^shell:\s", re.IGNORECASE)
+_ENV_HEADER = re.compile(r"^env:\s*$", re.IGNORECASE)
 _EXIT_CODE = re.compile(r"Process completed with exit code (\d+)", re.IGNORECASE)
 _FRAME = re.compile(
     r"^(?:"
@@ -95,14 +102,41 @@ def _error_lines(lines: list[str]) -> list[ErrorLine]:
     return found
 
 
+def _skip_script_preamble(lines: list[str]) -> int:
+    """Index of the first executed output line (after `shell:` / env block)."""
+    for index, record in enumerate(lines):
+        head = record.split("\n", 1)[0].strip()
+        if not _SHELL_LINE.match(head):
+            continue
+        start = index + 1
+        if start < len(lines) and _ENV_HEADER.match(lines[start].split("\n", 1)[0].strip()):
+            start += 1
+            while start < len(lines):
+                nxt = lines[start].split("\n", 1)[0]
+                if nxt.startswith(" ") or nxt.startswith("\t") or not nxt.strip():
+                    start += 1
+                    continue
+                break
+        return start
+    return 0
+
+
+def _first_error_index(lines: list[str]) -> int | None:
+    start = _skip_script_preamble(lines)
+    for index in range(start, len(lines)):
+        if _WINDOW_ERROR.search(lines[index]):
+            return index
+    for index in range(start, len(lines)):
+        if ERROR_LINE.search(lines[index]):
+            return index
+    return None
+
+
 def _windows(lines: list[str]) -> list[LogWindow]:
     if not lines:
         return []
     total = len(lines)
-    error_index = next(
-        (i for i, record in enumerate(lines) if ERROR_LINE.search(record)),
-        None,
-    )
+    error_index = _first_error_index(lines)
     first: LogWindow | None = None
     if error_index is not None:
         start = max(1, error_index + 1 - FIRST_ERROR_CONTEXT_LINES)

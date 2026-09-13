@@ -269,6 +269,46 @@ class GitHubClient:
             return []
         return data
 
+    def list_artifacts(self, repo: str, run_id: int) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        url: str | None = (
+            f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page={_JOBS_PER_PAGE}"
+        )
+        while url:
+            response = self._request("GET", url)
+            if response.status_code >= 400:
+                raise GitHubAPIError(
+                    f"failed to list artifacts for run {run_id} ({response.status_code})",
+                    status_code=response.status_code,
+                )
+            payload = response.json()
+            page = payload.get("artifacts", payload) if isinstance(payload, dict) else payload
+            if not isinstance(page, list):
+                raise GitHubAPIError("artifacts payload was not a list")
+            artifacts.extend(page)
+            url = _next_link(response.headers.get("link") or response.headers.get("Link"))
+        return artifacts
+
+    def download_artifact_zip(self, repo: str, artifact_id: int) -> bytes | None:
+        """Download an artifact zip. Follows the short-lived 302; does not cache it."""
+        path = f"repos/{repo}/actions/artifacts/{artifact_id}/zip"
+        try:
+            response = self._request("GET", path, follow_redirects=False)
+        except GitHubAPIError as exc:
+            if exc.status_code in (404, 410):
+                return None
+            raise
+        if response.status_code in (404, 410):
+            return None
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("location") or response.headers.get("Location")
+            if not location:
+                return None
+            return self._fetch_redirect_bytes(location)
+        if response.status_code >= 400:
+            return None
+        return response.content
+
     def get_job_log(self, repo: str, job_id: int) -> str | None:
         """Fetch plaintext job logs. Follows the short-lived 302; does not cache it."""
         path = f"repos/{repo}/actions/jobs/{job_id}/logs"
@@ -306,6 +346,23 @@ class GitHubClient:
         if response.status_code >= 400:
             return None
         return response.text
+
+    def _fetch_redirect_bytes(self, location: str) -> bytes | None:
+        anon_kwargs: dict[str, Any] = {
+            "timeout": self._timeout,
+            "follow_redirects": True,
+            "headers": {"Accept": "application/zip, application/octet-stream, */*"},
+        }
+        if self._transport is not None:
+            anon_kwargs["transport"] = self._transport
+        try:
+            with httpx.Client(**anon_kwargs) as anon:
+                response = anon.get(location)
+        except httpx.HTTPError:
+            return None
+        if response.status_code >= 400:
+            return None
+        return response.content
 
 
 def _next_link(link_header: str | None) -> str | None:

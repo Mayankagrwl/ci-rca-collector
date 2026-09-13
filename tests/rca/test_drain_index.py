@@ -87,6 +87,38 @@ def test_masking_config_hash_normalises_order_and_whitespace(tmp_path: Path) -> 
     assert masking_config_hash(str(re_path)) != base
 
 
+def test_novelty_falls_back_to_same_workflow_bin(tmp_path: Path) -> None:
+    healthy = [f"INFO processing record {i} of 200 [ok]" for i in range(1, 80)]
+    train(
+        healthy,
+        "Test Failure Scenarios_baseline",
+        drain_dir=tmp_path,
+        config_path=_INI,
+    )
+    failing = healthy[-5:] + [
+        "Exception: Connection refused to db:5432",
+        "ERROR failed to flush buffer: connection reset by peer",
+    ]
+    result = novelty(
+        failing,
+        "Test Failure Scenarios_noisy",
+        drain_dir=tmp_path,
+        config_path=_INI,
+        workflow="Test Failure Scenarios",
+    )
+    assert result.report.baseline_available is True
+    assert result.fallback_file == "Test_Failure_Scenarios_baseline.bin"
+    exact = novelty(
+        failing,
+        "Test Failure Scenarios_baseline",
+        drain_dir=tmp_path,
+        config_path=_INI,
+        workflow="Test Failure Scenarios",
+    )
+    assert exact.fallback_file is None
+    assert exact.report.baseline_available is True
+
+
 def test_train_then_novelty_sets_novel_flags(tmp_path: Path) -> None:
     healthy = ["INFO processing record 1", "INFO processing record 2", "INFO processing record 3"]
     train(healthy, "CI_build", drain_dir=tmp_path, config_path=_INI)

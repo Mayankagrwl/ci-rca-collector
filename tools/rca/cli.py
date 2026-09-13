@@ -10,7 +10,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from dateutil.parser import isoparse
 
@@ -18,6 +18,7 @@ from .budget import apply_budget
 from .cleaner import CleanResult, clean_log
 from .classify import ClassificationHit, classify_failure
 from .config import (
+    ARTIFACT_DOWNLOAD_MAX_BYTES,
     COLLECTOR_VERSION,
     MAX_FAILED_JOBS_ANALYSED,
     QUEUE_SECONDS_THRESHOLD,
@@ -35,17 +36,25 @@ from .drain_index import (
 )
 from .extract import extract_from_lines
 from .github_api import GitHubAPIError, GitHubClient
+from .junit import (
+    artifact_looks_like_junit,
+    merge_junit_reports,
+    parse_junit_from_zip,
+    parse_junit_xml,
+)
 from .history import (
     lookup_recurrence,
     open_store,
     summarize as summarize_history,
 )
 from .models import (
+    ArtifactInfo,
     BudgetReport,
     Classification,
     FailedJob,
     FailureRecord,
     HistoryContext,
+    JUnitReport,
     RunnerInfo,
     RunMeta,
     StepInfo,
@@ -202,6 +211,7 @@ def _cmd_capture(args: argparse.Namespace) -> int:
                     same_sha = client.list_runs(args.repo, head_sha=str(sha))
                 except GitHubAPIError as exc:
                     _LOG.warning("same-SHA runs unavailable: %s", exc)
+            _enrich_same_sha_jobs(client, args.repo, current=run, same_sha=same_sha, notes=[])
             _write_json(out / "same_sha_runs.json", same_sha)
             branch_runs: list[dict[str, Any]] = []
             last_success: dict[str, Any] | None = None
@@ -335,7 +345,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
                 continue
             cleaned = clean_log(raw).lines
             key = f"{workflow}_{job.get('name') or 'job'}"
-            drain_train(cleaned, key, drain_dir=drain_dir)
+            written = drain_train(cleaned, key, drain_dir=drain_dir)
+            _LOG.info("Drain3 wrote %s", written)
             trained += 1
             line_total += sum(1 for line in cleaned if str(line).strip())
         if trained == 0:
@@ -475,6 +486,7 @@ def _fetch_live(
                 same_sha = client.list_runs(repo, head_sha=str(sha))
             except GitHubAPIError as exc:
                 notes.append(f"same-SHA runs unavailable: {exc}")
+        _enrich_same_sha_jobs(client, repo, current=run, same_sha=same_sha, notes=notes)
         branch_runs: list[dict[str, Any]] = []
         last_success: dict[str, Any] | None = None
         pull_obj: dict[str, Any] | None = None
@@ -527,7 +539,9 @@ def _fetch_live(
                 notes.append(f"compare unavailable: {exc}")
         elif not optional:
             notes.append("skipped compare (rate limit)")
-        notes.append("Artifacts and JUnit not collected in this slice.")
+        artifact_infos, junit_report = _collect_artifacts_live(
+            client, repo, run_id, notes, optional=optional
+        )
         notes.extend(client.collection_notes)
         return {
             "repo": repo,
@@ -540,6 +554,8 @@ def _fetch_live(
             "last_success": last_success,
             "compare": compare_obj,
             "pull": pull_obj,
+            "artifacts": artifact_infos,
+            "junit": junit_report,
             "from_fixture": False,
             "notes": notes,
         }
@@ -580,6 +596,7 @@ def _load_fixture(path: Path) -> dict[str, Any]:
                 logs[int(stem)] = None
             else:
                 logs[int(stem)] = file.read_text(encoding="utf-8-sig")
+    artifact_infos, junit_report = _load_fixture_artifacts(path)
     return {
         "repo": meta.get("repo"),
         "run": run,
@@ -591,10 +608,11 @@ def _load_fixture(path: Path) -> dict[str, Any]:
         "last_success": _optional_obj(path / "last_success.json"),
         "compare": _optional_obj(path / "compare.json"),
         "pull": _optional_obj(path / "pull.json"),
+        "artifacts": artifact_infos,
+        "junit": junit_report,
         "from_fixture": True,
         "notes": [
             "replayed from fixture (no network)",
-            "Artifacts and JUnit not collected in this slice.",
         ],
     }
 
@@ -615,6 +633,154 @@ def _optional_runs(path: Path) -> list[dict[str, Any]]:
     if isinstance(loaded, list):
         return loaded
     return []
+
+
+def _enrich_same_sha_jobs(
+    client: GitHubClient,
+    repo: str,
+    *,
+    current: dict[str, Any],
+    same_sha: list[dict[str, Any]],
+    notes: list[str],
+) -> None:
+    workflow = str(current.get("name") or "")
+    current_id = current.get("id")
+    for item in same_sha:
+        if item.get("id") == current_id:
+            continue
+        if item.get("conclusion") != "success":
+            continue
+        if str(item.get("name") or "") != workflow:
+            continue
+        if not client.optional_collection_allowed:
+            notes.append("skipped same-SHA job lookup (rate limit)")
+            return
+        run_id = item.get("id")
+        if run_id is None:
+            continue
+        try:
+            item["jobs"] = client.list_jobs(repo, int(run_id))
+        except GitHubAPIError as exc:
+            notes.append(f"same-SHA jobs unavailable for run {run_id}: {exc}")
+
+
+def _artifact_info(raw: Mapping[str, Any], *, parsed: bool = False) -> ArtifactInfo:
+    size = raw.get("size_bytes")
+    if size is None:
+        size = raw.get("size_in_bytes") or 0
+    return ArtifactInfo(
+        name=str(raw.get("name") or "artifact"),
+        size_bytes=int(size or 0),
+        expired=bool(raw.get("expired")),
+        parsed=parsed,
+    )
+
+
+def _collect_artifacts_live(
+    client: GitHubClient,
+    repo: str,
+    run_id: int,
+    notes: list[str],
+    *,
+    optional: bool,
+) -> tuple[list[ArtifactInfo], JUnitReport | None]:
+    if not optional:
+        notes.append("skipped artifacts (rate limit)")
+        return [], None
+    try:
+        raw_artifacts = client.list_artifacts(repo, run_id)
+    except GitHubAPIError as exc:
+        notes.append(f"artifacts unavailable: {exc}")
+        return [], None
+    infos: list[ArtifactInfo] = []
+    reports: list[JUnitReport | None] = []
+    for raw in raw_artifacts:
+        size = int(raw.get("size_in_bytes") or raw.get("size_bytes") or 0)
+        name = str(raw.get("name") or "artifact")
+        expired = bool(raw.get("expired"))
+        parsed = False
+        if size > ARTIFACT_DOWNLOAD_MAX_BYTES:
+            notes.append(
+                f"skipped artifact {name!r} ({size} bytes > {ARTIFACT_DOWNLOAD_MAX_BYTES} bytes)"
+            )
+        elif (
+            not expired
+            and artifact_looks_like_junit(name)
+            and client.optional_collection_allowed
+            and raw.get("id") is not None
+        ):
+            blob = client.download_artifact_zip(repo, int(raw["id"]))
+            if blob:
+                report = parse_junit_from_zip(blob, source_artifact=name)
+                if report is not None:
+                    reports.append(report)
+                    parsed = True
+        infos.append(
+            ArtifactInfo(name=name, size_bytes=size, expired=expired, parsed=parsed)
+        )
+    return infos, merge_junit_reports(reports)
+
+
+def _load_fixture_artifacts(path: Path) -> tuple[list[ArtifactInfo], JUnitReport | None]:
+    infos: list[ArtifactInfo] = []
+    art_json = path / "artifacts.json"
+    if art_json.exists():
+        loaded = json.loads(art_json.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            loaded = loaded.get("artifacts") or []
+        if isinstance(loaded, list):
+            infos = [_artifact_info(item) for item in loaded if isinstance(item, dict)]
+    reports: list[JUnitReport | None] = []
+    search_roots = [path / "artifacts", path]
+    seen: set[Path] = set()
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for file in root.rglob("*"):
+            if not file.is_file() or file in seen:
+                continue
+            seen.add(file)
+            rel = str(file.relative_to(root)) if root != path else file.name
+            if file.suffix.lower() == ".zip":
+                report = parse_junit_from_zip(
+                    file.read_bytes(), source_artifact=file.stem
+                )
+                if report is not None:
+                    reports.append(report)
+                    _mark_parsed(infos, file.stem)
+            elif file.suffix.lower() == ".xml" and (
+                "junit" in file.name.lower() or "test-results" in rel.replace("\\", "/")
+            ):
+                try:
+                    reports.append(
+                        parse_junit_xml(
+                            file.read_text(encoding="utf-8-sig"),
+                            source_artifact=file.name,
+                        )
+                    )
+                    _mark_parsed(infos, file.name)
+                    if not any(item.name in {file.name, "test-results"} for item in infos):
+                        infos.append(
+                            ArtifactInfo(
+                                name="test-results",
+                                size_bytes=file.stat().st_size,
+                                parsed=True,
+                            )
+                        )
+                except Exception:  # noqa: BLE001
+                    continue
+    report = merge_junit_reports(reports)
+    if report is not None:
+        for item in infos:
+            if artifact_looks_like_junit(item.name):
+                item.parsed = True
+    return infos, report
+
+
+def _mark_parsed(infos: list[ArtifactInfo], name: str) -> None:
+    for item in infos:
+        if item.name == name or name.startswith(item.name):
+            item.parsed = True
 
 
 def _build_summary(
@@ -664,6 +830,7 @@ def _build_summary(
         run_attempt=int(run.get("run_attempt") or 1),
         prior_same_sha_runs=prior,
         no_failed_jobs=len(candidates) == 0,
+        job_names=[str(job.get("name") or "") for job in analysed],
     )
     if hit.reason:
         notes.append(hit.reason)
@@ -679,11 +846,17 @@ def _build_summary(
             job_name = str(analysed[0].get("name") or "job")
             workflow = str(run.get("name") or "workflow")
             key = f"{workflow}_{job_name}"
-            novelty_result = novelty(cleaned_lines[0], key, drain_dir=drain_dir)
+            novelty_result = novelty(
+                cleaned_lines[0], key, drain_dir=drain_dir, workflow=workflow
+            )
             drain_report = novelty_result.report
             fine = novelty_result.fingerprint_fine
             coarse = novelty_result.fingerprint_coarse
-            if drain_report.fingerprint_degraded:
+            if novelty_result.fallback_file:
+                notes.append(
+                    f"drain fallback {novelty_result.fallback_file} (job key missing)"
+                )
+            elif drain_report.fingerprint_degraded:
                 notes.append("Drain3 baseline unavailable; novelty is tri-state and fingerprint is degraded.")
         else:
             notes.append("no cleaned lines for Drain3")
@@ -790,6 +963,8 @@ def _build_summary(
         verdict=_verdict_from_hit(hit),
         classification=_classification_from_hit(hit),
         failed_jobs=failed_jobs,
+        junit=bundle.get("junit"),
+        artifacts=list(bundle.get("artifacts") or []),
         drain=drain_report,
         changes=changes,
         history=history,

@@ -101,8 +101,15 @@ def test_infra_runner_skips_regex() -> None:
 
 def test_flake_same_sha_passed() -> None:
     hit = check_same_sha_flake(
-        [{"name": "CI", "conclusion": "success"}],
+        [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "jobs": [{"name": "Install", "conclusion": "success"}],
+            }
+        ],
         "CI",
+        job_names=["Install"],
     )
     assert hit is not None
     assert hit.short_circuit == "flake_same_sha_passed"
@@ -116,12 +123,64 @@ def test_flake_same_sha_passed() -> None:
         failed_step_names=["Install"],
         log_line_counts=[80],
         workflow_name="CI",
-        prior_same_sha_runs=[{"name": "CI", "conclusion": "success"}],
+        prior_same_sha_runs=[
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "jobs": [{"name": "Install", "conclusion": "success"}],
+            }
+        ],
+        job_names=["Install"],
     )
     assert combined.category == "dependency"
     assert combined.is_flaky is True
     assert combined.short_circuit == "flake_same_sha_passed"
     assert combined.requires_analysis is False
+
+
+def test_baseline_success_does_not_flake_noisy() -> None:
+    prior = [
+        {
+            "name": "Test Failure Scenarios",
+            "conclusion": "success",
+            "jobs": [{"name": "baseline", "conclusion": "success"}],
+        }
+    ]
+    hit = check_same_sha_flake(
+        prior,
+        "Test Failure Scenarios",
+        job_names=["noisy"],
+    )
+    assert hit is None
+    combined = classify_failure(
+        raw_logs=["Exception: Connection refused to db:5432\n"],
+        cleaned_lines=[["Exception: Connection refused to db:5432"]],
+        conclusions=["failure"],
+        failed_step_names=["Run"],
+        log_line_counts=[80],
+        workflow_name="Test Failure Scenarios",
+        prior_same_sha_runs=prior,
+        job_names=["noisy"],
+    )
+    assert combined.short_circuit != "flake_same_sha_passed"
+    assert combined.is_flaky is False
+
+
+def test_lowercase_failed_is_not_test_failure() -> None:
+    hit = classify_lines(
+        [
+            'echo "ERROR failed to flush buffer: connection reset by peer"',
+            "INFO processing record 1 of 20000 [ok]",
+            "Exception: Connection refused to db:5432",
+            "ERROR failed to flush buffer: connection reset by peer",
+        ]
+    )
+    assert hit.category != "test_failure"
+
+
+def test_uppercase_failed_is_test_failure() -> None:
+    hit = classify_lines(["FAILED t/test_x.py::test_fail"])
+    assert hit.category == "test_failure"
 
 
 def test_no_failed_jobs() -> None:

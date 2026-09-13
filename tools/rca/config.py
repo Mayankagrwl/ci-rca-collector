@@ -133,7 +133,8 @@ CLASSIFY_RULES: list[ClassifyRule] = [
     {"category": "image_pull", "pattern": r"manifest unknown", "confidence": "high"},
     {"category": "test_failure", "pattern": r"AssertionError", "confidence": "high"},
     {"category": "test_failure", "pattern": r"Test run failed", "confidence": "high"},
-    {"category": "test_failure", "pattern": r"FAILED", "confidence": "medium"},
+    # Case-sensitive: a bare "failed" in echo/script text is not a pytest FAILED line.
+    {"category": "test_failure", "pattern": r"(?-i:\bFAILED\b)", "confidence": "medium"},
     {"category": "compile", "pattern": r"error TS", "confidence": "high"},
     {"category": "compile", "pattern": r"cannot find symbol", "confidence": "high"},
     {"category": "compile", "pattern": r"SyntaxError", "confidence": "high"},
