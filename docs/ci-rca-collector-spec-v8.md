@@ -2260,10 +2260,10 @@ should do.
 Per-phase detail behind the table in §1.2. Each phase extends the **same action**, adding inputs and
 outputs rather than replacing anything. `summary.json` stays the interface between phases.
 
-- **Phase 2:** the LLM call — new inputs `llm-endpoint`, `llm-token`, `analyze: true`. Gate the call
-  on `requires-analysis == 'true'` so deterministic verdicts cost nothing. Prompt built from
-  `summary.json`, Pydantic-validated response, one repair retry, fallback to publishing `summary.md`
-  alone if the model output is unusable. New outputs: `root-cause`, `suggested-fix`, `rca-confidence`.
+- **Phase 2:** analysis via the ST ChatGPT bridge. Contract is §16. `collect` stays collection-only;
+  `analyze` is a separate CLI. Gate on `requires_analysis`, cache by fingerprint, validate citations,
+  call `trinity_for_api` then fall back to `alfred_for_api`. New outputs (wired later, not in Slice H):
+  `root-cause`, `suggested-fix`, `rca-confidence`.
 - **Phase 3:** delivery, and the point at which `history-backend` moves from `cache` to `issues`
   (§10.4) so failure memory becomes durable and engineers can supply resolutions as comments.
   Sticky PR comment, auto-created issue with labels, SMTP email. Likely a
@@ -2274,3 +2274,154 @@ outputs rather than replacing anything. `summary.json` stays the interface betwe
   Warning events, `kubectl logs --previous`, rollout status, container exit reasons. Adds a
   `kubeconfig` input and a `mode: collect-k8s`. Consider `k8sgpt` as the deterministic analyzer
   front-end. This bumps `schema_version`, and therefore the action's major version.
+
+---
+
+## 16. Phase 2 — Analysis (ST ChatGPT)
+
+Phase 1 is unchanged: `collect` still emits `summary.json` / `summary.md` and never calls a model.
+Phase 2 adds a **separate** `analyze` CLI that reads those artifacts and, when gated in, calls the
+ST ChatGPT client-apps bridge.
+
+Do **not** fold analyze into `collect`. Do **not** change `action.yml` until a later slice wires it.
+
+### 16.1 Gate
+
+Call the bridge only when `summary.verdict.requires_analysis is True`.
+
+Otherwise write an `AnalysisRecord` with `status="gated"`, make no HTTP request, and leave
+`summary.md` as the published artifact.
+
+### 16.2 Cache
+
+Cache key: `sha256(f"{fine}|{category}|{masking_hash}|{prompt_version}")[:16]`.
+
+`fine` is `summary.fingerprint`, `category` is `classification.category`, `masking_hash` is
+`drain.masking_config_hash` (empty string when Drain3 did not run).
+
+On hit: `status="cached"`, `cache_hit=True`, reuse the stored `AnalysisResult`. No HTTP.
+
+`PROMPT_VERSION` is `"p2.1"`. Bump it in the same commit as any prompt-template change.
+
+### 16.3 ST ChatGPT bridge (`stgpt_client.py`)
+
+Not OpenAI, not PyGithub. One module, httpx, same TLS helpers as the GitHub client
+(`RCA_SSL_CERT_FILE` / `RCA_SSL_VERIFY` via `resolve_ssl_verify()`).
+
+Config (`config.py`):
+
+| Name | Default / source |
+|---|---|
+| `STGPT_API_URL` | `https://api-ai-bridge-dev.st.com/chatgpt/api/client-apps` |
+| `STGPT_CLIENT_APP_NAME` | `gtrd_srmtdpplm` |
+| `STGPT_API` | env `STGPT_API` (secret name on GHES). Never log it. |
+| `PERSONAS` | `("trinity_for_api", "alfred_for_api")` |
+| `PROMPT_VERSION` | `"p2.1"` |
+| `STGPT_SERVICE` | `"chatgpt"` (the `service` segment of the auth hash) |
+
+Auth token:
+
+```
+generate_auth_token(client, service, key, ts, nonce)
+  = SHA1 hex of f"{client}_{service}_{key}_{ts}_{nonce}"
+```
+
+`post_chat(url, api_key, client_app_name, persona, messages, ...)`:
+
+- `POST {url.rstrip("/")}/{client_app_name}`
+- JSON body includes `persona` and `messages` (OpenAI-shaped `{role, content}`)
+- Headers:
+  - `stchatgpt-auth-token` — the SHA1 hex
+  - `stchatgpt-auth-nonce` — the nonce used in the hash
+  - `stchatgpt-auth-timestamp` — Unix-epoch seconds, the `ts` used in the hash
+- `verify=` from `resolve_ssl_verify()` (same order as GitHub: `RCA_SSL_CERT_FILE`,
+  `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, then `RCA_SSL_VERIFY=false`)
+- Return `(status_code, body dict, completion str | None, response_id)`
+- `completion` is `body["completion"]` when that value is a string; otherwise `None`
+- `response_id` is `body["id"]` or `body["response_id"]` when present
+- Never print or log `api_key` or the auth token. HTTP error statuses are returned, not raised.
+  Transport failures raise `StgptError` with secrets stripped.
+
+### 16.4 trinity → alfred
+
+1. Call `trinity_for_api`.
+2. Parse `completion` as JSON into `AnalysisResult`. One repair retry on the **same** persona if
+   parse fails.
+3. Run citation validation.
+4. If the result is still unusable (`parse_error`, `citation_invalid`, empty completion, or
+   bridge error), call `alfred_for_api` with the same prompt and the same one-repair-retry rule.
+5. `fallback_used=True` when alfred is invoked. `persona` records which persona produced the
+   accepted result (or the last attempt).
+6. If both personas fail: `status="unusable"` and publish `summary.md` alone.
+
+### 16.5 Citation validation
+
+Every `AnalysisCitation.quote` must be a substring of the **`<EVIDENCE>` block actually sent**
+to the model (budget 6000 tokens, built from `summary.json` only). A miss triggers one repair
+retry on the same persona. After repair (and alfred, if invoked) still invented: `status="unvalidated"`.
+Do not publish an `ok` root cause that cites text the collector did not send.
+
+Allowed `source` values: `first_error_window`, `tail_window`, `stack_traces`, `log_templates`,
+`junit`, `change_context`, `annotations`, `history`, `step_table`.
+
+### 16.6 `analyze` CLI
+
+```
+python -m tools.rca.cli analyze --summary rca/summary.json --out rca/
+```
+
+Separate subcommand from `collect`. Reads `summary.json`, applies gate → cache → bridge →
+validate, writes `analysis.json` (`AnalysisRecord`) next to the summary. Does not re-collect
+logs. Does not post PR comments or open issues.
+
+### 16.7 Schema (`models.py`)
+
+Not attached to `Summary` in Slice H (that would change collect output). Defined now so later
+slices import one schema.
+
+```python
+class AnalysisCitation(BaseModel):
+    quote: str
+    source: Literal[
+        "first_error_window", "tail_window", "stack_traces", "log_templates",
+        "junit", "change_context", "annotations", "history", "step_table",
+    ]
+    line: int | None = None
+
+class AnalysisResult(BaseModel):
+    root_cause: str
+    suggested_fix: str
+    confidence: Literal["high", "medium", "low"]
+    citations: list[AnalysisCitation] = []
+
+class AnalysisRecord(BaseModel):
+    status: Literal[
+        "ok",                 # valid result from trinity or alfred
+        "cached",             # replayed from the analysis cache
+        "gated",              # requires_analysis false, short_circuit, or missing STGPT_API
+        "unvalidated",        # structured result whose citations were not in evidence
+        "failed",             # analyze error; exit 0 unless --strict
+        "parse_error",        # completion was not a valid AnalysisResult
+        "citation_invalid",   # a quote was not in the cited evidence
+        "bridge_error",       # HTTP / auth / transport failure
+        "unusable",           # both personas failed; publish summary.md only
+    ]
+    prompt_version: str = "p2.1"
+    persona: str | None = None
+    fingerprint: str | None = None
+    schema_version: str | None = None
+    result: AnalysisResult | None = None
+    cache_hit: bool = False
+    fallback_used: bool = False
+    response_id: str | None = None
+    notes: list[str] = []
+    analyzed_at: datetime | None = None
+```
+
+### 16.8 Phase 2 build order
+
+| Slice | Ships | Must not |
+|---|---|---|
+| **H** | `stgpt_client.py`, Analysis* models, STGPT config | collect, `action.yml`, real network |
+| **I** | `prompt.py` + `analyze.py` + `analyze` CLI: gate, cache, trinity→alfred, citations | `action.yml` |
+| J | action.yml `analyze` input / outputs | changing collect's default path |

@@ -5,10 +5,12 @@ from __future__ import annotations
 import pytest
 
 from tools.rca.config import (
+    STGPT_API_URL,
     resolve_github_api_url,
     resolve_github_server_url,
     resolve_github_token,
     resolve_ssl_verify,
+    resolve_stgpt_api_url,
 )
 from tools.rca.config_host import (
     resolve_github_api_url as host_resolve_api_url,
@@ -36,11 +38,15 @@ _SSL_ENV = (
     "REQUESTS_CA_BUNDLE",
     "RCA_SSL_VERIFY",
 )
+_STGPT_ENV = (
+    "STGPT_API",
+    "STGPT_API_URL",
+)
 
 
 @pytest.fixture(autouse=True)
 def _clear_host_and_token_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in _HOST_ENV + _TOKEN_ENV + _SSL_ENV:
+    for name in _HOST_ENV + _TOKEN_ENV + _SSL_ENV + _STGPT_ENV:
         monkeypatch.delenv(name, raising=False)
 
 
@@ -93,3 +99,11 @@ def test_ssl_verify_false_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolve_ssl_verify() is False
     monkeypatch.setenv("RCA_SSL_VERIFY", "true")
     assert resolve_ssl_verify() is True
+
+
+def test_stgpt_api_url_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STGPT_API_URL", raising=False)
+    assert resolve_stgpt_api_url() == STGPT_API_URL
+    monkeypatch.setenv("STGPT_API_URL", "https://bridge.example.invalid/chatgpt/api/client-apps/")
+    assert resolve_stgpt_api_url() == "https://bridge.example.invalid/chatgpt/api/client-apps"
+    assert resolve_stgpt_api_url("https://explicit.example.invalid/") == "https://explicit.example.invalid"

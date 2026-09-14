@@ -88,8 +88,14 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_train(args)
         if args.cmd == "refingerprint":
             return _cmd_refingerprint(args)
+        if args.cmd == "analyze":
+            return _cmd_analyze(args)
         parser.error(f"unknown command {args.cmd}")
     except Exception as exc:  # noqa: BLE001 — collector must not fail the workflow
+        if getattr(args, "cmd", None) == "analyze":
+            _LOG.exception("analyze error")
+            _emit_failed_analysis(args, f"analyze error: {exc}")
+            return 1 if getattr(args, "strict", False) else 0
         _LOG.exception("collector error")
         out = getattr(args, "out", None) or "rca"
         _safe_emit(
@@ -148,6 +154,20 @@ def _build_parser() -> argparse.ArgumentParser:
     refp.add_argument("--dry-run", action="store_true")
     refp.add_argument("--history-dir", default=".rca-history")
     refp.add_argument("--drain-config", default=None)
+
+    analyze = sub.add_parser("analyze", parents=[parent])
+    analyze.add_argument("--summary", required=True, help="path to summary.json")
+    analyze.add_argument("--out", required=True, help="directory for analysis.json / summary.*")
+    analyze.add_argument(
+        "--from-completion",
+        default=None,
+        help="offline completion JSON; skips HTTP",
+    )
+    analyze.add_argument(
+        "--cache-dir",
+        default=None,
+        help="analysis cache directory (default: <out>/analysis-cache)",
+    )
     return parser
 
 
@@ -375,6 +395,70 @@ def _cmd_train(args: argparse.Namespace) -> int:
         token_budget=getattr(args, "token_budget", None),
     )
     return 0
+
+
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    from .analyze import analyze_summary, write_analysis
+    from .models import AnalysisRecord
+    from .outputs import write_analysis_github_output
+
+    out = Path(args.out)
+    summary_path = Path(args.summary)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else out / "analysis-cache"
+    try:
+        summary = Summary.model_validate_json(summary_path.read_text(encoding="utf-8"))
+        record = analyze_summary(
+            summary,
+            from_completion=args.from_completion,
+            cache_dir=cache_dir,
+        )
+        write_analysis(record, summary_path=summary_path, out_dir=out)
+        write_analysis_github_output(record)
+    except Exception as exc:  # noqa: BLE001
+        _LOG.exception("analyze error")
+        record = AnalysisRecord(
+            status="failed",
+            notes=[f"analyze error: {exc}"],
+            analyzed_at=datetime.now(timezone.utc),
+        )
+        try:
+            write_analysis(record, summary_path=summary_path, out_dir=out)
+            write_analysis_github_output(record)
+        except Exception:
+            _LOG.exception("failed to write analysis.json")
+            _emit_failed_analysis(args, f"analyze error: {exc}")
+        if args.strict:
+            return 1
+        return 0
+    if record.status == "failed" and args.strict:
+        return 1
+    return 0
+
+
+def _emit_failed_analysis(args: argparse.Namespace, note: str) -> None:
+    from .analyze import write_analysis
+    from .models import AnalysisRecord
+    from .outputs import write_analysis_github_output
+
+    out = Path(getattr(args, "out", None) or "rca")
+    summary_path = Path(getattr(args, "summary", None) or (out / "summary.json"))
+    record = AnalysisRecord(
+        status="failed",
+        notes=[note],
+        analyzed_at=datetime.now(timezone.utc),
+    )
+    try:
+        write_analysis(record, summary_path=summary_path, out_dir=out)
+        write_analysis_github_output(record)
+    except Exception:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "analysis.json").write_text(
+            record.model_dump_json(indent=2) + "\n", encoding="utf-8"
+        )
+        try:
+            write_analysis_github_output(record)
+        except Exception:
+            _LOG.exception("failed to write analysis GITHUB_OUTPUT")
 
 
 def _cmd_refingerprint(args: argparse.Namespace) -> int:

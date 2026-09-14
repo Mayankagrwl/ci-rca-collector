@@ -11,6 +11,7 @@ REPLACEMENT = "***REDACTED***"
 
 _PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b(?:ghp|gho|ghs)_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bsk-(?:live|proj|svcacct)-[A-Za-z0-9_-]+"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bBearer\s+\S+", re.IGNORECASE),

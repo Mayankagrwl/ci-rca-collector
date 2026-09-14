@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tools.rca.models import (
+    AnalysisRecord,
+    AnalysisResult,
     BudgetReport,
     Classification,
     RunMeta,
@@ -13,9 +15,12 @@ from tools.rca.models import (
     Verdict,
 )
 from tools.rca.outputs import (
+    ANALYSIS_OUTPUT_KEYS,
     OUTPUT_KEYS,
     action_outputs,
+    analysis_outputs,
     failure_outputs,
+    write_analysis_github_output,
     write_failure_outputs,
     write_github_output,
 )
@@ -97,3 +102,27 @@ def test_outputs_are_single_line(tmp_path: Path) -> None:
     assert "requires-analysis=true\n" in text
     assert "short-circuit=\n" in text
     assert failure_outputs(tmp_path)["short-circuit"] == ""
+
+
+def test_analysis_outputs_are_single_line(tmp_path: Path) -> None:
+    record = AnalysisRecord(
+        status="ok",
+        result=AnalysisResult(
+            root_cause="first line\nsecond line",
+            suggested_fix="pin it",
+            confidence="high",
+        ),
+    )
+    values = analysis_outputs(record)
+    assert set(values) == set(ANALYSIS_OUTPUT_KEYS)
+    assert values["analysis-status"] == "ok"
+    assert values["rca-confidence"] == "high"
+    assert "\n" not in values["root-cause"]
+    dest = tmp_path / "out"
+    write_analysis_github_output(record, output_file=dest)
+    text = dest.read_text(encoding="utf-8")
+    assert "analysis-status=ok\n" in text
+    assert "rca-confidence=high\n" in text
+    assert "root-cause=first line second line\n" in text
+    assert "STGPT_API" not in text
+    assert "sk-live" not in text

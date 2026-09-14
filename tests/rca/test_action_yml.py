@@ -42,9 +42,32 @@ def test_action_yml_does_not_checkout_or_hardcode_hosts() -> None:
 
 def test_run_steps_declare_bash() -> None:
     # Composite `run:` steps must set shell. `uses:` steps cannot.
-    assert ACTION.count("shell: bash") >= 3
+    assert ACTION.count("shell: bash") >= 4
     assert "python --version" in ACTION
     assert "pip --version" in ACTION
+
+
+def test_action_yml_analyze_is_separate_gated_step() -> None:
+    assert "analyze:" in ACTION
+    assert "stgpt-api-key:" in ACTION
+    assert "stgpt-api-url:" in ACTION
+    assert "default: 'true'" in ACTION
+    assert "id: analyze" in ACTION
+    assert "python -m tools.rca.cli analyze" in ACTION
+    assert "steps.collect.outputs.requires-analysis == 'true'" in ACTION
+    assert "inputs.stgpt-api-key != '' || env.STGPT_API != ''" in ACTION
+    assert "STGPT_API: ${{ inputs.stgpt-api-key != '' && inputs.stgpt-api-key || env.STGPT_API }}" in ACTION
+    assert "RCA_SSL_VERIFY: ${{ inputs.ssl-verify }}" in ACTION
+    assert "root-cause:" in ACTION
+    assert "suggested-fix:" in ACTION
+    assert "rca-confidence:" in ACTION
+    assert "analysis-status:" in ACTION
+    assert "steps.analyze.outputs.root-cause" in ACTION
+    assert "api-ai-bridge" not in ACTION
+    collect_at = ACTION.index("id: collect")
+    analyze_at = ACTION.index("id: analyze")
+    summary_at = ACTION.index("Write job summary")
+    assert collect_at < analyze_at < summary_at
 
 
 def test_reusable_workflow_exists() -> None:

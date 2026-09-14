@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .models import Summary
+from .models import AnalysisRecord, Summary
 
 OUTPUT_KEYS = (
     "summary-path",
@@ -24,6 +24,13 @@ OUTPUT_KEYS = (
     "seen-count",
     "recurrence",
     "failed-job-count",
+)
+
+ANALYSIS_OUTPUT_KEYS = (
+    "root-cause",
+    "suggested-fix",
+    "rca-confidence",
+    "analysis-status",
 )
 
 
@@ -73,6 +80,34 @@ def failure_outputs(out_dir: Path) -> dict[str, str]:
         "recurrence": "new",
         "failed-job-count": "0",
     }
+
+
+def analysis_outputs(record: AnalysisRecord) -> dict[str, str]:
+    """Map an AnalysisRecord to GITHUB_OUTPUT keys. Single-line; never tokens."""
+    result = record.result
+    raw = {
+        "root-cause": result.root_cause if result is not None else "",
+        "suggested-fix": result.suggested_fix if result is not None else "",
+        "rca-confidence": result.confidence if result is not None else "",
+        "analysis-status": record.status or "",
+    }
+    return {key: _one_line(raw[key]) for key in ANALYSIS_OUTPUT_KEYS}
+
+
+def write_analysis_github_output(
+    record: AnalysisRecord,
+    *,
+    output_file: str | Path | None = None,
+) -> None:
+    path = output_file if output_file is not None else os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    values = analysis_outputs(record)
+    with dest.open("a", encoding="utf-8") as handle:
+        for key in ANALYSIS_OUTPUT_KEYS:
+            handle.write(f"{key}={values.get(key, '')}\n")
 
 
 def write_github_output(

@@ -44,11 +44,22 @@ jobs:
       - name: Collect failure context
         id: rca
         uses: acme/ci-rca-collector@v1
+        env:
+          STGPT_API: ${{ secrets.STGPT_API }}
         with:
           run-id: ${{ github.event.workflow_run.id }}
           mode: ${{ github.event.workflow_run.conclusion == 'success' && 'train' || 'collect' }}
           github-token: ${{ secrets.COMMON_ACTIONS_PAT || github.token }}
           github-api-url: ''
+          analyze: true
+
+      - name: Report analysis
+        if: steps.rca.outputs.requires-analysis == 'true'
+        run: |
+          echo "Analysis status: ${{ steps.rca.outputs.analysis-status }}"
+          echo "Confidence: ${{ steps.rca.outputs.rca-confidence }}"
+          echo "Root cause: ${{ steps.rca.outputs.root-cause }}"
+          echo "Suggested fix: ${{ steps.rca.outputs.suggested-fix }}"
 
       - name: Upload artifact
         if: github.event.workflow_run.conclusion == 'failure'

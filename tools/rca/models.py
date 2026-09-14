@@ -329,3 +329,57 @@ class Summary(BaseModel):
     kubernetes: None = None
     budget_report: BudgetReport
     collection_notes: list[str] = []
+
+
+# --- Phase 2 analysis (§16). Not attached to Summary in Slice H. ---
+
+AnalysisStatus = Literal[
+    "ok",
+    "cached",
+    "gated",
+    "unvalidated",
+    "failed",
+    "parse_error",
+    "citation_invalid",
+    "bridge_error",
+    "unusable",
+]
+
+AnalysisCitationSource = Literal[
+    "first_error_window",
+    "tail_window",
+    "stack_traces",
+    "log_templates",
+    "junit",
+    "change_context",
+    "annotations",
+    "history",
+    "step_table",
+]
+
+
+class AnalysisCitation(BaseModel):
+    quote: str
+    source: AnalysisCitationSource
+    line: int | None = None
+
+
+class AnalysisResult(BaseModel):
+    root_cause: str
+    suggested_fix: str
+    confidence: Literal["high", "medium", "low"]
+    citations: list[AnalysisCitation] = []
+
+
+class AnalysisRecord(BaseModel):
+    status: AnalysisStatus
+    prompt_version: str = "p2.1"
+    persona: str | None = None
+    fingerprint: str | None = None
+    schema_version: str | None = None
+    result: AnalysisResult | None = None
+    cache_hit: bool = False
+    fallback_used: bool = False
+    response_id: str | None = None
+    notes: list[str] = []
+    analyzed_at: datetime | None = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TypedDict
 
 from .config_host import (
@@ -42,6 +43,35 @@ FIRST_ERROR_CONTEXT_LINES = 30
 TAIL_WINDOW_LINES = 150
 STACK_TRACE_TOP_FRAMES = 10
 STACK_TRACE_BOTTOM_FRAMES = 5
+
+# Phase 2 — ST ChatGPT bridge (§16). Analyze CLI reads these; collect does not.
+STGPT_API_URL = "https://api-ai-bridge-dev.st.com/chatgpt/api/client-apps"
+STGPT_CLIENT_APP_NAME = "gtrd_srmtdpplm"
+STGPT_SERVICE = "chatgpt"
+PERSONAS = ("trinity_for_api", "alfred_for_api")
+PROMPT_VERSION = "p2.1"
+
+
+def resolve_stgpt_api_key(explicit: str | None = None) -> str | None:
+    """Resolve the ST ChatGPT bridge key from ``STGPT_API``. Never log it."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    value = os.environ.get("STGPT_API")
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def resolve_stgpt_api_url(explicit: str | None = None) -> str:
+    """Resolve the ST ChatGPT bridge base URL. Never log secrets."""
+    if explicit and explicit.strip():
+        return explicit.strip().rstrip("/")
+    value = os.environ.get("STGPT_API_URL")
+    if value and value.strip():
+        return value.strip().rstrip("/")
+    return STGPT_API_URL
+
 
 # Case-insensitive. Matched against the raw job log (Stage 1).
 RUNNER_FAILURE_PATTERNS: list[str] = [
@@ -152,13 +182,20 @@ __all__ = [
     "COLLECTOR_VERSION",
     "MASKING_CONFIG_VERSION",
     "MAX_FAILED_JOBS_ANALYSED",
+    "PERSONAS",
+    "PROMPT_VERSION",
     "QUEUE_SECONDS_THRESHOLD",
     "RUNNER_FAILURE_PATTERNS",
     "SCHEMA_VERSION",
     "SECTION_TOKEN_CAPS",
+    "STGPT_API_URL",
+    "STGPT_CLIENT_APP_NAME",
+    "STGPT_SERVICE",
     "TOKEN_BUDGET_TOTAL",
     "resolve_github_api_url",
     "resolve_github_server_url",
     "resolve_github_token",
     "resolve_ssl_verify",
+    "resolve_stgpt_api_key",
+    "resolve_stgpt_api_url",
 ]

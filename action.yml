@@ -78,6 +78,18 @@ inputs:
     description: 'Path to a CA bundle (PEM). Used as httpx verify= when set.'
     required: false
     default: ''
+  analyze:
+    description: 'Run the ST ChatGPT analyze step after collect. Skipped when the API key is empty.'
+    required: false
+    default: 'true'
+  stgpt-api-key:
+    description: 'ST ChatGPT bridge API key. Falls back to env STGPT_API. Leave empty to skip analyze.'
+    required: false
+    default: ''
+  stgpt-api-url:
+    description: 'Override ST ChatGPT bridge base URL. Leave empty to use STGPT_API_URL / the default.'
+    required: false
+    default: ''
 
 outputs:
   summary-path:
@@ -116,6 +128,18 @@ outputs:
   failed-job-count:
     description: 'Number of failed jobs found.'
     value: ${{ steps.collect.outputs.failed-job-count }}
+  root-cause:
+    description: 'LLM root cause. Empty when analyze was skipped.'
+    value: ${{ steps.analyze.outputs.root-cause }}
+  suggested-fix:
+    description: 'LLM suggested fix. Empty when analyze was skipped.'
+    value: ${{ steps.analyze.outputs.suggested-fix }}
+  rca-confidence:
+    description: 'LLM confidence: high | medium | low. Empty when analyze was skipped.'
+    value: ${{ steps.analyze.outputs.rca-confidence }}
+  analysis-status:
+    description: 'ok | cached | gated | unvalidated | failed. Empty when analyze was skipped.'
+    value: ${{ steps.analyze.outputs.analysis-status }}
 
 runs:
   using: 'composite'
@@ -172,6 +196,34 @@ runs:
           --drain-dir "$RCA_DRAIN_DIR" \
           --history-dir "$RCA_HISTORY_DIR" \
           --history-backend "$RCA_HISTORY_BACKEND" \
+          "${extra[@]}"
+
+    - name: Analyze
+      id: analyze
+      if: >
+        inputs.analyze == 'true' &&
+        inputs.mode == 'collect' &&
+        steps.collect.outputs.requires-analysis == 'true' &&
+        (inputs.stgpt-api-key != '' || env.STGPT_API != '')
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}
+        RCA_OUT: ${{ inputs.output-dir }}
+        RCA_STRICT: ${{ inputs.fail-on-error }}
+        RCA_SSL_VERIFY: ${{ inputs.ssl-verify }}
+        RCA_SSL_CERT_FILE: ${{ inputs.ssl-cert-file }}
+        SSL_CERT_FILE: ${{ env.SSL_CERT_FILE }}
+        REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
+        STGPT_API: ${{ inputs.stgpt-api-key != '' && inputs.stgpt-api-key || env.STGPT_API }}
+        STGPT_API_URL: ${{ inputs.stgpt-api-url != '' && inputs.stgpt-api-url || env.STGPT_API_URL }}
+      run: |
+        extra=()
+        if [ "$RCA_STRICT" = "true" ]; then
+          extra+=(--strict)
+        fi
+        python -m tools.rca.cli analyze \
+          --summary "$RCA_OUT/summary.json" \
+          --out "$RCA_OUT" \
           "${extra[@]}"
 
     - name: Write job summary

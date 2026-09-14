@@ -24,6 +24,10 @@ def test_consumer_stub_for_github_com() -> None:
     assert "rca-${{ github.event.workflow_run.head_branch }}" in text
     assert "secrets.COMMON_ACTIONS_PAT || github.token" in text
     assert "github-api-url: ''" in text
+    assert "STGPT_API: ${{ secrets.STGPT_API }}" in text
+    assert "analyze: true" in text
+    assert "steps.rca.outputs.requires-analysis == 'true'" in text
+    assert "api-ai-bridge" not in text
     assert "github.st.com" not in text
 
 

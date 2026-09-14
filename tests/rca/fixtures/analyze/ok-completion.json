@@ -1,0 +1,13 @@
+{
+  "completion": {
+    "root_cause": "npm could not resolve a dependency (ERESOLVE).",
+    "suggested_fix": "Align the conflicting package versions in package.json and retry the install.",
+    "confidence": "high",
+    "citations": [
+      {
+        "quote": "npm ERR! ERESOLVE could not resolve",
+        "source": "first_error_window"
+      }
+    ]
+  }
+}
