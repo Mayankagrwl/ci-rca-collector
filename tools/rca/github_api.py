@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import ssl
 import time
 from collections.abc import Callable
 from typing import Any
@@ -9,7 +11,14 @@ from urllib.parse import quote
 
 import httpx
 
-from .config import RATE_LIMIT_OPTIONAL_FLOOR, resolve_github_api_url, resolve_github_token
+from .config import (
+    RATE_LIMIT_OPTIONAL_FLOOR,
+    resolve_github_api_url,
+    resolve_github_token,
+    resolve_ssl_verify,
+)
+
+_LOG = logging.getLogger(__name__)
 
 _API_VERSION = "2022-11-28"
 _ACCEPT = "application/vnd.github+json"
@@ -38,6 +47,7 @@ class GitHubClient:
     ) -> None:
         self.api_url = resolve_github_api_url(api_url)
         token_value = resolve_github_token(token)
+        self.verify = resolve_ssl_verify()
         headers: dict[str, str] = {
             "Accept": _ACCEPT,
             "X-GitHub-Api-Version": _API_VERSION,
@@ -50,6 +60,7 @@ class GitHubClient:
             "headers": headers,
             "timeout": timeout,
             "follow_redirects": False,
+            "verify": self.verify,
         }
         if transport is not None:
             client_kwargs["transport"] = transport
@@ -60,6 +71,13 @@ class GitHubClient:
         self.rate_limit_remaining: int | None = None
         self.rate_limit_reset: int | None = None
         self.collection_notes: list[str] = []
+        if self.verify is False:
+            note = (
+                f"TLS verification disabled (RCA_SSL_VERIFY=false); "
+                f"API base {self.api_url}"
+            )
+            self.collection_notes.append(note)
+            _LOG.warning(note)
 
     def close(self) -> None:
         self._client.close()
@@ -102,6 +120,27 @@ class GitHubClient:
                 pass
         self._note_rate_limit()
 
+    def _ssl_error(self, exc: BaseException, *, method: str, url: str) -> GitHubAPIError:
+        note = (
+            f"SSL error talking to GitHub API at {self.api_url} "
+            f"({method} {url}): {exc}"
+        )
+        if note not in self.collection_notes:
+            self.collection_notes.append(note)
+        _LOG.error(note)
+        return GitHubAPIError(note)
+
+    def _anon_client_kwargs(self, headers: dict[str, str]) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "timeout": self._timeout,
+            "follow_redirects": True,
+            "headers": headers,
+            "verify": self.verify,
+        }
+        if self._transport is not None:
+            kwargs["transport"] = self._transport
+        return kwargs
+
     def _request(
         self,
         method: str,
@@ -122,6 +161,16 @@ class GitHubClient:
                 )
             except httpx.TimeoutException as exc:
                 last_error = GitHubAPIError(f"timeout talking to GitHub API ({method} {url})")
+                if attempt == _MAX_ATTEMPTS - 1:
+                    raise last_error from exc
+                self._sleep(2**attempt)
+                continue
+            except (httpx.ConnectError, httpx.ProtocolError, ssl.SSLError) as exc:
+                if _is_ssl_error(exc):
+                    raise self._ssl_error(exc, method=method, url=url) from exc
+                last_error = GitHubAPIError(
+                    f"connection error talking to GitHub API ({method} {url}): {exc}"
+                )
                 if attempt == _MAX_ATTEMPTS - 1:
                     raise last_error from exc
                 self._sleep(2**attempt)
@@ -331,38 +380,48 @@ class GitHubClient:
 
     def _fetch_redirect_body(self, location: str) -> str | None:
         # Signed blob URLs must not inherit the GitHub Authorization header.
-        anon_kwargs: dict[str, Any] = {
-            "timeout": self._timeout,
-            "follow_redirects": True,
-            "headers": {"Accept": "text/plain, */*"},
-        }
-        if self._transport is not None:
-            anon_kwargs["transport"] = self._transport
         try:
-            with httpx.Client(**anon_kwargs) as anon:
+            with httpx.Client(
+                **self._anon_client_kwargs({"Accept": "text/plain, */*"})
+            ) as anon:
                 response = anon.get(location)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            if _is_ssl_error(exc):
+                self._ssl_error(exc, method="GET", url=location)
             return None
         if response.status_code >= 400:
             return None
         return response.text
 
     def _fetch_redirect_bytes(self, location: str) -> bytes | None:
-        anon_kwargs: dict[str, Any] = {
-            "timeout": self._timeout,
-            "follow_redirects": True,
-            "headers": {"Accept": "application/zip, application/octet-stream, */*"},
-        }
-        if self._transport is not None:
-            anon_kwargs["transport"] = self._transport
         try:
-            with httpx.Client(**anon_kwargs) as anon:
+            with httpx.Client(
+                **self._anon_client_kwargs(
+                    {"Accept": "application/zip, application/octet-stream, */*"}
+                )
+            ) as anon:
                 response = anon.get(location)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            if _is_ssl_error(exc):
+                self._ssl_error(exc, method="GET", url=location)
             return None
         if response.status_code >= 400:
             return None
         return response.content
+
+
+def _is_ssl_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLError):
+            return True
+        text = str(current).lower()
+        if "ssl" in text or "certificate" in text:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _next_link(link_header: str | None) -> str | None:

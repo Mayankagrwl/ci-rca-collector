@@ -70,6 +70,14 @@ inputs:
     description: 'Fail the step if collection itself errors. Default false — see §13.'
     required: false
     default: 'false'
+  ssl-verify:
+    description: 'Verify TLS certificates. Set false only for GHES with a private CA you cannot install.'
+    required: false
+    default: 'true'
+  ssl-cert-file:
+    description: 'Path to a CA bundle (PEM). Used as httpx verify= when set.'
+    required: false
+    default: ''
 
 outputs:
   summary-path:
@@ -147,6 +155,10 @@ runs:
         RCA_HISTORY_DIR: ${{ inputs.history-dir }}
         RCA_HISTORY_BACKEND: ${{ inputs.history-backend }}
         RCA_STRICT: ${{ inputs.fail-on-error }}
+        RCA_SSL_VERIFY: ${{ inputs.ssl-verify }}
+        RCA_SSL_CERT_FILE: ${{ inputs.ssl-cert-file }}
+        SSL_CERT_FILE: ${{ env.SSL_CERT_FILE }}
+        REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
       run: |
         extra=()
         if [ "$RCA_STRICT" = "true" ]; then

@@ -8,6 +8,7 @@ from tools.rca.config import (
     resolve_github_api_url,
     resolve_github_server_url,
     resolve_github_token,
+    resolve_ssl_verify,
 )
 from tools.rca.config_host import (
     resolve_github_api_url as host_resolve_api_url,
@@ -29,9 +30,17 @@ _TOKEN_ENV = (
 )
 
 
+_SSL_ENV = (
+    "RCA_SSL_CERT_FILE",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "RCA_SSL_VERIFY",
+)
+
+
 @pytest.fixture(autouse=True)
 def _clear_host_and_token_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in _HOST_ENV + _TOKEN_ENV:
+    for name in _HOST_ENV + _TOKEN_ENV + _SSL_ENV:
         monkeypatch.delenv(name, raising=False)
 
 
@@ -63,3 +72,24 @@ def test_common_actions_pat_wins_over_github_token(
     monkeypatch.setenv("GITHUB_TOKEN", "pat-from-github")
     assert resolve_github_token() == "pat-from-common"
     assert host_resolve_token() == "pat-from-common"
+
+
+def test_ssl_verify_default_true() -> None:
+    assert resolve_ssl_verify() is True
+
+
+def test_ssl_cert_file_wins_over_verify_false(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pem = tmp_path / "ca.pem"
+    pem.write_text("ca")
+    monkeypatch.setenv("SSL_CERT_FILE", str(pem))
+    monkeypatch.setenv("RCA_SSL_VERIFY", "false")
+    assert resolve_ssl_verify() == str(pem)
+
+
+def test_ssl_verify_false_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RCA_SSL_VERIFY", "false")
+    assert resolve_ssl_verify() is False
+    monkeypatch.setenv("RCA_SSL_VERIFY", "true")
+    assert resolve_ssl_verify() is True

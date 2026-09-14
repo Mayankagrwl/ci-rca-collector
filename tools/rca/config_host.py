@@ -72,6 +72,22 @@ def resolve_github_api_url(api_url: str | None = None) -> str:
     return _DEFAULT_API_URL
 
 
+def resolve_ssl_verify() -> bool | str:
+    """httpx ``verify=``: CA bundle path, False, or True (default).
+
+    Order: ``RCA_SSL_CERT_FILE``, ``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``,
+    then ``RCA_SSL_VERIFY=false`` as a GHES escape hatch, else True.
+    """
+    for name in ("RCA_SSL_CERT_FILE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        value = _env(name)
+        if value:
+            return value
+    flag = _env("RCA_SSL_VERIFY")
+    if flag and flag.lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
 def resolve_github_token(token: str | None = None) -> str | None:
     """Resolve a GitHub token. Never log the result.
 

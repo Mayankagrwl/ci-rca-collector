@@ -22,11 +22,17 @@ _TOKEN_ENV = (
     "GITHUB_TOKEN",
     "GH_TOKEN",
 )
+_SSL_ENV = (
+    "RCA_SSL_CERT_FILE",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "RCA_SSL_VERIFY",
+)
 
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in _HOST_ENV + _TOKEN_ENV:
+    for name in _HOST_ENV + _TOKEN_ENV + _SSL_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("COMMON_ACTIONS_PAT", "test-token")
 
@@ -136,3 +142,56 @@ def test_rate_limit_exhausted_does_not_retry() -> None:
     assert calls["n"] == 1
     assert sleeps == []
     assert client.optional_collection_allowed is False
+
+
+def test_ssl_verify_defaults_true() -> None:
+    with GitHubClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json={})),
+        sleep=lambda _d: None,
+    ) as client:
+        assert client.verify is True
+
+
+def test_ssl_cert_file_env_sets_verify_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "corp-ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("RCA_SSL_CERT_FILE", str(bundle))
+    monkeypatch.setenv("RCA_SSL_VERIFY", "false")
+    with GitHubClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json={})),
+        sleep=lambda _d: None,
+    ) as client:
+        assert client.verify == str(bundle)
+
+
+def test_ssl_verify_false_notes_api_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RCA_SSL_VERIFY", "false")
+    monkeypatch.setenv("RCA_GITHUB_API_URL", "https://ghes.example.invalid/api/v3")
+    with GitHubClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"id": 1})),
+        sleep=lambda _d: None,
+    ) as client:
+        assert client.verify is False
+        assert client.api_url == "https://ghes.example.invalid/api/v3"
+        blob = " ".join(client.collection_notes)
+        assert "https://ghes.example.invalid/api/v3" in blob
+        assert "TLS verification disabled" in blob
+
+
+def test_ssl_error_includes_api_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RCA_GITHUB_API_URL", "https://ghes.example.invalid/api/v3")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "self-signed certificate in certificate chain",
+            request=request,
+        )
+
+    with GitHubClient(transport=httpx.MockTransport(handler), sleep=lambda _d: None) as client:
+        with pytest.raises(GitHubAPIError, match="ghes.example.invalid/api/v3") as caught:
+            client.get_run("acme/widgets", 1)
+        assert "SSL" in str(caught.value)
+        assert any("ghes.example.invalid/api/v3" in note for note in client.collection_notes)

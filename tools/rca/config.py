@@ -8,6 +8,7 @@ from .config_host import (
     resolve_github_api_url,
     resolve_github_server_url,
     resolve_github_token,
+    resolve_ssl_verify,
 )
 
 COLLECTOR_VERSION = "0.1.0"
@@ -159,4 +160,5 @@ __all__ = [
     "resolve_github_api_url",
     "resolve_github_server_url",
     "resolve_github_token",
+    "resolve_ssl_verify",
 ]

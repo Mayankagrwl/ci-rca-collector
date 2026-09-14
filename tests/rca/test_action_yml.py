@@ -14,6 +14,15 @@ def test_action_yml_has_host_overrides_empty_by_default() -> None:
     assert "default: ''" in ACTION
 
 
+def test_action_yml_forwards_ssl_inputs() -> None:
+    assert "ssl-verify:" in ACTION
+    assert "ssl-cert-file:" in ACTION
+    assert "RCA_SSL_VERIFY: ${{ inputs.ssl-verify }}" in ACTION
+    assert "RCA_SSL_CERT_FILE: ${{ inputs.ssl-cert-file }}" in ACTION
+    assert "SSL_CERT_FILE: ${{ env.SSL_CERT_FILE }}" in ACTION
+    assert "REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}" in ACTION
+
+
 def test_action_yml_forwards_host_and_token_env() -> None:
     assert "GITHUB_TOKEN: ${{ inputs.github-token }}" in ACTION
     assert "COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}" in ACTION
