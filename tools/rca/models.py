@@ -369,6 +369,7 @@ class AnalysisResult(BaseModel):
     suggested_fix: str
     confidence: Literal["high", "medium", "low"]
     citations: list[AnalysisCitation] = []
+    cannot_determine: bool = False
 
 
 class AnalysisRecord(BaseModel):
@@ -383,3 +384,4 @@ class AnalysisRecord(BaseModel):
     response_id: str | None = None
     notes: list[str] = []
     analyzed_at: datetime | None = None
+    raw_completion: str | None = None

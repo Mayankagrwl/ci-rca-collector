@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 import uuid
@@ -93,11 +94,68 @@ def post_chat(
         raise StgptError(_public_error(exc, endpoint)) from None
 
     body = _json_object(response)
-    completion = body.get("completion")
-    if not isinstance(completion, str):
-        completion = None
+    completion = extract_completion(body)
     response_id = _response_id(body)
     return ChatResult(response.status_code, body, completion, response_id, endpoint)
+
+
+def extract_completion(body: Mapping[str, Any] | None) -> str | None:
+    """Pull a completion string from common ST ChatGPT / OpenAI-shaped bodies."""
+    if not body:
+        return None
+    for key in ("completion", "text", "content", "output", "answer"):
+        got = _as_completion_text(body.get(key))
+        if got:
+            return got
+    message = body.get("message")
+    if isinstance(message, dict):
+        got = _as_completion_text(message.get("content") or message.get("completion"))
+        if got:
+            return got
+    data = body.get("data")
+    if isinstance(data, Mapping):
+        nested = extract_completion(data)
+        if nested:
+            return nested
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, Mapping):
+            nested = extract_completion(first)
+            if nested:
+                return nested
+            msg = first.get("message")
+            if isinstance(msg, Mapping):
+                got = _as_completion_text(msg.get("content") or msg.get("completion"))
+                if got:
+                    return got
+    if any(
+        key in body
+        for key in ("root_cause", "rootCause", "suggested_fix", "suggestedFix")
+    ):
+        try:
+            return json.dumps(dict(body), ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _as_completion_text(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, Mapping):
+        if any(
+            key in value
+            for key in ("root_cause", "rootCause", "suggested_fix", "suggestedFix")
+        ):
+            try:
+                return json.dumps(dict(value), ensure_ascii=False)
+            except (TypeError, ValueError):
+                return None
+        inner = value.get("content") or value.get("completion") or value.get("text")
+        if inner is not value:
+            return _as_completion_text(inner)
+    return None
 
 
 def public_request_url(url: str | None) -> str:

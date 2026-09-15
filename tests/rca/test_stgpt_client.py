@@ -20,7 +20,13 @@ from tools.rca.config import (
     resolve_stgpt_api_key,
 )
 from tools.rca.models import AnalysisCitation, AnalysisRecord, AnalysisResult
-from tools.rca.stgpt_client import ChatResult, StgptError, generate_auth_token, post_chat
+from tools.rca.stgpt_client import (
+    ChatResult,
+    StgptError,
+    extract_completion,
+    generate_auth_token,
+    post_chat,
+)
 
 _SSL_ENV = (
     "RCA_SSL_CERT_FILE",
@@ -134,6 +140,18 @@ def test_post_chat_uses_base_url_without_client_app_path() -> None:
     assert STGPT_CLIENT_APP_NAME not in str(seen[0].url)
     body = json.loads(seen[0].content.decode("utf-8"))
     assert body["clientAppName"] == STGPT_CLIENT_APP_NAME
+
+
+def test_extract_completion_from_camelcase_body() -> None:
+    body = {
+        "rootCause": "lockfile drift",
+        "suggestedFix": "pin it",
+        "confidence": "high",
+    }
+    text = extract_completion(body)
+    assert text is not None
+    payload = json.loads(text)
+    assert payload["rootCause"] == "lockfile drift"
 
 
 def test_post_chat_completion_missing_is_none() -> None:

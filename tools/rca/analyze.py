@@ -26,7 +26,33 @@ from .redact import redact_text
 from .stgpt_client import ChatResult, StgptError, post_chat, public_request_url
 
 _LOG = logging.getLogger(__name__)
-_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+_FENCE_BLOCK = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+_PREVIEW_CHARS = 240
+_PROSE_CAP = 1500
+_KEY_ALIASES = {
+    "rootCause": "root_cause",
+    "root_cause": "root_cause",
+    "cause": "root_cause",
+    "diagnosis": "root_cause",
+    "suggestedFix": "suggested_fix",
+    "suggested_fix": "suggested_fix",
+    "fix": "suggested_fix",
+    "cannotDetermine": "cannot_determine",
+    "cannot_determine": "cannot_determine",
+    "confidence": "confidence",
+    "citations": "citations",
+}
+_CITATION_SOURCES = {
+    "first_error_window",
+    "tail_window",
+    "stack_traces",
+    "log_templates",
+    "junit",
+    "change_context",
+    "annotations",
+    "history",
+    "step_table",
+}
 ChatFn = Callable[[str, Sequence[Mapping[str, str]]], ChatResult]
 
 
@@ -79,7 +105,11 @@ def analyze_summary(
                 }
             )
 
-        if from_completion is None and not resolve_stgpt_api_key(api_key):
+        if (
+            chat_fn is None
+            and from_completion is None
+            and not resolve_stgpt_api_key(api_key)
+        ):
             return base.model_copy(
                 update={
                     "status": "gated",
@@ -132,8 +162,15 @@ def write_analysis(
                 payload = loaded
         except json.JSONDecodeError:
             payload = {}
-    payload["analysis"] = json.loads(record.model_dump_json())
+    dumped = json.loads(record.model_dump_json())
+    dumped.pop("raw_completion", None)
+    payload["analysis"] = dumped
     dest_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    raw = record.raw_completion
+    if raw:
+        text, _ = redact_text(raw)
+        (out_dir / "raw-completion.txt").write_text(text + "\n", encoding="utf-8")
 
     dest_md = out_dir / "summary.md"
     src_md = src.with_name("summary.md")
@@ -166,92 +203,106 @@ def _gate(summary: Summary) -> dict[str, Any] | None:
 
 
 def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> AnalysisRecord:
-    last_ungrounded: AnalysisResult | None = None
-    last_id: str | None = None
     notes: list[str] = []
-    fallback_used = False
+    last_id: str | None = None
+    last_completion: str | None = None
     last_persona: str | None = None
+    fallback_used = False
 
     for index, persona in enumerate(PERSONAS):
         last_persona = persona
         if index > 0:
             fallback_used = True
             notes.append(f"fallback to {persona}")
-        completion_text: str | None = None
-        reason_text = "validation failed"
-        for attempt in range(2):
-            if attempt == 0:
-                messages = build_messages(evidence)
-            else:
-                if not completion_text:
-                    break
-                messages = build_messages(
-                    evidence,
-                    prior_completion=completion_text,
-                    repair_reason=reason_text,
-                )
-            try:
-                chat = chat_fn(persona, messages)
-            except StgptError as exc:
-                notes.append(f"{persona}: bridge error: {exc}")
-                return base.model_copy(
-                    update={
-                        "status": "failed",
-                        "persona": persona,
-                        "fallback_used": fallback_used,
-                        "notes": notes,
-                    }
-                )
-            if not (200 <= chat.status_code < 300):
-                notes.append(_http_failure_note(chat, persona))
-                return base.model_copy(
-                    update={
-                        "status": "failed",
-                        "persona": persona,
-                        "fallback_used": fallback_used,
-                        "response_id": chat.response_id,
-                        "notes": notes,
-                    }
-                )
-            last_id = chat.response_id
-            completion_text = chat.completion
-            parsed, why, structured = _parse_and_validate(chat.completion, evidence)
-            if parsed is not None:
-                return base.model_copy(
-                    update={
-                        "status": "ok",
-                        "persona": persona,
-                        "result": parsed,
-                        "fallback_used": fallback_used,
-                        "response_id": last_id,
-                        "notes": notes,
-                    }
-                )
-            reason_text = why
-            label = f"{persona} repair" if attempt else persona
-            notes.append(f"{label}: {why}")
-            if structured is not None:
-                last_ungrounded = structured
 
-    if last_ungrounded is not None:
-        return base.model_copy(
-            update={
-                "status": "unvalidated",
-                "persona": last_persona,
-                "result": last_ungrounded,
-                "fallback_used": fallback_used,
-                "response_id": last_id,
-                "notes": notes,
-            }
+        chat = _call_chat(chat_fn, persona, build_messages(evidence), notes)
+        if chat is None:
+            continue
+        if not _is_2xx(chat.status_code):
+            notes.append(_http_failure_note(chat, persona))
+            continue
+        last_id = chat.response_id
+        completion = chat.completion
+        if not (isinstance(completion, str) and completion.strip()):
+            notes.append(f"{persona}: empty completion")
+            continue
+
+        last_completion = completion
+        outcome = _interpret_completion(completion, evidence)
+        if outcome.status == "ok" and outcome.result is not None:
+            return _record(
+                base,
+                status="ok",
+                persona=persona,
+                result=outcome.result,
+                fallback_used=fallback_used,
+                response_id=last_id,
+                notes=notes,
+                raw_completion=completion,
+            )
+
+        notes.append(_parse_note(persona, outcome.why, completion))
+        repair_messages = build_messages(
+            evidence,
+            prior_completion=completion,
+            repair_reason=outcome.why,
         )
-    return base.model_copy(
-        update={
-            "status": "failed",
-            "persona": last_persona,
-            "fallback_used": fallback_used,
-            "response_id": last_id,
-            "notes": notes or ["analyze failed"],
-        }
+        repaired = _call_chat(chat_fn, persona, repair_messages, notes)
+        if (
+            repaired is not None
+            and _is_2xx(repaired.status_code)
+            and isinstance(repaired.completion, str)
+            and repaired.completion.strip()
+        ):
+            last_id = repaired.response_id
+            last_completion = repaired.completion
+            outcome = _interpret_completion(repaired.completion, evidence)
+            if outcome.status == "ok" and outcome.result is not None:
+                return _record(
+                    base,
+                    status="ok",
+                    persona=persona,
+                    result=outcome.result,
+                    fallback_used=fallback_used,
+                    response_id=last_id,
+                    notes=notes,
+                    raw_completion=last_completion,
+                )
+            notes.append(_parse_note(f"{persona} repair", outcome.why, last_completion))
+        elif repaired is not None and not _is_2xx(repaired.status_code):
+            notes.append(_http_failure_note(repaired, persona))
+
+        return _soft_fallback(
+            base,
+            outcome=outcome,
+            persona=persona,
+            fallback_used=fallback_used,
+            response_id=last_id,
+            notes=notes,
+            raw_completion=last_completion,
+        )
+
+    if last_completion:
+        outcome = _interpret_completion(last_completion, evidence)
+        notes.append(_parse_note(last_persona or "analyze", outcome.why, last_completion))
+        return _soft_fallback(
+            base,
+            outcome=outcome,
+            persona=last_persona,
+            fallback_used=fallback_used,
+            response_id=last_id,
+            notes=notes,
+            raw_completion=last_completion,
+        )
+    return _record(
+        base,
+        status="failed",
+        persona=last_persona,
+        result=None,
+        fallback_used=fallback_used,
+        response_id=last_id,
+        notes=notes or ["analyze failed"],
+        raw_completion=None,
     )
 
 
@@ -285,46 +336,216 @@ def _body_snippet(body: Mapping[str, Any], *, limit: int = 200) -> str:
     return text
 
 
-def _parse_and_validate(
-    completion: str | None, evidence: str
-) -> tuple[AnalysisResult | None, str, AnalysisResult | None]:
-    result = _parse_result(completion)
-    if result is None:
-        return None, "parse_error", None
+class _Outcome:
+    def __init__(self, status: str, why: str, result: AnalysisResult | None) -> None:
+        self.status = status
+        self.why = why
+        self.result = result
+
+
+def _is_2xx(status_code: int) -> bool:
+    return 200 <= status_code < 300
+
+
+def _call_chat(
+    chat_fn: ChatFn,
+    persona: str,
+    messages: Sequence[Mapping[str, str]],
+    notes: list[str],
+) -> ChatResult | None:
+    try:
+        return chat_fn(persona, messages)
+    except StgptError as exc:
+        notes.append(f"{persona}: bridge error: {exc}")
+        return None
+
+
+def _record(
+    base: AnalysisRecord,
+    *,
+    status: str,
+    persona: str | None,
+    result: AnalysisResult | None,
+    fallback_used: bool,
+    response_id: str | None,
+    notes: list[str],
+    raw_completion: str | None,
+) -> AnalysisRecord:
+    return base.model_copy(
+        update={
+            "status": status,
+            "persona": persona,
+            "result": result,
+            "fallback_used": fallback_used,
+            "response_id": response_id,
+            "notes": notes,
+            "raw_completion": raw_completion,
+        }
+    )
+
+
+def _soft_fallback(
+    base: AnalysisRecord,
+    *,
+    outcome: _Outcome,
+    persona: str | None,
+    fallback_used: bool,
+    response_id: str | None,
+    notes: list[str],
+    raw_completion: str | None,
+) -> AnalysisRecord:
+    result = outcome.result
+    if result is None and raw_completion and raw_completion.strip():
+        result = _prose_result(raw_completion)
+    if result is not None:
+        result = result.model_copy(update={"cannot_determine": True})
+    return _record(
+        base,
+        status="unvalidated",
+        persona=persona,
+        result=result,
+        fallback_used=fallback_used,
+        response_id=response_id,
+        notes=notes,
+        raw_completion=raw_completion,
+    )
+
+
+def _parse_note(label: str | None, why: str, completion: str) -> str:
+    preview, _ = redact_text(completion)
+    preview = " ".join(preview.split())[:_PREVIEW_CHARS]
+    note, _ = redact_text(f"{label}: {why}; completion_preview={preview}")
+    return note
+
+
+def _prose_result(completion: str) -> AnalysisResult:
+    text, _ = redact_text(completion.strip())
+    return AnalysisResult(
+        root_cause=text[:_PROSE_CAP],
+        suggested_fix="",
+        confidence="low",
+        citations=[],
+        cannot_determine=True,
+    )
+
+
+def _interpret_completion(completion: str, evidence: str) -> _Outcome:
+    payload = _first_json_object(_strip_fences(completion))
+    if not isinstance(payload, dict):
+        return _Outcome("parse_error", "parse_error: no JSON object", _prose_result(completion))
+    normalized = _normalize_payload(payload)
+    try:
+        result = AnalysisResult.model_validate(normalized)
+    except Exception as exc:
+        root = normalized.get("root_cause")
+        if isinstance(root, str) and root.strip():
+            result = AnalysisResult(
+                root_cause=root.strip()[:_PROSE_CAP],
+                suggested_fix=str(normalized.get("suggested_fix") or ""),
+                confidence=_confidence(normalized.get("confidence")),
+                citations=[],
+                cannot_determine=True,
+            )
+            return _Outcome("unvalidated", f"parse_error: {exc}", result)
+        return _Outcome("parse_error", f"parse_error: {exc}", _prose_result(completion))
+
+    if not result.citations:
+        result = result.model_copy(update={"cannot_determine": True})
+        return _Outcome("unvalidated", "missing citations", result)
     missing = [
         cite.quote
         for cite in result.citations
         if cite.quote and cite.quote not in evidence
     ]
     if missing:
-        return None, "ungrounded: " + "; ".join(missing[:3]), result
-    return result, "ok", result
+        result = result.model_copy(update={"cannot_determine": True})
+        return _Outcome("unvalidated", "ungrounded: " + "; ".join(missing[:3]), result)
+    return _Outcome("ok", "ok", result)
 
 
-def _parse_result(completion: str | None) -> AnalysisResult | None:
-    if completion is None:
-        return None
-    text = completion.strip()
-    if not text:
-        return None
-    text = _FENCE.sub("", text).strip()
+def _strip_fences(text: str) -> str:
+    match = _FENCE_BLOCK.search(text)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+
+def _first_json_object(text: str) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end <= start:
-            return None
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _normalize_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    mapped: dict[str, Any] = {}
+    for key, value in payload.items():
+        mapped[_KEY_ALIASES.get(str(key), str(key))] = value
+    root = mapped.get("root_cause")
+    if not isinstance(root, str):
+        for key in ("rootCause", "cause", "diagnosis"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                mapped["root_cause"] = value
+                break
+    fix = mapped.get("suggested_fix")
+    if not isinstance(fix, str):
+        for key in ("suggestedFix", "fix"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                mapped["suggested_fix"] = value
+                break
+        else:
+            mapped["suggested_fix"] = ""
+    mapped["confidence"] = _confidence(mapped.get("confidence"))
+    mapped["citations"] = _normalize_citations(mapped.get("citations"))
+    flag = mapped.get("cannot_determine")
+    if isinstance(flag, str):
+        mapped["cannot_determine"] = flag.strip().lower() in {"1", "true", "yes"}
+    elif flag is None:
+        mapped["cannot_determine"] = False
+    else:
+        mapped["cannot_determine"] = bool(flag)
+    return mapped
+
+
+def _confidence(value: Any) -> str:
+    if isinstance(value, str) and value.strip().lower() in {"high", "medium", "low"}:
+        return value.strip().lower()
+    return "low"
+
+
+def _normalize_citations(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        quote = item.get("quote") or item.get("text") or ""
+        source = item.get("source") or item.get("section")
+        if not isinstance(quote, str) or not quote:
+            continue
+        if source not in _CITATION_SOURCES:
+            continue
+        line = item.get("line")
         try:
-            payload = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(payload, dict):
-        return None
-    try:
-        return AnalysisResult.model_validate(payload)
-    except Exception:
-        return None
+            line_n = int(line) if line is not None else None
+        except (TypeError, ValueError):
+            line_n = None
+        out.append({"quote": quote, "source": source, "line": line_n})
+    return out
 
 
 def _make_chat_fn(
@@ -470,6 +691,8 @@ def _diagnosis_markdown(record: AnalysisRecord) -> str:
         lines.append("**Cache:** hit")
     result = record.result
     if result is not None:
+        if result.cannot_determine:
+            lines.append("**Cannot determine:** true")
         lines.extend(
             [
                 f"**Confidence:** {result.confidence}",
