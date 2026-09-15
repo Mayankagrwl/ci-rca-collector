@@ -23,7 +23,13 @@ from .config import (
 from .models import AnalysisRecord, AnalysisResult, Summary
 from .prompt import build_evidence, build_messages
 from .redact import redact_text
-from .stgpt_client import ChatResult, StgptError, post_chat, public_request_url
+from .stgpt_client import (
+    ChatResult,
+    StgptError,
+    flatten_user_content,
+    post_chat,
+    public_request_url,
+)
 
 _LOG = logging.getLogger(__name__)
 _FENCE_BLOCK = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
@@ -146,9 +152,10 @@ def write_analysis(
     """Write analysis.json, merge into summary.json, append ## AI diagnosis."""
     out_dir.mkdir(parents=True, exist_ok=True)
     analysis_path = out_dir / "analysis.json"
-    analysis_path.write_text(
-        record.model_dump_json(indent=2) + "\n", encoding="utf-8"
-    )
+    analysis_dump = json.loads(record.model_dump_json())
+    analysis_dump.pop("raw_completion", None)
+    analysis_dump.pop("stgpt_responses", None)
+    analysis_path.write_text(json.dumps(analysis_dump, indent=2) + "\n", encoding="utf-8")
 
     dest_json = out_dir / "summary.json"
     src = Path(summary_path)
@@ -164,6 +171,7 @@ def write_analysis(
             payload = {}
     dumped = json.loads(record.model_dump_json())
     dumped.pop("raw_completion", None)
+    dumped.pop("stgpt_responses", None)
     payload["analysis"] = dumped
     dest_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -171,6 +179,12 @@ def write_analysis(
     if raw:
         text, _ = redact_text(raw)
         (out_dir / "raw-completion.txt").write_text(text + "\n", encoding="utf-8")
+
+    if record.stgpt_responses:
+        responses, _ = _redact_walk(list(record.stgpt_responses))
+        (out_dir / "stgpt-response.json").write_text(
+            json.dumps(responses, indent=2) + "\n", encoding="utf-8"
+        )
 
     dest_md = out_dir / "summary.md"
     src_md = src.with_name("summary.md")
@@ -208,6 +222,7 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
     last_completion: str | None = None
     last_persona: str | None = None
     fallback_used = False
+    stgpt_responses: list[dict[str, Any]] = []
 
     for index, persona in enumerate(PERSONAS):
         last_persona = persona
@@ -215,17 +230,41 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
             fallback_used = True
             notes.append(f"fallback to {persona}")
 
-        chat = _call_chat(chat_fn, persona, build_messages(evidence), notes)
+        messages = build_messages(evidence)
+        chat = _call_chat(chat_fn, persona, messages, notes)
         if chat is None:
+            if any("prompt_empty" in note for note in notes):
+                return _record(
+                    base,
+                    status="failed",
+                    persona=persona,
+                    result=None,
+                    fallback_used=fallback_used,
+                    response_id=None,
+                    notes=notes,
+                    raw_completion=None,
+                    stgpt_responses=stgpt_responses,
+                )
             continue
         if not _is_2xx(chat.status_code):
             notes.append(_http_failure_note(chat, persona))
             continue
         last_id = chat.response_id
+        stgpt_responses.append(_stgpt_debug(chat, persona))
+        notes.append(_response_meta_note(chat, persona, messages))
         completion = chat.completion
         if not (isinstance(completion, str) and completion.strip()):
-            notes.append(f"{persona}: empty completion")
-            continue
+            return _record(
+                base,
+                status="failed",
+                persona=persona,
+                result=None,
+                fallback_used=fallback_used,
+                response_id=last_id,
+                notes=notes,
+                raw_completion=None,
+                stgpt_responses=stgpt_responses,
+            )
 
         last_completion = completion
         outcome = _interpret_completion(completion, evidence)
@@ -239,6 +278,7 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
                 response_id=last_id,
                 notes=notes,
                 raw_completion=completion,
+                stgpt_responses=stgpt_responses,
             )
 
         notes.append(_parse_note(persona, outcome.why, completion))
@@ -248,6 +288,9 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
             repair_reason=outcome.why,
         )
         repaired = _call_chat(chat_fn, persona, repair_messages, notes)
+        if repaired is not None and _is_2xx(repaired.status_code):
+            stgpt_responses.append(_stgpt_debug(repaired, persona))
+            notes.append(_response_meta_note(repaired, persona, repair_messages))
         if (
             repaired is not None
             and _is_2xx(repaired.status_code)
@@ -267,6 +310,7 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
                     response_id=last_id,
                     notes=notes,
                     raw_completion=last_completion,
+                    stgpt_responses=stgpt_responses,
                 )
             notes.append(_parse_note(f"{persona} repair", outcome.why, last_completion))
         elif repaired is not None and not _is_2xx(repaired.status_code):
@@ -280,6 +324,7 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
             response_id=last_id,
             notes=notes,
             raw_completion=last_completion,
+            stgpt_responses=stgpt_responses,
         )
 
     if last_completion:
@@ -293,6 +338,7 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
             response_id=last_id,
             notes=notes,
             raw_completion=last_completion,
+            stgpt_responses=stgpt_responses,
         )
     return _record(
         base,
@@ -303,7 +349,44 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
         response_id=last_id,
         notes=notes or ["analyze failed"],
         raw_completion=None,
+        stgpt_responses=stgpt_responses,
     )
+
+
+def _response_meta_note(
+    chat: ChatResult,
+    persona: str,
+    messages: Sequence[Mapping[str, str]],
+) -> str:
+    keys = ",".join(str(k) for k in chat.body.keys()) if chat.body else ""
+    completion = chat.completion if isinstance(chat.completion, str) else ""
+    uchars = chat.user_message_chars
+    if uchars is None:
+        uchars = len(flatten_user_content(messages))
+    duration = chat.duration_ms if chat.duration_ms is not None else ""
+    rid = chat.response_id or ""
+    note = (
+        f"{persona}: keys=[{keys}] completion_len={len(completion)} "
+        f"responseId={rid} duration_ms={duration} user_message_chars={uchars}"
+    )
+    if not completion.strip():
+        note += " empty completion"
+    redacted, _ = redact_text(note)
+    return redacted
+
+
+def _stgpt_debug(chat: ChatResult, persona: str) -> dict[str, Any]:
+    return {
+        "persona": persona,
+        "status_code": chat.status_code,
+        "duration_ms": chat.duration_ms,
+        "user_message_chars": chat.user_message_chars,
+        "completion_len": len(chat.completion) if isinstance(chat.completion, str) else 0,
+        "responseId": chat.response_id,
+        "keys": list(chat.body.keys()) if chat.body else [],
+        "url": public_request_url(chat.url),
+        "body": dict(chat.body) if chat.body else {},
+    }
 
 
 def _http_failure_note(chat: ChatResult, persona: str) -> str:
@@ -370,6 +453,7 @@ def _record(
     response_id: str | None,
     notes: list[str],
     raw_completion: str | None,
+    stgpt_responses: list[dict[str, Any]] | None = None,
 ) -> AnalysisRecord:
     return base.model_copy(
         update={
@@ -380,6 +464,7 @@ def _record(
             "response_id": response_id,
             "notes": notes,
             "raw_completion": raw_completion,
+            "stgpt_responses": list(stgpt_responses or []),
         }
     )
 
@@ -393,6 +478,7 @@ def _soft_fallback(
     response_id: str | None,
     notes: list[str],
     raw_completion: str | None,
+    stgpt_responses: list[dict[str, Any]] | None = None,
 ) -> AnalysisRecord:
     result = outcome.result
     if result is None and raw_completion and raw_completion.strip():
@@ -408,6 +494,7 @@ def _soft_fallback(
         response_id=response_id,
         notes=notes,
         raw_completion=raw_completion,
+        stgpt_responses=stgpt_responses,
     )
 
 

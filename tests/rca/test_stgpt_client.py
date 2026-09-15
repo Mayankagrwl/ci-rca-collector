@@ -17,6 +17,7 @@ from tools.rca.config import (
     STGPT_API_URL,
     STGPT_CLIENT_APP_NAME,
     STGPT_SERVICE,
+    STGPT_VERSION,
     resolve_stgpt_api_key,
 )
 from tools.rca.models import AnalysisCitation, AnalysisRecord, AnalysisResult
@@ -61,7 +62,8 @@ def test_generate_auth_token_is_sha1_hex_of_known_inputs() -> None:
 def test_config_phase2_defaults() -> None:
     assert STGPT_API_URL == "https://api-ai-bridge-dev.st.com/chatgpt/api/client-apps"
     assert STGPT_CLIENT_APP_NAME == "gtrd_srmtdpplm"
-    assert STGPT_SERVICE == "chatgpt"
+    assert STGPT_SERVICE == "chat"
+    assert STGPT_VERSION == "1.0"
     assert PERSONAS == ("trinity_for_api", "alfred_for_api")
     assert PROMPT_VERSION == "p2.1"
 
@@ -108,11 +110,17 @@ def test_post_chat_extracts_completion_and_auth_headers() -> None:
     assert request.headers["stchatgpt-auth-nonce"] == nonce
     assert request.headers["stchatgpt-auth-timestamp"] == ts
     body = json.loads(request.content.decode("utf-8"))
+    assert body["version"] == STGPT_VERSION
     assert body["persona"] == "trinity_for_api"
     assert body["clientAppName"] == _APP
+    assert body["service"] == "chat"
+    assert body["timestamp"] == ts
     assert body["messages"] == [{"role": "user", "content": "why did ci fail?"}]
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["content"]
     assert _KEY not in request.content.decode("utf-8")
     assert "Authorization" not in request.headers
+    assert result.user_message_chars == len("why did ci fail?")
 
 
 def test_post_chat_uses_base_url_without_client_app_path() -> None:
@@ -140,6 +148,16 @@ def test_post_chat_uses_base_url_without_client_app_path() -> None:
     assert STGPT_CLIENT_APP_NAME not in str(seen[0].url)
     body = json.loads(seen[0].content.decode("utf-8"))
     assert body["clientAppName"] == STGPT_CLIENT_APP_NAME
+    assert body["service"] == "chat"
+    assert body["version"] == STGPT_VERSION
+    assert body["timestamp"] == "1"
+    assert body["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_extract_completion_from_data_message() -> None:
+    body = {"id": "resp-1", "data": {"message": "hello from data.message"}}
+    assert extract_completion(body) == "hello from data.message"
+    assert extract_completion({"completion": "", "data": {"message": "fallback"}}) == "fallback"
 
 
 def test_extract_completion_from_camelcase_body() -> None:
@@ -152,6 +170,27 @@ def test_extract_completion_from_camelcase_body() -> None:
     assert text is not None
     payload = json.loads(text)
     assert payload["rootCause"] == "lockfile drift"
+
+
+def test_post_chat_prompt_empty_fails_before_post() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"completion": "nope"})
+
+    with pytest.raises(StgptError, match="prompt_empty"):
+        post_chat(
+            _BRIDGE,
+            _KEY,
+            _APP,
+            "trinity_for_api",
+            [{"role": "user", "content": "  "}],
+            transport=httpx.MockTransport(handler),
+            timestamp="1",
+            nonce="n",
+        )
+    assert calls["n"] == 0
 
 
 def test_post_chat_completion_missing_is_none() -> None:

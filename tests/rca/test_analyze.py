@@ -310,6 +310,52 @@ def test_parse_error_does_not_call_second_persona(tmp_path: Path) -> None:
     assert gh_keys["analysis"]["result"]["root_cause"]
 
 
+def test_empty_completion_200_is_failed_with_keys(tmp_path: Path) -> None:
+    out = _collect(tmp_path)
+    summary = _summary(out)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["service"] == "chat"
+        assert body["version"]
+        assert body["clientAppName"]
+        assert body["timestamp"]
+        assert body["messages"] == [
+            {"role": "user", "content": body["messages"][0]["content"]}
+        ]
+        assert body["messages"][0]["content"].strip()
+        return httpx.Response(
+            200,
+            json={"completion": "", "responseId": "rid-empty", "foo": "bar"},
+        )
+
+    record = analyze_summary(
+        summary,
+        api_key="test-stgpt-key",
+        url="https://stgpt.test.invalid/chatgpt/api/client-apps",
+        transport=httpx.MockTransport(handler),
+        cache_dir=tmp_path / "cache",
+    )
+    write_analysis(record, summary_path=out / "summary.json", out_dir=out)
+    assert record.status == "failed"
+    assert calls["n"] == 1
+    blob = " ".join(record.notes)
+    assert "completion_len=0" in blob
+    assert "keys=" in blob
+    assert "foo" in blob
+    assert "responseId=rid-empty" in blob
+    assert "user_message_chars=" in blob
+    assert "parse_error" not in blob
+    assert "test-stgpt-key" not in blob
+    assert record.fallback_used is False
+    saved = json.loads((out / "stgpt-response.json").read_text(encoding="utf-8"))
+    assert saved[0]["completion_len"] == 0
+    assert "foo" in saved[0]["keys"]
+    assert "test-stgpt-key" not in json.dumps(saved)
+
+
 def test_http_404_fails_with_status_persona_and_url_note(
     tmp_path: Path, monkeypatch
 ) -> None:

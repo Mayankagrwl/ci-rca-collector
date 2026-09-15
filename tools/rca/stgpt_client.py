@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import STGPT_SERVICE
+from .config import STGPT_SERVICE, STGPT_VERSION
 from .config_host import resolve_ssl_verify
 
 _LOG = logging.getLogger(__name__)
@@ -31,12 +31,29 @@ class ChatResult(NamedTuple):
     completion: str | None
     response_id: str | None
     url: str | None = None
+    duration_ms: int | None = None
+    user_message_chars: int | None = None
 
 
 def generate_auth_token(client: str, service: str, key: str, ts: str | int, nonce: str) -> str:
     """Return SHA1 hex of ``f"{client}_{service}_{key}_{ts}_{nonce}"``."""
     raw = f"{client}_{service}_{key}_{ts}_{nonce}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def flatten_user_content(messages: Sequence[Mapping[str, str]]) -> str:
+    """Collapse chat messages into a single non-empty user prompt."""
+    parts: list[str] = []
+    for item in messages:
+        content = str(item.get("content") or "")
+        if not content.strip():
+            continue
+        role = str(item.get("role") or "user")
+        if role == "assistant":
+            parts.append("Previous assistant reply:\n" + content)
+        else:
+            parts.append(content)
+    return "\n\n".join(parts).strip()
 
 
 def post_chat(
@@ -53,12 +70,18 @@ def post_chat(
     nonce: str | None = None,
     verify: bool | str | None = None,
     extra: Mapping[str, Any] | None = None,
+    version: str = STGPT_VERSION,
 ) -> ChatResult:
     """POST a chat turn. HTTP error statuses are returned, not raised."""
     ts = timestamp if timestamp is not None else str(int(time.time()))
     nonce_value = nonce if nonce is not None else uuid.uuid4().hex
     token = generate_auth_token(client_app_name, service, api_key, ts, nonce_value)
     endpoint = url.strip().rstrip("/")
+    user_content = flatten_user_content(messages)
+    if not user_content:
+        raise StgptError("prompt_empty")
+    _LOG.info("ST ChatGPT user_message_chars=%s", len(user_content))
+
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -69,9 +92,12 @@ def post_chat(
     payload: dict[str, Any] = {}
     if extra:
         payload.update(dict(extra))
-    payload["persona"] = persona
-    payload["messages"] = [dict(item) for item in messages]
+    payload["version"] = version
     payload["clientAppName"] = client_app_name
+    payload["service"] = "chat"
+    payload["timestamp"] = str(ts)
+    payload["persona"] = persona
+    payload["messages"] = [{"role": "user", "content": user_content}]
 
     ssl_verify = resolve_ssl_verify() if verify is None else verify
     if ssl_verify is False:
@@ -87,48 +113,58 @@ def post_chat(
     if transport is not None:
         client_kwargs["transport"] = transport
 
+    started = time.perf_counter()
     try:
         with httpx.Client(**client_kwargs) as client:
             response = client.post(endpoint, headers=headers, json=payload)
     except (httpx.HTTPError, OSError) as exc:
         raise StgptError(_public_error(exc, endpoint)) from None
+    duration_ms = int(round((time.perf_counter() - started) * 1000))
 
     body = _json_object(response)
     completion = extract_completion(body)
     response_id = _response_id(body)
-    return ChatResult(response.status_code, body, completion, response_id, endpoint)
+    return ChatResult(
+        response.status_code,
+        body,
+        completion,
+        response_id,
+        endpoint,
+        duration_ms,
+        len(user_content),
+    )
 
 
 def extract_completion(body: Mapping[str, Any] | None) -> str | None:
-    """Pull a completion string from common ST ChatGPT / OpenAI-shaped bodies."""
+    """First non-empty of the documented ST ChatGPT / OpenAI answer paths."""
     if not body:
         return None
-    for key in ("completion", "text", "content", "output", "answer"):
-        got = _as_completion_text(body.get(key))
-        if got:
-            return got
-    message = body.get("message")
-    if isinstance(message, dict):
-        got = _as_completion_text(message.get("content") or message.get("completion"))
+    for value in (
+        body.get("completion"),
+        body.get("message"),
+        body.get("text"),
+        body.get("content"),
+    ):
+        got = _scalar_text(value)
         if got:
             return got
     data = body.get("data")
     if isinstance(data, Mapping):
-        nested = extract_completion(data)
-        if nested:
-            return nested
+        for key in ("completion", "message", "text"):
+            got = _scalar_text(data.get(key))
+            if got:
+                return got
     choices = body.get("choices")
-    if isinstance(choices, list) and choices:
+    if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
         first = choices[0]
-        if isinstance(first, Mapping):
-            nested = extract_completion(first)
-            if nested:
-                return nested
-            msg = first.get("message")
-            if isinstance(msg, Mapping):
-                got = _as_completion_text(msg.get("content") or msg.get("completion"))
-                if got:
-                    return got
+        message = first.get("message")
+        if isinstance(message, Mapping):
+            got = _scalar_text(message.get("content"))
+            if got:
+                return got
+        got = _scalar_text(first.get("text"))
+        if got:
+            return got
     if any(
         key in body
         for key in ("root_cause", "rootCause", "suggested_fix", "suggestedFix")
@@ -140,21 +176,14 @@ def extract_completion(body: Mapping[str, Any] | None) -> str | None:
     return None
 
 
-def _as_completion_text(value: Any) -> str | None:
+def _scalar_text(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value
     if isinstance(value, Mapping):
-        if any(
-            key in value
-            for key in ("root_cause", "rootCause", "suggested_fix", "suggestedFix")
-        ):
-            try:
-                return json.dumps(dict(value), ensure_ascii=False)
-            except (TypeError, ValueError):
-                return None
-        inner = value.get("content") or value.get("completion") or value.get("text")
-        if inner is not value:
-            return _as_completion_text(inner)
+        for key in ("content", "completion", "text", "message"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return inner
     return None
 
 
@@ -180,7 +209,7 @@ def _json_object(response: httpx.Response) -> dict[str, Any]:
 
 
 def _response_id(body: Mapping[str, Any]) -> str | None:
-    for key in ("id", "response_id"):
+    for key in ("responseId", "response_id", "id"):
         value = body.get(key)
         if value is None or value == "":
             continue
@@ -191,7 +220,7 @@ def _response_id(body: Mapping[str, Any]) -> str | None:
 def _public_error(exc: BaseException, endpoint: str) -> str:
     host = urlparse(endpoint).netloc or endpoint
     text = str(exc)
-    for secret in (_secrets_from(exc)):
+    for secret in _secrets_from(exc):
         if secret:
             text = text.replace(secret, _REDACT)
     return f"ST ChatGPT bridge error talking to {host}: {text}"

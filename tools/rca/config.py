@@ -47,7 +47,8 @@ STACK_TRACE_BOTTOM_FRAMES = 5
 # Phase 2 — ST ChatGPT bridge (§16). Analyze CLI reads these; collect does not.
 STGPT_API_URL = "https://api-ai-bridge-dev.st.com/chatgpt/api/client-apps"
 STGPT_CLIENT_APP_NAME = "gtrd_srmtdpplm"
-STGPT_SERVICE = "chatgpt"
+STGPT_SERVICE = "chat"
+STGPT_VERSION = "1.0"
 PERSONAS = ("trinity_for_api", "alfred_for_api")
 PROMPT_VERSION = "p2.1"
 
@@ -191,6 +192,7 @@ __all__ = [
     "STGPT_API_URL",
     "STGPT_CLIENT_APP_NAME",
     "STGPT_SERVICE",
+    "STGPT_VERSION",
     "TOKEN_BUDGET_TOTAL",
     "resolve_github_api_url",
     "resolve_github_server_url",
