@@ -26,6 +26,7 @@ from .redact import redact_text
 from .stgpt_client import (
     ChatResult,
     StgptError,
+    bridge_error_message,
     flatten_user_content,
     post_chat,
     public_request_url,
@@ -252,6 +253,20 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
         last_id = chat.response_id
         stgpt_responses.append(_stgpt_debug(chat, persona))
         notes.append(_response_meta_note(chat, persona, messages))
+        api_error = bridge_error_message(chat.body)
+        if api_error:
+            notes.append(f"{persona}: {api_error}")
+            return _record(
+                base,
+                status="failed",
+                persona=persona,
+                result=None,
+                fallback_used=fallback_used,
+                response_id=last_id,
+                notes=notes,
+                raw_completion=None,
+                stgpt_responses=stgpt_responses,
+            )
         completion = chat.completion
         if not (isinstance(completion, str) and completion.strip()):
             return _record(
@@ -291,6 +306,20 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
         if repaired is not None and _is_2xx(repaired.status_code):
             stgpt_responses.append(_stgpt_debug(repaired, persona))
             notes.append(_response_meta_note(repaired, persona, repair_messages))
+            repair_error = bridge_error_message(repaired.body)
+            if repair_error:
+                notes.append(f"{persona} repair: {repair_error}")
+                return _record(
+                    base,
+                    status="failed",
+                    persona=persona,
+                    result=None,
+                    fallback_used=fallback_used,
+                    response_id=repaired.response_id,
+                    notes=notes,
+                    raw_completion=None,
+                    stgpt_responses=stgpt_responses,
+                )
         if (
             repaired is not None
             and _is_2xx(repaired.status_code)

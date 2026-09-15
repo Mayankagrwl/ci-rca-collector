@@ -118,6 +118,8 @@ def test_post_chat_extracts_completion_and_auth_headers() -> None:
     assert body["messages"] == [{"role": "user", "content": "why did ci fail?"}]
     assert len(body["messages"]) == 1
     assert body["messages"][0]["content"]
+    assert body["responseFormat"] == "json_object"
+    assert body["responseFormat"] not in {"json", "JSON", "json-schema", ""}
     assert _KEY not in request.content.decode("utf-8")
     assert "Authorization" not in request.headers
     assert result.user_message_chars == len("why did ci fail?")
@@ -152,6 +154,49 @@ def test_post_chat_uses_base_url_without_client_app_path() -> None:
     assert body["version"] == STGPT_VERSION
     assert body["timestamp"] == "1"
     assert body["messages"] == [{"role": "user", "content": "hi"}]
+    assert body["responseFormat"] == "json_object"
+
+
+def test_extract_completion_skips_errorcode_message() -> None:
+    body = {
+        "responseId": "r1",
+        "errorCode": "VALIDATION",
+        "message": "responseFormat must be one of the following values: text, json_object",
+        "service": "chat",
+        "duration": 12,
+    }
+    assert extract_completion(body) is None
+
+
+def test_post_chat_retries_text_when_json_object_rejected() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        seen.append(payload["responseFormat"])
+        if payload["responseFormat"] == "json_object":
+            return httpx.Response(
+                200,
+                json={
+                    "errorCode": "VALIDATION",
+                    "message": "responseFormat must be one of the following values: text, json_object",
+                    "responseId": "r1",
+                },
+            )
+        return httpx.Response(200, json={"completion": "ok from text"})
+
+    result = post_chat(
+        _BRIDGE,
+        _KEY,
+        _APP,
+        "trinity_for_api",
+        [{"role": "user", "content": "hi"}],
+        transport=httpx.MockTransport(handler),
+        timestamp="1",
+        nonce="n",
+    )
+    assert seen == ["json_object", "text"]
+    assert result.completion == "ok from text"
 
 
 def test_extract_completion_from_data_message() -> None:

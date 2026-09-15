@@ -310,6 +310,50 @@ def test_parse_error_does_not_call_second_persona(tmp_path: Path) -> None:
     assert gh_keys["analysis"]["result"]["root_cause"]
 
 
+def test_errorcode_payload_fails_without_root_cause(tmp_path: Path) -> None:
+    out = _collect(tmp_path)
+    summary = _summary(out)
+    formats: list[str] = []
+    err = "responseFormat must be one of the following values: text, json_object"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        formats.append(payload["responseFormat"])
+        assert payload["responseFormat"] in {"json_object", "text"}
+        return httpx.Response(
+            200,
+            json={
+                "responseId": "rid-err",
+                "errorCode": "VALIDATION",
+                "message": err,
+                "service": "chat",
+                "duration": 8,
+            },
+        )
+
+    record = analyze_summary(
+        summary,
+        api_key="test-stgpt-key",
+        url="https://stgpt.test.invalid/chatgpt/api/client-apps",
+        transport=httpx.MockTransport(handler),
+        cache_dir=tmp_path / "cache",
+    )
+    write_analysis(record, summary_path=out / "summary.json", out_dir=out)
+    assert formats[0] == "json_object"
+    assert formats[0] not in {"json", "JSON", "json-schema", ""}
+    assert record.status == "failed"
+    assert record.result is None
+    blob = " ".join(record.notes)
+    assert err in blob
+    assert "test-stgpt-key" not in blob
+    merged = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert merged["analysis"]["status"] == "failed"
+    assert merged["analysis"].get("result") is None
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert err in md
+    assert "**Root cause:**" not in md
+
+
 def test_empty_completion_200_is_failed_with_keys(tmp_path: Path) -> None:
     out = _collect(tmp_path)
     summary = _summary(out)

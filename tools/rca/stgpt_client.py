@@ -71,6 +71,8 @@ def post_chat(
     verify: bool | str | None = None,
     extra: Mapping[str, Any] | None = None,
     version: str = STGPT_VERSION,
+    response_format: str = "json_object",
+    _format_retry: bool = False,
 ) -> ChatResult:
     """POST a chat turn. HTTP error statuses are returned, not raised."""
     ts = timestamp if timestamp is not None else str(int(time.time()))
@@ -81,6 +83,7 @@ def post_chat(
     if not user_content:
         raise StgptError("prompt_empty")
     _LOG.info("ST ChatGPT user_message_chars=%s", len(user_content))
+    fmt = _coerce_response_format(response_format)
 
     headers = {
         "Accept": "application/json",
@@ -98,6 +101,7 @@ def post_chat(
     payload["timestamp"] = str(ts)
     payload["persona"] = persona
     payload["messages"] = [{"role": "user", "content": user_content}]
+    payload["responseFormat"] = fmt
 
     ssl_verify = resolve_ssl_verify() if verify is None else verify
     if ssl_verify is False:
@@ -122,6 +126,22 @@ def post_chat(
     duration_ms = int(round((time.perf_counter() - started) * 1000))
 
     body = _json_object(response)
+    if fmt == "json_object" and not _format_retry and response_format_rejected(body):
+        return post_chat(
+            url,
+            api_key,
+            client_app_name,
+            persona,
+            messages,
+            service=service,
+            timeout=timeout,
+            transport=transport,
+            verify=verify,
+            extra=extra,
+            version=version,
+            response_format="text",
+            _format_retry=True,
+        )
     completion = extract_completion(body)
     response_id = _response_id(body)
     return ChatResult(
@@ -135,9 +155,36 @@ def post_chat(
     )
 
 
+def _coerce_response_format(value: str | None) -> str:
+    """Only json_object or text. Never json / JSON / json-schema / empty."""
+    if value == "text":
+        return "text"
+    return "json_object"
+
+
+def response_format_rejected(body: Mapping[str, Any] | None) -> bool:
+    message = bridge_error_message(body)
+    return bool(message and message.startswith("responseFormat must"))
+
+
+def bridge_error_message(body: Mapping[str, Any] | None) -> str | None:
+    """API error payload (errorCode or responseFormat rejection). Not a completion."""
+    if not body:
+        return None
+    message = body.get("message")
+    text = message.strip() if isinstance(message, str) else ""
+    if body.get("errorCode"):
+        return text or str(body.get("errorCode"))
+    if text.startswith("responseFormat must"):
+        return text
+    return None
+
+
 def extract_completion(body: Mapping[str, Any] | None) -> str | None:
     """First non-empty of the documented ST ChatGPT / OpenAI answer paths."""
     if not body:
+        return None
+    if bridge_error_message(body):
         return None
     for value in (
         body.get("completion"),
