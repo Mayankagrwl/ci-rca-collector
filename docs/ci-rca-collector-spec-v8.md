@@ -2328,8 +2328,8 @@ generate_auth_token(client, service, key, ts, nonce)
 
 `post_chat(url, api_key, client_app_name, persona, messages, ...)`:
 
-- `POST {url.rstrip("/")}/{client_app_name}`
-- JSON body includes `persona` and `messages` (OpenAI-shaped `{role, content}`)
+- `POST {url}` exactly — never append `clientAppName` or any other path segment
+- JSON body includes `clientAppName`, `persona`, and `messages` (OpenAI-shaped `{role, content}`)
 - Headers:
   - `stchatgpt-auth-token` — the SHA1 hex
   - `stchatgpt-auth-nonce` — the nonce used in the hash

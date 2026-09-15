@@ -27,6 +27,9 @@ def test_consumer_stub_for_github_com() -> None:
     assert "STGPT_API: ${{ secrets.STGPT_API }}" in text
     assert "analyze: true" in text
     assert "steps.rca.outputs.requires-analysis == 'true'" in text
+    assert "steps.rca.outputs.analysis-status" in text
+    assert "steps.rca.outputs.analysis-notes" in text
+    assert "summary.json notes" in text
     assert "api-ai-bridge" not in text
     assert "github.st.com" not in text
 

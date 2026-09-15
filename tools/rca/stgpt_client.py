@@ -29,6 +29,7 @@ class ChatResult(NamedTuple):
     body: dict[str, Any]
     completion: str | None
     response_id: str | None
+    url: str | None = None
 
 
 def generate_auth_token(client: str, service: str, key: str, ts: str | int, nonce: str) -> str:
@@ -56,7 +57,7 @@ def post_chat(
     ts = timestamp if timestamp is not None else str(int(time.time()))
     nonce_value = nonce if nonce is not None else uuid.uuid4().hex
     token = generate_auth_token(client_app_name, service, api_key, ts, nonce_value)
-    endpoint = _chat_url(url, client_app_name)
+    endpoint = url.strip().rstrip("/")
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -64,12 +65,12 @@ def post_chat(
         "stchatgpt-auth-nonce": nonce_value,
         "stchatgpt-auth-timestamp": str(ts),
     }
-    payload: dict[str, Any] = {
-        "persona": persona,
-        "messages": [dict(item) for item in messages],
-    }
+    payload: dict[str, Any] = {}
     if extra:
         payload.update(dict(extra))
+    payload["persona"] = persona
+    payload["messages"] = [dict(item) for item in messages]
+    payload["clientAppName"] = client_app_name
 
     ssl_verify = resolve_ssl_verify() if verify is None else verify
     if ssl_verify is False:
@@ -96,22 +97,27 @@ def post_chat(
     if not isinstance(completion, str):
         completion = None
     response_id = _response_id(body)
-    return ChatResult(response.status_code, body, completion, response_id)
+    return ChatResult(response.status_code, body, completion, response_id, endpoint)
 
 
-def _chat_url(url: str, client_app_name: str) -> str:
-    base = url.rstrip("/")
-    suffix = f"/{client_app_name}"
-    if base.endswith(suffix):
-        return base
-    return f"{base}{suffix}"
+def public_request_url(url: str | None) -> str:
+    """Host + path only. No query, fragment, or credentials."""
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    host = parsed.netloc.split("@")[-1] if parsed.netloc else ""
+    path = parsed.path or ""
+    if parsed.scheme and host:
+        return f"{parsed.scheme}://{host}{path}"
+    return f"{host}{path}" or url.split("?", 1)[0].split("#", 1)[0]
 
 
 def _json_object(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
     except ValueError:
-        return {}
+        text = (response.text or "").strip()
+        return {"raw": text[:500]} if text else {}
     return payload if isinstance(payload, dict) else {}
 
 

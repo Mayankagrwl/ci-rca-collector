@@ -88,25 +88,52 @@ def test_post_chat_extracts_completion_and_auth_headers() -> None:
         timestamp=ts,
         nonce=nonce,
     )
-    assert result == ChatResult(
-        200,
-        {"completion": "root cause is the lockfile", "id": "chat-99"},
-        "root cause is the lockfile",
-        "chat-99",
-    )
+    assert result.status_code == 200
+    assert result.completion == "root cause is the lockfile"
+    assert result.response_id == "chat-99"
+    assert result.url == _BRIDGE
     assert len(seen) == 1
     request = seen[0]
     assert request.method == "POST"
-    assert str(request.url) == f"{_BRIDGE}/{_APP}"
+    assert str(request.url) == _BRIDGE
+    assert _APP not in request.url.path
     token = generate_auth_token(_APP, STGPT_SERVICE, _KEY, ts, nonce)
     assert request.headers["stchatgpt-auth-token"] == token
     assert request.headers["stchatgpt-auth-nonce"] == nonce
     assert request.headers["stchatgpt-auth-timestamp"] == ts
     body = json.loads(request.content.decode("utf-8"))
     assert body["persona"] == "trinity_for_api"
+    assert body["clientAppName"] == _APP
     assert body["messages"] == [{"role": "user", "content": "why did ci fail?"}]
     assert _KEY not in request.content.decode("utf-8")
     assert "Authorization" not in request.headers
+
+
+def test_post_chat_uses_base_url_without_client_app_path() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"completion": "ok"})
+
+    post_chat(
+        STGPT_API_URL,
+        _KEY,
+        STGPT_CLIENT_APP_NAME,
+        "trinity_for_api",
+        [{"role": "user", "content": "hi"}],
+        transport=httpx.MockTransport(handler),
+        timestamp="1",
+        nonce="n",
+    )
+    assert len(seen) == 1
+    path = seen[0].url.path
+    assert str(seen[0].url).rstrip("/") == STGPT_API_URL
+    assert path == "/chatgpt/api/client-apps"
+    assert STGPT_CLIENT_APP_NAME not in path
+    assert STGPT_CLIENT_APP_NAME not in str(seen[0].url)
+    body = json.loads(seen[0].content.decode("utf-8"))
+    assert body["clientAppName"] == STGPT_CLIENT_APP_NAME
 
 
 def test_post_chat_completion_missing_is_none() -> None:

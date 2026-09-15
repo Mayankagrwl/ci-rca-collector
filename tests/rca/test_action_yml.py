@@ -62,7 +62,9 @@ def test_action_yml_analyze_is_separate_gated_step() -> None:
     assert "suggested-fix:" in ACTION
     assert "rca-confidence:" in ACTION
     assert "analysis-status:" in ACTION
+    assert "analysis-notes:" in ACTION
     assert "steps.analyze.outputs.root-cause" in ACTION
+    assert "steps.analyze.outputs.analysis-notes" in ACTION
     assert "api-ai-bridge" not in ACTION
     collect_at = ACTION.index("id: collect")
     analyze_at = ACTION.index("id: analyze")

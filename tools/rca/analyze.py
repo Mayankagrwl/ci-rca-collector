@@ -23,7 +23,7 @@ from .config import (
 from .models import AnalysisRecord, AnalysisResult, Summary
 from .prompt import build_evidence, build_messages
 from .redact import redact_text
-from .stgpt_client import ChatResult, StgptError, post_chat
+from .stgpt_client import ChatResult, StgptError, post_chat, public_request_url
 
 _LOG = logging.getLogger(__name__)
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
@@ -192,10 +192,27 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
                 )
             try:
                 chat = chat_fn(persona, messages)
-            except StgptError:
-                notes.append(f"{persona}: bridge error")
-                completion_text = None
-                break
+            except StgptError as exc:
+                notes.append(f"{persona}: bridge error: {exc}")
+                return base.model_copy(
+                    update={
+                        "status": "failed",
+                        "persona": persona,
+                        "fallback_used": fallback_used,
+                        "notes": notes,
+                    }
+                )
+            if not (200 <= chat.status_code < 300):
+                notes.append(_http_failure_note(chat, persona))
+                return base.model_copy(
+                    update={
+                        "status": "failed",
+                        "persona": persona,
+                        "fallback_used": fallback_used,
+                        "response_id": chat.response_id,
+                        "notes": notes,
+                    }
+                )
             last_id = chat.response_id
             completion_text = chat.completion
             parsed, why, structured = _parse_and_validate(chat.completion, evidence)
@@ -236,6 +253,36 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
             "notes": notes or ["analyze failed"],
         }
     )
+
+
+def _http_failure_note(chat: ChatResult, persona: str) -> str:
+    loc = public_request_url(chat.url)
+    snippet = _body_snippet(chat.body)
+    parts = [f"HTTP {chat.status_code}", f"persona={persona}"]
+    if loc:
+        parts.append(f"url={loc}")
+    if snippet:
+        parts.append(f"body={snippet}")
+    note, _ = redact_text(" ".join(parts))
+    return note
+
+
+def _body_snippet(body: Mapping[str, Any], *, limit: int = 200) -> str:
+    if not body:
+        return ""
+    raw = body.get("raw")
+    if isinstance(raw, str) and len(body) == 1:
+        text = raw
+    else:
+        try:
+            text = json.dumps(dict(body), ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(body)
+    text, _ = redact_text(text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
 
 
 def _parse_and_validate(

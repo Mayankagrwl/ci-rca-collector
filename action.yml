@@ -140,6 +140,9 @@ outputs:
   analysis-status:
     description: 'ok | cached | gated | unvalidated | failed. Empty when analyze was skipped.'
     value: ${{ steps.analyze.outputs.analysis-status }}
+  analysis-notes:
+    description: 'Analyze notes (HTTP errors, gate reasons). Empty when skipped.'
+    value: ${{ steps.analyze.outputs.analysis-notes }}
 
 runs:
   using: 'composite'

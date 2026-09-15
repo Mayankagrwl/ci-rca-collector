@@ -31,6 +31,7 @@ ANALYSIS_OUTPUT_KEYS = (
     "suggested-fix",
     "rca-confidence",
     "analysis-status",
+    "analysis-notes",
 )
 
 
@@ -90,6 +91,7 @@ def analysis_outputs(record: AnalysisRecord) -> dict[str, str]:
         "suggested-fix": result.suggested_fix if result is not None else "",
         "rca-confidence": result.confidence if result is not None else "",
         "analysis-status": record.status or "",
+        "analysis-notes": "; ".join(record.notes),
     }
     return {key: _one_line(raw[key]) for key in ANALYSIS_OUTPUT_KEYS}
 

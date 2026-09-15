@@ -57,9 +57,13 @@ jobs:
         if: steps.rca.outputs.requires-analysis == 'true'
         run: |
           echo "Analysis status: ${{ steps.rca.outputs.analysis-status }}"
+          echo "Notes: ${{ steps.rca.outputs.analysis-notes }}"
           echo "Confidence: ${{ steps.rca.outputs.rca-confidence }}"
           echo "Root cause: ${{ steps.rca.outputs.root-cause }}"
           echo "Suggested fix: ${{ steps.rca.outputs.suggested-fix }}"
+          if [ -f rca/summary.json ]; then
+            python -c "import json; a=(json.load(open('rca/summary.json')).get('analysis') or {}); print('summary.json status:', a.get('status')); print('summary.json notes:', '; '.join(a.get('notes') or []))"
+          fi
 
       - name: Upload artifact
         if: github.event.workflow_run.conclusion == 'failure'

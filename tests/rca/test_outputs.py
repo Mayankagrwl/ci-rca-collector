@@ -122,6 +122,7 @@ def test_analysis_outputs_are_single_line(tmp_path: Path) -> None:
     write_analysis_github_output(record, output_file=dest)
     text = dest.read_text(encoding="utf-8")
     assert "analysis-status=ok\n" in text
+    assert "analysis-notes=\n" in text
     assert "rca-confidence=high\n" in text
     assert "root-cause=first line second line\n" in text
     assert "STGPT_API" not in text

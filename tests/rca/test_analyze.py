@@ -6,10 +6,12 @@ import hashlib
 import json
 from pathlib import Path
 
+import httpx
+
 from tools.rca.analyze import analyze_summary, cache_key, write_analysis
 from tools.rca.budget import token_count
 from tools.rca.cli import main
-from tools.rca.config import PROMPT_VERSION
+from tools.rca.config import PROMPT_VERSION, STGPT_CLIENT_APP_NAME
 from tools.rca.models import Summary
 from tools.rca.prompt import build_evidence
 from tools.rca.redact import REPLACEMENT
@@ -210,6 +212,52 @@ def test_from_completion_fixture_cli(tmp_path: Path, monkeypatch) -> None:
     assert "root-cause=" in text
     assert "suggested-fix=" in text
     assert "STGPT_API" not in text
+
+
+def test_http_404_fails_with_status_persona_and_url_note(
+    tmp_path: Path, monkeypatch
+) -> None:
+    out = _collect(tmp_path)
+    summary = _summary(out)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        assert STGPT_CLIENT_APP_NAME not in request.url.path
+        return httpx.Response(404, json={"message": "no route to app"})
+
+    gh_out = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(gh_out))
+    record = analyze_summary(
+        summary,
+        api_key="test-stgpt-key",
+        url="https://stgpt.test.invalid/chatgpt/api/client-apps",
+        transport=httpx.MockTransport(handler),
+        cache_dir=tmp_path / "cache",
+    )
+    write_analysis(record, summary_path=out / "summary.json", out_dir=out)
+    from tools.rca.outputs import write_analysis_github_output
+
+    write_analysis_github_output(record, output_file=gh_out)
+    assert record.status == "failed"
+    assert calls["n"] == 1
+    blob = " ".join(record.notes)
+    assert "HTTP 404" in blob
+    assert "persona=trinity_for_api" in blob
+    assert "stgpt.test.invalid/chatgpt/api/client-apps" in blob
+    assert "no route to app" in blob
+    assert "?" not in blob.split("url=", 1)[-1].split(" ", 1)[0]
+    assert "test-stgpt-key" not in blob
+    assert STGPT_CLIENT_APP_NAME not in "".join(
+        n.split("url=", 1)[-1].split(" ", 1)[0] for n in record.notes if "url=" in n
+    )
+    text = gh_out.read_text(encoding="utf-8")
+    assert "analysis-status=failed\n" in text
+    assert "HTTP 404" in text
+    assert "test-stgpt-key" not in text
+    merged = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert merged["analysis"]["status"] == "failed"
+    assert any("HTTP 404" in n for n in merged["analysis"]["notes"])
 
 
 def test_analyze_error_exits_zero_unless_strict(tmp_path: Path) -> None:
