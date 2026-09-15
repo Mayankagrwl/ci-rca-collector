@@ -90,6 +90,10 @@ inputs:
     description: 'Override ST ChatGPT bridge base URL. Leave empty to use STGPT_API_URL / the default.'
     required: false
     default: ''
+  stgpt-client-app-name:
+    description: 'ST ChatGPT clientAppName. Empty uses STGPT_CLIENT_APP_NAME / default gtrd_srmtdpplm.'
+    required: false
+    default: ''
 
 outputs:
   summary-path:
@@ -219,6 +223,8 @@ runs:
         REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
         STGPT_API: ${{ inputs.stgpt-api-key != '' && inputs.stgpt-api-key || env.STGPT_API }}
         STGPT_API_URL: ${{ inputs.stgpt-api-url != '' && inputs.stgpt-api-url || env.STGPT_API_URL }}
+        STGPT_CLIENT_APP_NAME: ${{ inputs.stgpt-client-app-name != '' && inputs.stgpt-client-app-name || env.STGPT_CLIENT_APP_NAME }}
+        STGPT_PERSONA: ${{ env.STGPT_PERSONA }}
       run: |
         extra=()
         if [ "$RCA_STRICT" = "true" ]; then

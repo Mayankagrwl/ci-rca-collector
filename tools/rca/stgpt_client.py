@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import STGPT_SERVICE, STGPT_VERSION
+from .config import STGPT_SERVICE, STGPT_VERSION, resolve_stgpt_client_app_name
 from .config_host import resolve_ssl_verify
 
 _LOG = logging.getLogger(__name__)
@@ -33,6 +33,7 @@ class ChatResult(NamedTuple):
     url: str | None = None
     duration_ms: int | None = None
     user_message_chars: int | None = None
+    client_app_name: str | None = None
 
 
 def generate_auth_token(client: str, service: str, key: str, ts: str | int, nonce: str) -> str:
@@ -77,12 +78,21 @@ def post_chat(
     """POST a chat turn. HTTP error statuses are returned, not raised."""
     ts = timestamp if timestamp is not None else str(int(time.time()))
     nonce_value = nonce if nonce is not None else uuid.uuid4().hex
+    client_app_name = (client_app_name or "").strip() or resolve_stgpt_client_app_name()
+    api_key = (api_key or "").strip()
     token = generate_auth_token(client_app_name, service, api_key, ts, nonce_value)
     endpoint = url.strip().rstrip("/")
     user_content = flatten_user_content(messages)
     if not user_content:
         raise StgptError("prompt_empty")
     _LOG.info("ST ChatGPT user_message_chars=%s", len(user_content))
+    _LOG.info(
+        "stgpt clientAppName_repr=%r clientAppName_len=%s url=%s persona=%s",
+        client_app_name,
+        len(client_app_name),
+        public_request_url(endpoint),
+        persona,
+    )
     fmt = _coerce_response_format(response_format)
 
     headers = {
@@ -152,6 +162,7 @@ def post_chat(
         endpoint,
         duration_ms,
         len(user_content),
+        client_app_name,
     )
 
 
@@ -175,7 +186,7 @@ def bridge_error_message(body: Mapping[str, Any] | None) -> str | None:
     text = message.strip() if isinstance(message, str) else ""
     if body.get("errorCode"):
         return text or str(body.get("errorCode"))
-    if text.startswith("responseFormat must"):
+    if text.startswith("responseFormat must") or text.startswith("Invalid application name"):
         return text
     return None
 

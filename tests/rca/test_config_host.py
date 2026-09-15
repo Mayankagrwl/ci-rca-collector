@@ -6,11 +6,14 @@ import pytest
 
 from tools.rca.config import (
     STGPT_API_URL,
+    STGPT_CLIENT_APP_NAME,
     resolve_github_api_url,
     resolve_github_server_url,
     resolve_github_token,
     resolve_ssl_verify,
+    resolve_stgpt_api_key,
     resolve_stgpt_api_url,
+    resolve_stgpt_client_app_name,
 )
 from tools.rca.config_host import (
     resolve_github_api_url as host_resolve_api_url,
@@ -41,6 +44,10 @@ _SSL_ENV = (
 _STGPT_ENV = (
     "STGPT_API",
     "STGPT_API_URL",
+    "STGPT_CLIENT_APP_NAME",
+    "CLIENT_APP_NAME",
+    "API_KEY",
+    "API_URL",
 )
 
 
@@ -107,3 +114,26 @@ def test_stgpt_api_url_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STGPT_API_URL", "https://bridge.example.invalid/chatgpt/api/client-apps/")
     assert resolve_stgpt_api_url() == "https://bridge.example.invalid/chatgpt/api/client-apps"
     assert resolve_stgpt_api_url("https://explicit.example.invalid/") == "https://explicit.example.invalid"
+    monkeypatch.delenv("STGPT_API_URL")
+    monkeypatch.setenv("API_URL", "https://from-api-url.example.invalid/chatgpt/api/client-apps/")
+    assert resolve_stgpt_api_url() == "https://from-api-url.example.invalid/chatgpt/api/client-apps"
+    assert STGPT_CLIENT_APP_NAME not in resolve_stgpt_api_url()
+
+
+def test_stgpt_client_app_name_strips_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert resolve_stgpt_client_app_name() == "gtrd_srmtdpplm"
+    assert len(resolve_stgpt_client_app_name()) == 14
+    monkeypatch.setenv("STGPT_CLIENT_APP_NAME", "gtrd_srmtdpplm\n")
+    assert resolve_stgpt_client_app_name() == "gtrd_srmtdpplm"
+    assert len(resolve_stgpt_client_app_name()) == 14
+    monkeypatch.delenv("STGPT_CLIENT_APP_NAME")
+    monkeypatch.setenv("CLIENT_APP_NAME", "  gtrd_srmtdpplm  ")
+    assert resolve_stgpt_client_app_name() == "gtrd_srmtdpplm"
+
+
+def test_stgpt_api_key_from_api_key_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert resolve_stgpt_api_key() is None
+    monkeypatch.setenv("API_KEY", "  laptop-key\n")
+    assert resolve_stgpt_api_key() == "laptop-key"
+    monkeypatch.setenv("STGPT_API", "stgpt-wins")
+    assert resolve_stgpt_api_key() == "stgpt-wins"

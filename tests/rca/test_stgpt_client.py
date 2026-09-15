@@ -35,6 +35,9 @@ _SSL_ENV = (
     "REQUESTS_CA_BUNDLE",
     "RCA_SSL_VERIFY",
     "STGPT_API",
+    "STGPT_CLIENT_APP_NAME",
+    "CLIENT_APP_NAME",
+    "API_KEY",
 )
 
 _BRIDGE = "https://stgpt.test.invalid/chatgpt/api/client-apps"
@@ -215,6 +218,44 @@ def test_extract_completion_from_camelcase_body() -> None:
     assert text is not None
     payload = json.loads(text)
     assert payload["rootCause"] == "lockfile drift"
+
+
+def test_client_app_name_stripped_in_token_and_body(caplog: pytest.LogCaptureFixture) -> None:
+    seen: list[httpx.Request] = []
+    ts, nonce = "1", "n"
+    dirty = "gtrd_srmtdpplm\n"
+    clean = "gtrd_srmtdpplm"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"completion": "ok"})
+
+    with caplog.at_level(logging.INFO):
+        result = post_chat(
+            _BRIDGE,
+            f" {_KEY} ",
+            dirty,
+            "trinity_for_api",
+            [{"role": "user", "content": "hi"}],
+            transport=httpx.MockTransport(handler),
+            timestamp=ts,
+            nonce=nonce,
+        )
+    assert len(seen) == 1
+    body = json.loads(seen[0].content.decode("utf-8"))
+    assert body["clientAppName"] == clean
+    assert len(body["clientAppName"]) == 14
+    assert "\n" not in body["clientAppName"]
+    token = generate_auth_token(clean, STGPT_SERVICE, _KEY, ts, nonce)
+    dirty_token = generate_auth_token(dirty, STGPT_SERVICE, _KEY, ts, nonce)
+    assert seen[0].headers["stchatgpt-auth-token"] == token
+    assert token != dirty_token
+    assert result.client_app_name == clean
+    log = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "clientAppName_repr='gtrd_srmtdpplm'" in log
+    assert "clientAppName_len=14" in log
+    assert _KEY not in log
+    assert token not in log
 
 
 def test_post_chat_prompt_empty_fails_before_post() -> None:

@@ -15,10 +15,10 @@ from .config import (
     PERSONAS,
     PROMPT_VERSION,
     SCHEMA_VERSION,
-    STGPT_CLIENT_APP_NAME,
     TOKEN_BUDGET_TOTAL,
     resolve_stgpt_api_key,
     resolve_stgpt_api_url,
+    resolve_stgpt_client_app_name,
 )
 from .models import AnalysisRecord, AnalysisResult, Summary
 from .prompt import build_evidence, build_messages
@@ -255,7 +255,7 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
         notes.append(_response_meta_note(chat, persona, messages))
         api_error = bridge_error_message(chat.body)
         if api_error:
-            notes.append(f"{persona}: {api_error}")
+            notes.append(_api_error_note(persona, api_error, chat.client_app_name))
             return _record(
                 base,
                 status="failed",
@@ -308,7 +308,9 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
             notes.append(_response_meta_note(repaired, persona, repair_messages))
             repair_error = bridge_error_message(repaired.body)
             if repair_error:
-                notes.append(f"{persona} repair: {repair_error}")
+                notes.append(
+                    _api_error_note(f"{persona} repair", repair_error, repaired.client_app_name)
+                )
                 return _record(
                     base,
                     status="failed",
@@ -380,6 +382,16 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
         raw_completion=None,
         stgpt_responses=stgpt_responses,
     )
+
+
+def _api_error_note(label: str, message: str, client_app_name: str | None) -> str:
+    name = resolve_stgpt_client_app_name(client_app_name)
+    note = (
+        f"{label}: {message} "
+        f"clientAppName_repr={name!r} clientAppName_len={len(name)}"
+    )
+    redacted, _ = redact_text(note)
+    return redacted
 
 
 def _response_meta_note(
@@ -679,7 +691,7 @@ def _make_chat_fn(
     if not key:
         raise StgptError("missing STGPT_API")
     bridge = resolve_stgpt_api_url(url)
-    app = client_app_name or STGPT_CLIENT_APP_NAME
+    app = resolve_stgpt_client_app_name(client_app_name)
 
     def _call(persona: str, messages: Sequence[Mapping[str, str]]) -> ChatResult:
         return post_chat(

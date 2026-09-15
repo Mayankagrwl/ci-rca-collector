@@ -310,6 +310,47 @@ def test_parse_error_does_not_call_second_persona(tmp_path: Path) -> None:
     assert gh_keys["analysis"]["result"]["root_cause"]
 
 
+def test_invalid_application_name_fails_without_root_cause(tmp_path: Path) -> None:
+    out = _collect(tmp_path)
+    summary = _summary(out)
+    err = "Invalid application name: gtrd_srmtdpplm"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        assert payload["clientAppName"] == "gtrd_srmtdpplm"
+        assert len(payload["clientAppName"]) == 14
+        return httpx.Response(
+            200,
+            json={
+                "responseId": "rid-app",
+                "errorCode": "VALIDATION",
+                "message": err,
+                "service": "chat",
+                "duration": 5,
+            },
+        )
+
+    record = analyze_summary(
+        summary,
+        api_key="test-stgpt-key",
+        url="https://stgpt.test.invalid/chatgpt/api/client-apps",
+        client_app_name="gtrd_srmtdpplm\n",
+        transport=httpx.MockTransport(handler),
+        cache_dir=tmp_path / "cache",
+    )
+    write_analysis(record, summary_path=out / "summary.json", out_dir=out)
+    assert record.status == "failed"
+    assert record.result is None
+    blob = " ".join(record.notes)
+    assert "Invalid application name" in blob
+    assert "clientAppName_repr='gtrd_srmtdpplm'" in blob
+    assert "clientAppName_len=14" in blob
+    assert "test-stgpt-key" not in blob
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "**Root cause:**" not in md
+    assert err in md
+
+
 def test_errorcode_payload_fails_without_root_cause(tmp_path: Path) -> None:
     out = _collect(tmp_path)
     summary = _summary(out)

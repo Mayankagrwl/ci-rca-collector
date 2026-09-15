@@ -51,6 +51,10 @@ def test_action_yml_analyze_is_separate_gated_step() -> None:
     assert "analyze:" in ACTION
     assert "stgpt-api-key:" in ACTION
     assert "stgpt-api-url:" in ACTION
+    assert "stgpt-client-app-name:" in ACTION
+    assert "STGPT_CLIENT_APP_NAME:" in ACTION
+    assert "STGPT_PERSONA:" in ACTION
+    assert "github.st.com" not in ACTION
     assert "default: 'true'" in ACTION
     assert "id: analyze" in ACTION
     assert "python -m tools.rca.cli analyze" in ACTION

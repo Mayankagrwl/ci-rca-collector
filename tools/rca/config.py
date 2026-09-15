@@ -53,25 +53,42 @@ PERSONAS = ("trinity_for_api", "alfred_for_api")
 PROMPT_VERSION = "p2.1"
 
 
+def _strip_env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
+
+
 def resolve_stgpt_api_key(explicit: str | None = None) -> str | None:
-    """Resolve the ST ChatGPT bridge key from ``STGPT_API``. Never log it."""
+    """Resolve the ST ChatGPT bridge key. Never log it.
+
+    Order: explicit argument, ``STGPT_API``, ``API_KEY``.
+    """
     if explicit and explicit.strip():
         return explicit.strip()
-    value = os.environ.get("STGPT_API")
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None
+    return _strip_env("STGPT_API", "API_KEY")
 
 
 def resolve_stgpt_api_url(explicit: str | None = None) -> str:
-    """Resolve the ST ChatGPT bridge base URL. Never log secrets."""
+    """Resolve the ST ChatGPT bridge base URL. Never append clientAppName."""
     if explicit and explicit.strip():
         return explicit.strip().rstrip("/")
-    value = os.environ.get("STGPT_API_URL")
-    if value and value.strip():
-        return value.strip().rstrip("/")
-    return STGPT_API_URL
+    value = _strip_env("STGPT_API_URL", "API_URL")
+    if value:
+        return value.rstrip("/")
+    return STGPT_API_URL.rstrip("/")
+
+
+def resolve_stgpt_client_app_name(explicit: str | None = None) -> str:
+    """Resolve clientAppName. Strip surrounding whitespace/newlines."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    return _strip_env("STGPT_CLIENT_APP_NAME", "CLIENT_APP_NAME") or STGPT_CLIENT_APP_NAME
 
 
 # Case-insensitive. Matched against the raw job log (Stage 1).
@@ -200,4 +217,5 @@ __all__ = [
     "resolve_ssl_verify",
     "resolve_stgpt_api_key",
     "resolve_stgpt_api_url",
+    "resolve_stgpt_client_app_name",
 ]
