@@ -94,6 +94,34 @@ _FIX_PREFIX = (
 )
 _LOCK_OR_MANIFEST = frozenset({"lockfile", "dependency"})
 _CONFIG_ONLY = frozenset({"ci_config", "container"})
+SIGNATURE_CATEGORIES = frozenset(
+    {
+        "dependency",
+        "compile",
+        "oom",
+        "timeout",
+        "image_pull",
+        "auth",
+        "test_failure",
+        "disk_space",
+    }
+)
+_PKG_RES = [
+    re.compile(r"No matching distribution found for ([A-Za-z0-9_.-]+)", re.I),
+    re.compile(r"satisfies the requirement ([A-Za-z0-9_.-]+)", re.I),
+    re.compile(r"(?m)^Collecting ([A-Za-z0-9_.-]+)\s*$"),
+    re.compile(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]", re.I),
+    re.compile(r"Cannot find module ['\"]([^'\"]+)['\"]", re.I),
+    re.compile(r"npm ERR! 404[^\n]*['\"]([^'\"]+)['\"]", re.I),
+    re.compile(r"go: ([^\s:]+):(?:\s+module)? .*not found", re.I),
+]
+_TEST_NAME_RE = re.compile(r"\bFAILED\s+(\S+)", re.I)
+_WORKFLOW_PATH_RE = re.compile(r"\.github/workflows/|/action\.ya?ml\b", re.I)
+_WORKFLOW_SYNTAX_RE = re.compile(
+    r"Invalid workflow file|Workflow syntax|Unexpected value|"
+    r"you have an error in your yaml|Error in the workflow file",
+    re.I,
+)
 _SHORT_CIRCUITS = frozenset(
     {"infra_runner", "infra_widespread", "flake_same_sha_passed", "no_failed_jobs"}
 )
@@ -224,6 +252,10 @@ def diagnose(summary: Summary) -> DeterministicVerdict:
     if r17 is not None:
         return finish(r17)
 
+    r_sig = _rule_signature(summary, hit)
+    if r_sig is not None:
+        return finish(r_sig)
+
     return finish(_rule_r18(summary, hit, stage, files_from_logs))
 
 
@@ -282,17 +314,173 @@ def looks_like_fix(text: str | None) -> bool:
     return bool(lowered) and any(lowered.startswith(prefix) for prefix in _FIX_PREFIX)
 
 
-def enrich_display(summary: Summary, verdict: DeterministicVerdict) -> DeterministicVerdict:
-    """Fill fix_one_liner and citation quotes without changing the winning rule."""
-    if not verdict.fix_one_liner:
-        if looks_like_fix(verdict.one_liner):
-            verdict.fix_one_liner = verdict.one_liner
-        else:
-            verdict.fix_one_liner = _FIX_BY_RULE.get(verdict.rule_id) or (
-                "Inspect the collector evidence; compare with last green."
+def _contains_rule_id(text: str | None) -> bool:
+    return bool(re.search(r"\bR(?:1[0-8]|[1-9])\b", text or ""))
+
+
+def extract_package_name(summary: Summary) -> str | None:
+    blob = _all_text(summary, ignore_job=False)
+    for compiled in _PKG_RES:
+        match = compiled.search(blob)
+        if match:
+            name = (match.group(1) or "").strip().rstrip(".,;:")
+            if name and name.lower() not in {"the", "a", "requirement"}:
+                return name
+    return None
+
+
+def extract_test_name(summary: Summary) -> str | None:
+    if summary.junit is not None and summary.junit.failures:
+        item = summary.junit.failures[0]
+        if item.name:
+            return f"{item.classname}::{item.name}" if item.classname else item.name
+    blob = _all_text(summary, ignore_job=False)
+    match = _TEST_NAME_RE.search(blob)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _error_from_workflow(summary: Summary) -> bool:
+    blob = _all_text(summary, ignore_job=False)
+    if _WORKFLOW_SYNTAX_RE.search(blob) or _WORKFLOW_PATH_RE.search(blob):
+        return True
+    for path, _line in _error_paths(summary, ignore_job=False):
+        if _WORKFLOW_PATH_RE.search(path.replace("\\", "/")):
+            return True
+    return False
+
+
+def user_facing(verdict: DeterministicVerdict, summary: Summary):
+    """User card copy. Never includes rule ids. Citations are evidence only."""
+    from .models import AnalysisCitation, AnalysisResult
+
+    cat = verdict.category or "unknown"
+    signature = cat in SIGNATURE_CATEGORIES or (
+        verdict.confidence == "high" and cat != "unknown"
+    )
+    conf = "high" if signature else (
+        verdict.confidence if verdict.confidence in {"high", "medium", "low"} else "medium"
+    )
+    pkg = extract_package_name(summary)
+    test_name = extract_test_name(summary)
+    classes = set((summary.changes.classes if summary.changes else []) or [])
+    ci_only = bool(classes) and classes <= {"ci_config", "container", "build_config"}
+
+    if cat == "dependency" or (signature and cat == "dependency"):
+        if pkg:
+            root = (
+                f'Package install failed: "{pkg}" was not found '
+                f"(or could not be resolved)."
             )
-    if not verdict.citations:
-        verdict.citations = display_citation_quotes(summary, extra=verdict.one_liner)
+        else:
+            root = (
+                "Package install failed: a package was not found "
+                "(or could not be resolved)."
+            )
+        fix = (
+            "Use a published package name and version; update the manifest/lockfile; "
+            "re-run. If a workflow file also changed, check the install command — "
+            "but the log error is the missing package."
+        )
+    elif cat == "timeout":
+        root = "The job exceeded its time limit (or hung until it was cancelled)."
+        fix = "Raise timeout-minutes or fix the hang/retry loop."
+    elif cat == "oom":
+        root = "The process ran out of memory (OOM / exit 137 / heap exhaustion)."
+        fix = "Raise the job or container memory limit."
+    elif cat == "image_pull":
+        root = (
+            "The container image could not be pulled "
+            "(missing tag, registry 401/403, or denied)."
+        )
+        fix = "Check the image name/tag and registry credentials; compare digest to last green."
+    elif cat == "auth":
+        root = "Authentication failed (401/403 or access denied)."
+        fix = "Check credentials, tokens, and registry or package permissions."
+    elif cat == "test_failure":
+        if test_name:
+            root = f'Test failed: {test_name}.'
+        else:
+            root = "A test assertion failed."
+        fix = "Fix the failing assertion in that test."
+    elif cat == "compile":
+        files = verdict.suspected_files
+        if files:
+            root = f"Compilation failed in {files[0]}."
+        else:
+            root = "Compilation failed."
+        fix = "Fix the compile error in the suspected source file(s)."
+    elif cat == "disk_space":
+        root = "The job ran out of disk space (ENOSPC)."
+        fix = "Free disk space or use a larger runner disk."
+    elif verdict.is_flaky or verdict.short_circuit == "flake_same_sha_passed":
+        root = (
+            "This job failed on a SHA that previously succeeded, "
+            "or the same fingerprint failed on another branch."
+        )
+        fix = "Re-run the job; treat as flaky until it repeats on a clean SHA."
+    elif (
+        (not signature or cat in {"unknown", "infra_runner"})
+        and ci_only
+        and (verdict.rule_id == "R14" or not signature)
+    ):
+        root = (
+            "The CI workflow or action definition changed in this range "
+            "and the job failed."
+        )
+        fix = (
+            "Diff .github/workflows against last green and revert the pipeline edit "
+            "if it is unrelated to the product change."
+        )
+    else:
+        root = verdict.one_liner or "The collector named this failure from the logs."
+        fix = verdict.fix_one_liner or fix_for_rule(verdict.rule_id)
+        root = re.sub(r"\bR(?:1[0-8]|[1-9])\s*:\s*", "", root).strip()
+        fix = re.sub(r"\bR(?:1[0-8]|[1-9])\s*:\s*", "", fix).strip()
+
+    extras = [pkg] if pkg else []
+    if test_name:
+        extras.append(test_name)
+    quotes = display_citation_quotes(summary)
+    for item in extras:
+        if item and item not in quotes:
+            quotes.insert(0, item)
+    citations: list[AnalysisCitation] = []
+    changed = set(_changed_files(summary.changes))
+    for quote in quotes:
+        if looks_like_fix(quote) or _contains_rule_id(quote):
+            continue
+        source = "first_error_window"
+        if quote in changed or (pkg and quote == pkg):
+            source = "change_context" if quote in changed else "first_error_window"
+        elif any(quote in (w.content or "") for s in summary.pipeline_logs for w in s.windows):
+            source = "pipeline_logs"
+        citations.append(AnalysisCitation(quote=quote[:240], source=source))  # type: ignore[arg-type]
+        if len(citations) >= 5:
+            break
+
+    return AnalysisResult(
+        root_cause=root,
+        suggested_fix=fix,
+        confidence=conf,  # type: ignore[arg-type]
+        citations=citations,
+        suspected_files=list(verdict.suspected_files),
+        suspected_stage=verdict.suspected_stage,
+        infra_or_code=verdict.is_infra_vs_code,
+        used_deterministic_rule=verdict.rule_id,
+        source="deterministic",
+    )
+
+
+def enrich_display(summary: Summary, verdict: DeterministicVerdict) -> DeterministicVerdict:
+    """Apply user-facing copy; citations are log lines / packages / paths only."""
+    card = user_facing(verdict, summary)
+    verdict.one_liner = card.root_cause
+    verdict.fix_one_liner = card.suggested_fix
+    verdict.citations = [cite.quote for cite in card.citations]
+    if card.confidence in {"high", "medium", "low"}:
+        verdict.confidence = card.confidence
     return verdict
 
 
@@ -306,9 +494,12 @@ def display_citation_quotes(summary: Summary, *, extra: str | None = None) -> li
             return
         quotes.append(item[:240])
 
-    _add(extra)
+    if extra and not looks_like_fix(extra) and not _contains_rule_id(extra):
+        _add(extra)
     if summary.diagnosis is not None and summary.diagnosis.one_liner:
-        _add(summary.diagnosis.one_liner)
+        line = summary.diagnosis.one_liner
+        if not looks_like_fix(line) and not _contains_rule_id(line):
+            _add(line)
     for job in summary.failed_jobs:
         for err in job.error_lines[:2]:
             _add(err.text)
@@ -340,7 +531,13 @@ def display_citation_quotes(summary: Summary, *, extra: str | None = None) -> li
 def refine_blast_radius(
     summary: Summary, verdict: DeterministicVerdict
 ) -> DeterministicVerdict:
-    """Rewrite rollback one-liners when the diff is only config/deps/image."""
+    """Rewrite rollback one-liners when the diff is only config/deps/image.
+
+    A high-confidence classify signature is the cause. ci_config/lockfile in
+    changes.classes is a hint unless the error line is a workflow/action file.
+    """
+    if verdict.category in SIGNATURE_CATEGORIES and not _error_from_workflow(summary):
+        return verdict
     if not is_blast_radius_skip(summary):
         return verdict
     classes = set((summary.changes.classes if summary.changes else []) or [])
@@ -715,9 +912,6 @@ def _rule_dependency_lockfile(
 ) -> DeterministicVerdict | None:
     if hit.category != "dependency" and not _search_category(summary, "dependency"):
         return None
-    classes = set((summary.changes.classes if summary.changes else []) or [])
-    if not (classes & _LOCK_OR_MANIFEST):
-        return None
     files = [
         path
         for path in _changed_files(summary.changes)
@@ -725,16 +919,14 @@ def _rule_dependency_lockfile(
     ]
     return _from_hit(
         "R8",
-        _one_liner_from_hit(
-            hit,
-            "dependency resolution failed and a lockfile/manifest changed",
-        ),
+        _one_liner_from_hit(hit, "package install or dependency resolution failed"),
         hit if hit.category == "dependency" else ClassificationHit(
             category="dependency",
             confidence="high",
             is_infra_vs_code="code",
         ),
         category="dependency",
+        confidence="high",
         is_infra_vs_code="code",
         requires_analysis=False,
         suspected_files=files,
@@ -757,6 +949,20 @@ def _rule_compile(
         for stream in summary.pipeline_logs
     )
     if not in_build_pipeline:
+        if hit.category == "compile" and hit.confidence == "high":
+            return _v(
+                "R9",
+                _one_liner_from_hit(hit, "compile error"),
+                category="compile",
+                confidence="high",
+                is_infra_vs_code="code",
+                requires_analysis=False,
+                suspected_files=[path for path, _line in files_from_logs][:3],
+                suspected_stage="build",
+                matched_stream=hit.matched_stream,
+                winning_stream_id=hit.matched_stream,
+                matched_pattern=hit.matched_pattern,
+            )
         return None
     changed = _changed_files(summary.changes)
     log_paths = [path for path, _line in files_from_logs]
@@ -924,21 +1130,28 @@ def _rule_last_green(summary: Summary) -> DeterministicVerdict | None:
 
 
 def _rule_config_only(summary: Summary, hit: ClassificationHit) -> DeterministicVerdict | None:
+    if hit.confidence == "high" and hit.category in SIGNATURE_CATEGORIES:
+        if not _error_from_workflow(summary):
+            return None
     classes = set((summary.changes.classes if summary.changes else []) or [])
-    if not classes or not classes <= _CONFIG_ONLY:
+    if not classes or not classes <= (_CONFIG_ONLY | {"build_config"}):
         return None
-    blob = _all_text(summary, ignore_job=False)
-    related = (
-        hit.category in {"image_pull", "auth", "unknown"}
-        or bool(_IMAGE_OR_WORKFLOW_RE.search(blob))
-    )
+    if hit.category in SIGNATURE_CATEGORIES and not _error_from_workflow(summary):
+        return None
+    related = _error_from_workflow(summary) or hit.category in {
+        "image_pull",
+        "auth",
+        "unknown",
+    }
     if not related:
         return None
-    category = hit.category if hit.category != "unknown" else "image_pull"
+    category = "unknown" if hit.category in SIGNATURE_CATEGORIES else (
+        hit.category if hit.category != "unknown" else "unknown"
+    )
     return _v(
         "R14",
-        "only ci_config/container changed and the error is image/workflow related",
-        category=category,
+        "The CI workflow or action definition changed in this range and the job failed.",
+        category=category if category != "image_pull" else "unknown",
         confidence="high",
         is_infra_vs_code="infra",
         requires_analysis=False,
@@ -1007,6 +1220,36 @@ def _rule_pipeline_over_job(
     )
 
 
+_SIGNATURE_RULE = {
+    "dependency": "R8",
+    "compile": "R9",
+    "oom": "R5",
+    "timeout": "R4",
+    "image_pull": "R7",
+    "auth": "R7",
+    "test_failure": "R10",
+    "disk_space": "R6",
+}
+
+
+def _rule_signature(summary: Summary, hit: ClassificationHit) -> DeterministicVerdict | None:
+    """High-confidence classify hits are a cause even without a matching later rule."""
+    if hit.confidence != "high" or hit.category not in SIGNATURE_CATEGORIES:
+        return None
+    rule = _SIGNATURE_RULE.get(hit.category)
+    if not rule:
+        return None
+    return _from_hit(
+        rule,
+        _one_liner_from_hit(hit, f"{hit.category} signature matched"),
+        hit,
+        category=hit.category,
+        confidence="high",
+        requires_analysis=False,
+        suspected_stage=_suspected_stage(summary, hit),
+    )
+
+
 def _rule_r18(
     summary: Summary,
     hit: ClassificationHit,
@@ -1014,6 +1257,18 @@ def _rule_r18(
     files_from_logs: list[tuple[str, int | None]],
 ) -> DeterministicVerdict:
     files = list(dict.fromkeys(path for path, _line in files_from_logs))
+    classes = set((summary.changes.classes if summary.changes else []) or [])
+    if classes and classes <= (_CONFIG_ONLY | {"build_config"}):
+        return _v(
+            "R14",
+            "The CI workflow or action definition changed in this range and the job failed.",
+            category="unknown",
+            confidence="medium",
+            is_infra_vs_code="infra",
+            requires_analysis=False,
+            suspected_files=list(_changed_files(summary.changes)),
+            suspected_stage=stage,
+        )
     return _from_hit(
         "R18",
         "insufficient deterministic evidence; packaging a minimal bundle",

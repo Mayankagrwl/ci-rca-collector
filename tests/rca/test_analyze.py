@@ -44,7 +44,10 @@ def _collect(tmp_path: Path) -> Path:
 
 
 def _summary(out: Path) -> Summary:
-    return Summary.model_validate_json((out / "summary.json").read_text(encoding="utf-8"))
+    summary = Summary.model_validate_json((out / "summary.json").read_text(encoding="utf-8"))
+    # sample-failure is now R8 (no STGPT). Tests that call the model re-enable analysis.
+    summary.verdict.requires_analysis = True
+    return summary
 
 
 def _result(quote: str, *, root: str = "npm ERESOLVE") -> dict[str, object]:
@@ -117,6 +120,8 @@ def test_missing_key_skips_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
             str(tmp_path / "cache"),
             "--stgpt-key-present",
             "false",
+            "--requires-analysis",
+            "true",
         ]
     )
     assert rc == 0
@@ -182,6 +187,8 @@ def test_happy_path_writes_status_ok_and_root_cause(tmp_path: Path) -> None:
             _OK_COMPLETION,
             "--cache-dir",
             str(tmp_path / "cache"),
+            "--requires-analysis",
+            "true",
         ]
     )
     assert rc == 0
@@ -239,6 +246,8 @@ def test_r8_skip_has_root_cause_and_suggested_fix(tmp_path: Path) -> None:
     assert summary.diagnosis is not None
     assert summary.diagnosis.rule_id == "R8"
     assert summary.verdict.requires_analysis is False
+    assert "R8" not in (summary.diagnosis.one_liner or "")
+    assert "R18" not in (summary.diagnosis.one_liner or "")
     (out / "summary.json").write_text(summary.model_dump_json(indent=2), encoding="utf-8")
     rc = main(
         [
@@ -285,6 +294,8 @@ def test_cache_hit_skips_http(tmp_path: Path) -> None:
             str(cache),
             "--from-completion",
             _OK_COMPLETION,
+            "--requires-analysis",
+            "true",
         ]
     )
     assert first == 0
@@ -299,6 +310,8 @@ def test_cache_hit_skips_http(tmp_path: Path) -> None:
             "--cache-dir",
             str(cache),
             "--stgpt-key-present",
+            "true",
+            "--requires-analysis",
             "true",
         ]
     )
@@ -388,6 +401,8 @@ def test_from_completion_fixture_cli(tmp_path: Path, monkeypatch) -> None:
             _OK_COMPLETION,
             "--cache-dir",
             str(tmp_path / "cache"),
+            "--requires-analysis",
+            "true",
         ]
     )
     assert rc == 0

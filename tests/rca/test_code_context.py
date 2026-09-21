@@ -287,7 +287,8 @@ def test_blast_radius_lockfile_and_workflow_skips_get_file() -> None:
     assert any("changes.classes=" in note for note in summary.collection_notes)
     verdict = diagnose(summary)
     assert verdict.requires_analysis is False
-    assert "Roll back the lockfile" in verdict.one_liner
+    assert "Package install failed" in verdict.one_liner
+    assert "R8" not in verdict.one_liner
     from tools.rca.diagnose import apply_verdict
 
     apply_verdict(summary, verdict)

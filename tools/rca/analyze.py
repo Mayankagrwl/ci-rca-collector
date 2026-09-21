@@ -222,8 +222,6 @@ def redact_record(record: AnalysisRecord) -> AnalysisRecord:
 
 
 def _gate(summary: Summary) -> AnalysisRecord | None:
-    if summary.verdict.requires_analysis is False:
-        return skipped_record(summary, "deterministic_sufficient")
     if summary.verdict.short_circuit:
         return skipped_record(summary, "short_circuit")
     return None
@@ -579,60 +577,33 @@ def analysis_result_from_summary(
     summary: Summary, *, source: str = "deterministic"
 ) -> AnalysisResult:
     """Fill the four display fields from collector diagnosis. Never invent files."""
-    from .diagnose import looks_like_fix
+    from .diagnose import DeterministicVerdict, user_facing
 
     diag = summary.diagnosis
-    rule = diag.rule_id if diag is not None else None
-    one = (
-        (diag.one_liner if diag is not None else None)
-        or summary.verdict.reason
-        or summary.classification.category
-        or "Collector named this failure."
-    )
-    fix = (diag.fix_one_liner if diag is not None else None) or ""
-    if looks_like_fix(one):
-        category = summary.classification.category or "failure"
-        root = f"{rule or 'R18'}: {category} failure."
-        if one not in root:
-            root = f"{root} {one}"
-        fix = fix or one
-    else:
-        root = one
-        if not fix:
-            from .diagnose import fix_for_rule
-
-            fix = fix_for_rule(rule) or one
-    root = (root or "").strip() or "Deterministic collector diagnosis."
-    fix = (fix or "").strip() or "See the deterministic diagnosis in this report."
-    conf = summary.classification.confidence
-    if conf not in {"high", "medium", "low"}:
-        conf = "medium"
-    citations = citations_from_summary(summary)
-    if not citations:
-        citations = [
-            AnalysisCitation(quote=one[:240], source="deterministic_rule")
-        ]
-    return AnalysisResult(
-        root_cause=root,
-        suggested_fix=fix,
-        confidence=conf,  # type: ignore[arg-type]
-        citations=citations,
-        suspected_files=list(diag.suspected_files if diag is not None else []),
+    verdict = DeterministicVerdict(
+        category=summary.classification.category or "unknown",
+        confidence=summary.classification.confidence or "low",
+        is_infra_vs_code=summary.classification.is_infra_vs_code or "unknown",
+        requires_analysis=summary.verdict.requires_analysis,
+        rule_id=diag.rule_id if diag is not None else "R18",
+        one_liner=(diag.one_liner if diag is not None else "") or "",
         suspected_stage=diag.suspected_stage if diag is not None else None,
-        infra_or_code=summary.classification.is_infra_vs_code,
-        used_deterministic_rule=rule,
-        source=source,
+        suspected_files=list(diag.suspected_files if diag is not None else []),
+        citations=list(diag.citations if diag is not None else []),
+        is_flaky=summary.classification.is_flaky,
+        short_circuit=summary.verdict.short_circuit,
+        fix_one_liner=diag.fix_one_liner if diag is not None else None,
     )
+    result = user_facing(verdict, summary)
+    result.source = source
+    return result
 
 
 def citations_from_summary(summary: Summary) -> list[AnalysisCitation]:
     """Citations only from collector evidence. Never fabricate files."""
     from .diagnose import display_citation_quotes
 
-    quotes = display_citation_quotes(
-        summary,
-        extra=summary.diagnosis.one_liner if summary.diagnosis is not None else None,
-    )
+    quotes = display_citation_quotes(summary)
     out: list[AnalysisCitation] = []
     lockfiles = set()
     if summary.changes is not None:
@@ -678,7 +649,7 @@ def citations_from_summary(summary: Summary) -> list[AnalysisCitation]:
                         line = err.line_number
                         break
         elif summary.diagnosis is not None and quote == summary.diagnosis.one_liner:
-            source = "deterministic_rule"
+            continue
         out.append(
             AnalysisCitation(
                 quote=quote[:240],
@@ -1083,13 +1054,6 @@ def _diagnosis_markdown(
     )
     if reason:
         lines.append(f"**Reason code:** {reason}")
-    if called == "no":
-        diag = summary.diagnosis if summary is not None else None
-        if diag is not None and diag.rule_id:
-            pointer = f"`{diag.rule_id}`"
-            if diag.one_liner:
-                pointer += f" — {diag.one_liner}"
-            lines.append(f"**Deterministic rule:** {pointer}")
     if record.persona:
         lines.append(f"**Persona:** {record.persona}")
     if record.cache_hit:

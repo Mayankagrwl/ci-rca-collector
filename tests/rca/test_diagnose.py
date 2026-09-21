@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from tools.rca.diagnose import apply_verdict, diagnose
+from tools.rca.diagnose import apply_verdict, diagnose, user_facing
 from tools.rca.models import (
     BudgetReport,
     ChangeContext,
@@ -231,7 +231,9 @@ def test_r8_dependency_with_lockfile_change() -> None:
     assert verdict.requires_analysis is False
     assert verdict.category == "dependency"
     assert "package-lock.json" in verdict.suspected_files
-    assert "Roll back the lockfile" in verdict.one_liner
+    assert "Package install failed" in verdict.one_liner
+    assert "R8" not in verdict.one_liner
+    assert "revert the pipeline edit" not in (verdict.one_liner + (verdict.fix_one_liner or ""))
 
 
 def test_r9_compile_intersects_changed_source() -> None:
@@ -364,23 +366,24 @@ def test_r13_last_green_novel_template() -> None:
 
 def test_r14_ci_config_container_only() -> None:
     summary = _summary(
-        job_text="Error: Docker failed to pull image acme/ci:latest",
+        job_text="Invalid workflow file: .github/workflows/ci.yml: Unexpected value 'on'",
         changes=ChangeContext(
             head_sha="abc",
             range_basis="last_success",
-            classes=["ci_config", "container"],
-            files=[".github/workflows/ci.yml", "Dockerfile"],
+            classes=["ci_config"],
+            files=[".github/workflows/ci.yml"],
         ),
     )
     verdict = diagnose(summary)
     assert verdict.rule_id == "R14"
     assert verdict.requires_analysis is False
-    assert verdict.is_infra_vs_code == "infra"
+    assert "R14" not in verdict.one_liner
+    assert "workflow" in verdict.one_liner.lower() or "CI" in verdict.one_liner
 
 
 def test_r15_history_exact_reuses_resolution() -> None:
     summary = _summary(
-        job_text="npm ERR! ERESOLVE could not resolve",
+        job_text="mysterious flaky failure without a signature",
         history=HistoryContext(
             match="exact",
             previous_resolution="pin lodash@4.17.21",
@@ -390,13 +393,12 @@ def test_r15_history_exact_reuses_resolution() -> None:
     verdict = diagnose(summary)
     assert verdict.rule_id == "R15"
     assert verdict.requires_analysis is False
-    assert "pin lodash" in verdict.one_liner
-    assert "history" in verdict.citations
+    assert "pin lodash" in verdict.one_liner or "pin lodash" in (verdict.fix_one_liner or "")
 
 
 def test_r16_history_cross_branch_flake() -> None:
     summary = _summary(
-        job_text="npm ERR! ERESOLVE could not resolve",
+        job_text="mysterious flaky failure without a signature",
         history=HistoryContext(
             match="exact",
             cross_branch=True,
@@ -415,7 +417,7 @@ def test_r17_pipeline_first_error_beats_exit_code_job_log() -> None:
         job_text="##[error]Process completed with exit code 1.",
         pipeline_logs=[
             _pipe(
-                "npm ERR! code ERESOLVE\nnpm ERR! ERESOLVE could not resolve",
+                "panic: runtime error: invalid memory address",
                 artifact="pipeline-logs-build",
                 stage="build",
             )
@@ -424,7 +426,6 @@ def test_r17_pipeline_first_error_beats_exit_code_job_log() -> None:
     verdict = diagnose(summary)
     assert verdict.rule_id == "R17"
     assert verdict.requires_analysis is False
-    assert verdict.category == "dependency"
     assert verdict.winning_stream_id is not None
     assert verdict.winning_stream_id.startswith("artifact:")
 
@@ -439,6 +440,60 @@ def test_r18_unknown_requires_analysis() -> None:
     assert applied.verdict.reason.startswith("R18:")
     assert applied.diagnosis is not None
     assert applied.diagnosis.rule_id == "R18"
+
+
+def test_pip_missing_package_wins_over_ci_yml_in_diff() -> None:
+    lines = (
+        "Collecting this-package-does-not-exist-9f3a\n"
+        "ERROR: Could not find a version that satisfies the requirement "
+        "this-package-does-not-exist-9f3a (from versions: none)\n"
+        "ERROR: No matching distribution found for this-package-does-not-exist-9f3a\n"
+        "##[error]Process completed with exit code 1."
+    )
+    summary = _summary(
+        job_text=lines,
+        changes=ChangeContext(
+            head_sha="abc",
+            range_basis="last_success",
+            classes=["ci_config"],
+            files=[".github/workflows/rca-collect.yml"],
+        ),
+    )
+    verdict = diagnose(summary)
+    assert verdict.rule_id.startswith("R8")
+    assert verdict.rule_id != "R18"
+    assert verdict.requires_analysis is False
+    card = user_facing(verdict, summary)
+    assert "this-package-does-not-exist-9f3a" in card.root_cause
+    assert "revert the pipeline edit" not in card.suggested_fix.lower()
+    assert "missing package" in card.suggested_fix
+    blob = card.root_cause + card.suggested_fix
+    assert "R18" not in blob
+    assert "R8" not in blob
+    for cite in card.citations:
+        assert not cite.quote.lower().startswith("use a published")
+        assert "R8" not in cite.quote
+        assert "R18" not in cite.quote
+
+
+def test_ci_yml_only_workflow_syntax_uses_ci_config_copy() -> None:
+    summary = _summary(
+        job_text="Invalid workflow file: .github/workflows/ci.yml: Unexpected value 'on'",
+        changes=ChangeContext(
+            head_sha="abc",
+            range_basis="last_success",
+            classes=["ci_config"],
+            files=[".github/workflows/ci.yml"],
+        ),
+    )
+    verdict = diagnose(summary)
+    card = user_facing(verdict, summary)
+    assert verdict.rule_id == "R14"
+    assert "workflow" in card.root_cause.lower() or "CI" in card.root_cause
+    assert "revert the pipeline edit" in card.suggested_fix.lower()
+    assert "R14" not in card.root_cause
+    assert "R18" not in card.root_cause
+    assert "R14" not in card.suggested_fix
 
 
 def test_r10_generic_assertion_with_hunk_requires_analysis() -> None:

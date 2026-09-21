@@ -68,7 +68,7 @@ def test_collect_from_fixture(tmp_path: Path) -> None:
     assert job["steps"][1]["suspected_cache_miss"] is True
     assert payload["classification"]["category"] == "dependency"
     assert payload["classification"]["is_infra_vs_code"] == "code"
-    assert payload["verdict"]["requires_analysis"] is True
+    assert payload["verdict"]["requires_analysis"] is False
     assert payload["drain"] is not None
     assert payload["drain"]["baseline_available"] is False
     for tmpl in payload["drain"]["templates"]:
@@ -113,7 +113,7 @@ def test_collect_writes_github_output(tmp_path: Path, monkeypatch) -> None:
     for key in OUTPUT_KEYS:
         assert f"{key}=" in text
     assert "category=dependency" in text
-    assert "requires-analysis=true" in text
+    assert "requires-analysis=false" in text
     assert "failed-job-count=1" in text
     assert "recurrence=new" in text
     assert "seen-count=0" in text
