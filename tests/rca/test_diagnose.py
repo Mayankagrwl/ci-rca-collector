@@ -476,6 +476,28 @@ def test_pip_missing_package_wins_over_ci_yml_in_diff() -> None:
         assert "R18" not in cite.quote
 
 
+def test_artifactory_already_exists_beats_r14_copy() -> None:
+    summary = _summary(
+        job_text=(
+            "This release already exists on Artifactory\n"
+            "Update package.json before publishing 3.1.21"
+        ),
+        changes=ChangeContext(
+            head_sha="abc",
+            range_basis="last_success",
+            classes=["ci_config"],
+            files=[".github/workflows/ci.yml", "package.json"],
+        ),
+    )
+    verdict = diagnose(summary)
+    card = user_facing(verdict, summary)
+    blob = (card.root_cause + " " + card.suggested_fix).lower()
+    assert "artifactory" in blob or "already exists" in blob
+    assert "revert the pipeline edit" not in blob
+    assert "R14" not in card.root_cause
+    assert "R14" not in card.suggested_fix
+
+
 def test_ci_yml_only_workflow_syntax_uses_ci_config_copy() -> None:
     summary = _summary(
         job_text="Invalid workflow file: .github/workflows/ci.yml: Unexpected value 'on'",

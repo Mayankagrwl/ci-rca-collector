@@ -441,7 +441,7 @@ class AnalysisResult(BaseModel):
 
 class AnalysisRecord(BaseModel):
     status: AnalysisStatus
-    prompt_version: str = "p2.2"
+    prompt_version: str = "p2.3"
     persona: str | None = None
     fingerprint: str | None = None
     schema_version: str | None = None

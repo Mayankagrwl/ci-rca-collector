@@ -37,19 +37,60 @@ jobs:
       deterministic-rule: ${{ steps.rca.outputs.deterministic-rule }}
       diagnosis-source: ${{ steps.rca.outputs.diagnosis-source }}
     steps:
+      # Sanitize workflow names before actions/cache. Keys must match
+      # ^[a-zA-Z0-9!#%'()+,-./<=>@_[{}~]+$ — spaces in names like
+      # "Build Api-gateway" cause HTTP 400 and the restore never hits.
+      #
+      # History must restore across runs of the SAME workflow. A run-id-only
+      # key (rca-history-160782) never hits on the next failure.
+      # actions/cache is still a ~7 day LRU. Composite action also emits
+      # drain-cache-key / history-cache-key from Python.
+      - name: Sanitize cache keys
+        id: keys
+        shell: bash
+        env:
+          WF: ${{ inputs.workflow-name }}
+          JOB: ${{ github.job }}
+          REPO: ${{ github.repository }}
+        run: |
+          sanitize() {
+            local s="${1:-unknown}"
+            s="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"
+            s="$(printf '%s' "$s" | tr -s '[:space:]' '-')"
+            s="$(printf '%s' "$s" | sed -E 's/[^a-z0-9._-]+/-/g; s/-{2,}/-/g; s/^-+//; s/-+$//; s/^$/unknown/')"
+            printf '%s' "${s:0:80}"
+          }
+          wf="$(sanitize "$WF")"
+          job="$(sanitize "${JOB:-collect}")"
+          repo="$(sanitize "$REPO")"
+          {
+            echo "workflow=$wf"
+            echo "job=$job"
+            echo "repo=$repo"
+            echo "drain-cache-key=drain3-${wf}-${job}"
+            echo "drain-cache-restore-key=drain3-${wf}-"
+            echo "history-cache-key=rca-history-${repo}-${wf}"
+            echo "history-cache-restore-key=rca-history-${repo}-"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Restore Drain3 baseline
-        uses: actions/cache@v4
+        continue-on-error: true
+        uses: actions/cache/restore@v4
         with:
           path: .drain/
-          key: drain3-${{ inputs.workflow-name }}-${{ inputs.run-id }}
-          restore-keys: drain3-${{ inputs.workflow-name }}-
+          key: ${{ steps.keys.outputs.drain-cache-key }}
+          restore-keys: |
+            ${{ steps.keys.outputs.drain-cache-restore-key }}
 
       - name: Restore fingerprint history
-        uses: actions/cache@v4
+        continue-on-error: true
+        uses: actions/cache/restore@v4
         with:
           path: .rca-history/
-          key: rca-history-${{ inputs.run-id }}
-          restore-keys: rca-history-
+          key: ${{ steps.keys.outputs.history-cache-key }}
+          restore-keys: |
+            ${{ steps.keys.outputs.history-cache-restore-key }}
+            rca-history-
 
       - name: Collect
         id: rca
@@ -59,6 +100,23 @@ jobs:
           run-id: ${{ inputs.run-id }}
           mode: ${{ inputs.conclusion == 'success' && 'train' || 'collect' }}
           github-api-url: ''
+          workflow-name: ${{ inputs.workflow-name }}
+
+      - name: Save Drain3 baseline
+        if: inputs.conclusion == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .drain/
+          key: ${{ steps.keys.outputs.drain-cache-key }}
+
+      - name: Save fingerprint history
+        if: inputs.conclusion == 'failure'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .rca-history/
+          key: ${{ steps.keys.outputs.history-cache-key }}
 
       - name: Upload artifact
         if: inputs.conclusion == 'failure'

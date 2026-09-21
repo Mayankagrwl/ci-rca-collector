@@ -122,6 +122,12 @@ _WORKFLOW_SYNTAX_RE = re.compile(
     r"you have an error in your yaml|Error in the workflow file",
     re.I,
 )
+_SPECIFIC_CAUSE_RE = re.compile(
+    r"already exists|artifactory|ERESOLVE|error TS\d+|"
+    r"\bFAILED\s+\S+|AssertionError|No matching distribution|"
+    r"Could not find a version|ENOSPC|error TS",
+    re.I,
+)
 _SHORT_CIRCUITS = frozenset(
     {"infra_runner", "infra_widespread", "flake_same_sha_passed", "no_failed_jobs"}
 )
@@ -351,6 +357,69 @@ def _error_from_workflow(summary: Summary) -> bool:
     return False
 
 
+def specific_log_cause(summary: Summary) -> str | None:
+    """First log line that names a concrete cause (already-exists, ERESOLVE, TS, JUnit)."""
+    candidates: list[str] = []
+    for job in summary.failed_jobs:
+        for err in job.error_lines:
+            if err.text:
+                candidates.append(err.text)
+        for window in job.windows:
+            if window.label in {"first_error", "merged"} and window.content:
+                candidates.extend(window.content.splitlines())
+    for stream in summary.pipeline_logs:
+        for err in stream.error_lines:
+            if err.text:
+                candidates.append(err.text)
+        for window in stream.windows:
+            if window.label in {"first_error", "merged"} and window.content:
+                candidates.extend(window.content.splitlines())
+    if summary.junit is not None:
+        for failure in summary.junit.failures:
+            if failure.message:
+                candidates.append(failure.message)
+            blob = f"{failure.classname}::{failure.name}"
+            if failure.name:
+                candidates.append(blob)
+    for raw in candidates:
+        line = (raw or "").strip()
+        if line and _SPECIFIC_CAUSE_RE.search(line):
+            return line[:240]
+    return None
+
+
+def _copy_from_specific_line(
+    line: str, verdict: DeterministicVerdict
+) -> tuple[str, str]:
+    lowered = line.lower()
+    if "already exists" in lowered or "artifactory" in lowered:
+        return (
+            line[:240],
+            "Bump the package version (for example in package.json) and republish; "
+            "do not revert an unrelated workflow edit.",
+        )
+    if "eresolve" in lowered:
+        return (
+            line[:240],
+            "Align the conflicting package versions in the manifest/lockfile "
+            "and retry the install.",
+        )
+    if re.search(r"error ts\d+", lowered):
+        return (
+            line[:240],
+            "Fix the TypeScript/compile error at the cited file:line.",
+        )
+    if re.search(r"\bfailed\s+\S+|assertionerror", lowered):
+        return (
+            line[:240],
+            "Fix the failing test assertion.",
+        )
+    return (
+        line[:240],
+        verdict.fix_one_liner or "Fix the error named in the log line.",
+    )
+
+
 def user_facing(verdict: DeterministicVerdict, summary: Summary):
     """User card copy. Never includes rule ids. Citations are evidence only."""
     from .models import AnalysisCitation, AnalysisResult
@@ -420,6 +489,11 @@ def user_facing(verdict: DeterministicVerdict, summary: Summary):
             "or the same fingerprint failed on another branch."
         )
         fix = "Re-run the job; treat as flaky until it repeats on a clean SHA."
+    elif (
+        (not signature or cat in {"unknown", "infra_runner"} or verdict.rule_id == "R14")
+        and (specific := specific_log_cause(summary))
+    ):
+        root, fix = _copy_from_specific_line(specific, verdict)
     elif (
         (not signature or cat in {"unknown", "infra_runner"})
         and ci_only

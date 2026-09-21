@@ -93,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_refingerprint(args)
         if args.cmd == "analyze":
             return _cmd_analyze(args)
+        if args.cmd == "cache-keys":
+            return _cmd_cache_keys(args)
         parser.error(f"unknown command {args.cmd}")
     except Exception as exc:  # noqa: BLE001 — collector must not fail the workflow
         if getattr(args, "cmd", None) == "analyze":
@@ -191,6 +193,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="true|false; default infers from STGPT_API / API_KEY.",
     )
+
+    keys = sub.add_parser("cache-keys", parents=[parent])
+    keys.add_argument("--workflow-name", default=None)
+    keys.add_argument("--job-name", default=None)
+    keys.add_argument("--repository", default=None, help="owner/repo")
     return parser
 
 
@@ -424,6 +431,7 @@ def _cmd_collect(args: argparse.Namespace) -> int:
             notes.extend(bundle.pop("notes", []))
         summary = _build_summary(bundle, extra_notes=notes, args=args)
         summary = _maybe_fetch_code_context(summary, bundle, args)
+        _annotate_cache_keys(summary, args)
     except Exception as exc:  # noqa: BLE001 — always emit a partial summary
         _LOG.exception("collect failed")
         _safe_emit(
@@ -504,6 +512,84 @@ def _summary_if_readable(path: Path) -> Summary | None:
     except Exception:
         return None
     return None
+
+
+def _cmd_cache_keys(args: argparse.Namespace) -> int:
+    """Print sanitized actions/cache keys to stdout and $GITHUB_OUTPUT."""
+    from .cache_keys import (
+        cache_key_part,
+        drain_cache_key,
+        drain_restore_key,
+        history_cache_key,
+        history_restore_keys,
+    )
+
+    wf = (
+        args.workflow_name
+        or os.environ.get("RCA_WORKFLOW_NAME")
+        or os.environ.get("GITHUB_WORKFLOW")
+        or "unknown"
+    )
+    job = (
+        args.job_name
+        or os.environ.get("RCA_JOB_NAME")
+        or os.environ.get("GITHUB_JOB")
+        or "job"
+    )
+    repo = (
+        args.repository
+        or getattr(args, "repo", None)
+        or os.environ.get("RCA_REPO")
+        or os.environ.get("GITHUB_REPOSITORY")
+        or "unknown"
+    )
+    drain = drain_cache_key(wf, job)
+    drain_restore = drain_restore_key(wf)
+    hist = history_cache_key(repo, wf)
+    hist_restore = history_restore_keys(repo)[0]
+    values = {
+        "drain-cache-key": drain,
+        "drain-cache-restore-key": drain_restore,
+        "history-cache-key": hist,
+        "history-cache-restore-key": hist_restore,
+        "workflow-key-part": cache_key_part(wf),
+        "job-key-part": cache_key_part(job),
+        "repo-key-part": cache_key_part(repo),
+    }
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("a", encoding="utf-8") as handle:
+            for key, value in values.items():
+                handle.write(f"{key}={value}\n")
+    for key, value in values.items():
+        print(f"{key}={value}")
+    return 0
+
+
+def _annotate_cache_keys(summary: Summary, args: argparse.Namespace) -> None:
+    """Log the exact GitHub Actions cache keys in collection_notes."""
+    from .cache_keys import drain_cache_key, history_cache_key
+
+    job = os.environ.get("GITHUB_JOB") or (
+        summary.failed_jobs[0].name if summary.failed_jobs else "job"
+    )
+    repo = (
+        getattr(args, "repo", None)
+        or os.environ.get("RCA_REPO")
+        or os.environ.get("GITHUB_REPOSITORY")
+        or "unknown"
+    )
+    drain = os.environ.get("RCA_DRAIN_CACHE_KEY") or drain_cache_key(
+        summary.run.workflow_name, job
+    )
+    hist = os.environ.get("RCA_HISTORY_CACHE_KEY") or history_cache_key(
+        repo, summary.run.workflow_name
+    )
+    for note in (f"drain cache key: {drain}", f"history cache key: {hist}"):
+        if note not in summary.collection_notes:
+            summary.collection_notes.append(note)
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:

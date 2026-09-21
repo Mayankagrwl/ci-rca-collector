@@ -20,7 +20,9 @@ from tools.rca.redact import REPLACEMENT
 
 _FIXTURE = "tests/rca/fixtures/sample-failure"
 _OK_COMPLETION = "tests/rca/fixtures/analyze/ok-completion.json"
+_ARTIFACTORY_COMPLETION = "tests/rca/fixtures/analyze/artifactory-completion.json"
 _QUOTE = "npm ERR! ERESOLVE could not resolve"
+_ARTIFACTORY = "This release already exists on Artifactory"
 _INVENTED = "this citation was never in the collected evidence xyzzy"
 
 
@@ -59,7 +61,7 @@ def _result(quote: str, *, root: str = "npm ERESOLVE") -> dict[str, object]:
     }
 
 
-def test_skip_when_requires_analysis_false(tmp_path: Path) -> None:
+def test_requires_analysis_false_still_calls_model(tmp_path: Path) -> None:
     out = _collect(tmp_path)
     payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     payload["verdict"]["requires_analysis"] = False
@@ -73,28 +75,24 @@ def test_skip_when_requires_analysis_false(tmp_path: Path) -> None:
             str(out),
             "--cache-dir",
             str(tmp_path / "cache"),
+            "--from-completion",
+            _OK_COMPLETION,
+            "--requires-analysis",
+            "false",
         ]
     )
     assert rc == 0
     analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
-    assert analysis["status"] == "skipped"
-    assert analysis["cache_hit"] is False
-    assert analysis["result"] is not None
-    assert analysis["result"]["root_cause"].strip()
-    assert analysis["result"]["suggested_fix"].strip()
-    assert analysis["model_called"] is False
-    assert analysis["reason_code"] == "deterministic_sufficient"
-    assert analysis["notes"][0] == "deterministic_sufficient"
-    merged = json.loads((out / "summary.json").read_text(encoding="utf-8"))
-    assert merged["analysis"]["status"] == "skipped"
+    assert analysis["status"] == "ok"
+    assert analysis["model_called"] is True
+    assert analysis["reason_code"] is None
+    assert "ERESOLVE" in analysis["result"]["root_cause"]
+    assert analysis["result"]["source"] in {"ai", "mixed"}
     md = (out / "summary.md").read_text(encoding="utf-8")
     assert "## AI diagnosis" in md
-    assert "**Model called:** no" in md
-    assert "**Reason code:** deterministic_sufficient" in md
-    assert "**Root cause:**" in md
-    assert "**Suggested fix:**" in md
-    assert analysis["result"]["root_cause"][:20] in md
-    assert list((tmp_path / "cache").glob("*.json")) == []
+    assert "**Model called:** yes" in md
+    assert "revert the pipeline edit" not in md.lower()
+    assert list((tmp_path / "cache").glob("*.json"))
 
 
 def test_missing_key_skips_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -215,6 +213,8 @@ def test_job_summary_file_includes_ai_section_after_write(tmp_path: Path) -> Non
             str(out / "summary.json"),
             "--out",
             str(out),
+            "--stgpt-key-present",
+            "false",
         ]
     )
     assert rc == 0
@@ -229,6 +229,126 @@ def test_job_summary_file_includes_ai_section_after_write(tmp_path: Path) -> Non
     text = job_summary.read_text(encoding="utf-8")
     assert "## AI diagnosis" in text
     assert "**Model called:** no" in text
+
+
+def test_artifactory_model_card_prefers_log_over_r14(tmp_path: Path) -> None:
+    from tools.rca.diagnose import apply_verdict, diagnose
+    from tools.rca.models import ChangeContext, ErrorLine, LogWindow
+    from tools.rca.prompt import build_evidence
+
+    out = _collect(tmp_path)
+    summary = Summary.model_validate_json((out / "summary.json").read_text(encoding="utf-8"))
+    job = summary.failed_jobs[0]
+    job.windows = [
+        LogWindow(
+            label="first_error",
+            start_line=1,
+            end_line=2,
+            total_lines=2,
+            content=(
+                "This release already exists on Artifactory\n"
+                "Update package.json version before publishing 3.1.21"
+            ),
+        )
+    ]
+    job.error_lines = [
+        ErrorLine(line_number=12, text="This release already exists on Artifactory")
+    ]
+    summary.changes = ChangeContext(
+        head_sha=summary.run.head_sha,
+        range_basis="last_success",
+        classes=["ci_config"],
+        files=[".github/workflows/ci.yml", "package.json"],
+    )
+    apply_verdict(summary, diagnose(summary))
+    (out / "summary.json").write_text(summary.model_dump_json(indent=2), encoding="utf-8")
+    evidence = build_evidence(summary)
+    assert "DETERMINISTIC_HINT:" in evidence
+    assert _ARTIFACTORY in evidence
+    rc = main(
+        [
+            "analyze",
+            "--summary",
+            str(out / "summary.json"),
+            "--out",
+            str(out),
+            "--from-completion",
+            _ARTIFACTORY_COMPLETION,
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    )
+    assert rc == 0
+    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["status"] == "ok"
+    assert analysis["model_called"] is True
+    result = analysis["result"]
+    blob = (result["root_cause"] + " " + result["suggested_fix"]).lower()
+    assert "artifactory" in blob or "version" in blob or "package.json" in blob
+    assert "revert the pipeline edit" not in blob
+    assert "workflow definition changed" not in result["root_cause"].lower()
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "revert the pipeline edit" not in md.lower()
+    assert "**Model called:** yes" in md
+
+
+def test_infra_short_circuit_keeps_deterministic_when_model_says_code(
+    tmp_path: Path,
+) -> None:
+    from tools.rca.models import Verdict
+
+    out = _collect(tmp_path)
+    summary = _summary(out)
+    summary.verdict = Verdict(
+        short_circuit="infra_runner",
+        requires_analysis=False,
+        reason="R1: runner died",
+    )
+    summary.classification.category = "infra_runner"
+    summary.classification.is_infra_vs_code = "infra"
+    payload = {
+        "root_cause": "a null pointer in src/app.ts caused the job to fail",
+        "suggested_fix": "fix the null pointer",
+        "confidence": "high",
+        "infra_or_code": "code",
+        "citations": [{"quote": _QUOTE, "source": "first_error_window"}],
+    }
+    record = analyze_summary(
+        summary,
+        from_completion={"completion": json.dumps(payload)},
+        cache_dir=tmp_path / "cache",
+    )
+    write_analysis(record, summary_path=out / "summary.json", out_dir=out)
+    assert record.model_called is True
+    assert record.result is not None
+    assert record.result.source == "mixed"
+    assert "null pointer" not in record.result.root_cause.lower()
+    assert any("null pointer" in note.lower() for note in record.notes)
+
+
+def test_short_circuit_still_calls_model(tmp_path: Path) -> None:
+    out = _collect(tmp_path)
+    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    payload["verdict"]["short_circuit"] = "infra_runner"
+    payload["verdict"]["requires_analysis"] = False
+    (out / "summary.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    rc = main(
+        [
+            "analyze",
+            "--summary",
+            str(out / "summary.json"),
+            "--out",
+            str(out),
+            "--from-completion",
+            _OK_COMPLETION,
+        ]
+    )
+    assert rc == 0
+    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["model_called"] is True
+    assert analysis["status"] in {"ok", "cached"}
+    evidence_note = (out / "summary.md").read_text(encoding="utf-8")
+    assert "**Model called:** yes" in evidence_note
 
 
 def test_r8_skip_has_root_cause_and_suggested_fix(tmp_path: Path) -> None:
@@ -258,12 +378,15 @@ def test_r8_skip_has_root_cause_and_suggested_fix(tmp_path: Path) -> None:
             str(out),
             "--cache-dir",
             str(tmp_path / "cache"),
+            "--stgpt-key-present",
+            "false",
         ]
     )
     assert rc == 0
     analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
     assert analysis["status"] == "skipped"
     assert analysis["model_called"] is False
+    assert analysis["reason_code"] == "missing_stgpt_key"
     result = analysis["result"]
     assert result is not None
     assert result["root_cause"].strip()
@@ -329,6 +452,8 @@ def test_ungrounded_citation_repair_succeeds(tmp_path: Path) -> None:
     assert _QUOTE in evidence
     assert evidence.startswith("<EVIDENCE>")
     assert evidence.endswith("</EVIDENCE>")
+    assert "DETERMINISTIC_HINT:" in evidence
+    assert "rule_id:" in evidence
     assert token_count(evidence) <= 2500 + 20
 
     completions = [_result(_INVENTED), _result(_QUOTE)]
@@ -356,7 +481,10 @@ def test_invented_citation_after_repair_unvalidated(tmp_path: Path) -> None:
     write_analysis(record, summary_path=out / "summary.json", out_dir=out)
     assert record.status == "unvalidated"
     assert record.result is not None
-    assert _INVENTED in record.result.citations[0].quote
+    assert record.result.root_cause.strip()
+    assert record.result.source == "deterministic"
+    notes = " ".join(record.notes)
+    assert _INVENTED in notes or _INVENTED in (record.raw_completion or "")
     md = (out / "summary.md").read_text(encoding="utf-8")
     assert "## AI diagnosis" in md
     assert "unvalidated" in md
@@ -455,8 +583,9 @@ def test_prose_only_200_publishes_root_cause(tmp_path: Path) -> None:
     write_analysis(record, summary_path=out / "summary.json", out_dir=out)
     assert record.status == "unvalidated"
     assert record.result is not None
-    assert record.result.root_cause.startswith("The install failed")
-    assert record.result.cannot_determine is True
+    assert record.result.root_cause.strip()
+    assert record.result.source == "deterministic"
+    assert any("The install failed" in note for note in record.notes)
     assert record.fallback_used is False
     assert any("completion_preview=" in note for note in record.notes)
     merged = json.loads((out / "summary.json").read_text(encoding="utf-8"))
@@ -509,7 +638,7 @@ def test_parse_error_does_not_call_second_persona(tmp_path: Path) -> None:
     assert record.fallback_used is False
     assert record.result is not None
     assert record.result.root_cause
-    assert record.result.cannot_determine is True
+    assert record.result.source == "deterministic"
     assert any("parse_error" in note for note in record.notes)
     assert any("completion_preview=" in note for note in record.notes)
     gh_keys = json.loads((out / "summary.json").read_text(encoding="utf-8"))

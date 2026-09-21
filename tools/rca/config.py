@@ -78,7 +78,7 @@ STGPT_CLIENT_APP_NAME = "gtrd_srmtdpplm"
 STGPT_SERVICE = "chat"
 STGPT_VERSION = "1.0"
 PERSONAS = ("trinity_for_api", "alfred_for_api")
-PROMPT_VERSION = "p2.2"
+PROMPT_VERSION = "p2.3"
 
 
 def _strip_env(*names: str) -> str | None:

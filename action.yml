@@ -102,6 +102,10 @@ inputs:
     description: 'ST ChatGPT clientAppName. Empty uses STGPT_CLIENT_APP_NAME / default gtrd_srmtdpplm.'
     required: false
     default: ''
+  workflow-name:
+    description: 'Failed workflow name for Drain3/history cache keys. Defaults to workflow_run.name or github.workflow.'
+    required: false
+    default: ''
 
 outputs:
   summary-path:
@@ -167,6 +171,12 @@ outputs:
   analysis-notes:
     description: 'Analyze notes (HTTP errors, gate reasons). Empty when skipped.'
     value: ${{ steps.analyze.outputs.analysis-notes }}
+  drain-cache-key:
+    description: 'Sanitized actions/cache key for the Drain3 baseline.'
+    value: ${{ steps.cache-keys.outputs.drain-cache-key }}
+  history-cache-key:
+    description: 'Sanitized actions/cache key for fingerprint history (repo+workflow, not run-id).'
+    value: ${{ steps.cache-keys.outputs.history-cache-key }}
 
 runs:
   using: 'composite'
@@ -183,6 +193,39 @@ runs:
         python --version
         pip --version
         pip install --disable-pip-version-check -r "$GITHUB_ACTION_PATH/requirements.txt"
+
+    - name: Compute cache keys
+      id: cache-keys
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}
+        RCA_WORKFLOW_NAME: ${{ inputs.workflow-name != '' && inputs.workflow-name || github.event.workflow_run.name || github.workflow }}
+        RCA_JOB_NAME: ${{ github.job }}
+        RCA_REPO: ${{ inputs.repository }}
+      run: |
+        python -m tools.rca.cli cache-keys \
+          --workflow-name "$RCA_WORKFLOW_NAME" \
+          --job-name "$RCA_JOB_NAME" \
+          --repository "$RCA_REPO"
+
+    - name: Restore Drain3 baseline
+      continue-on-error: true
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.drain-cache-dir }}
+        key: ${{ steps.cache-keys.outputs.drain-cache-key }}
+        restore-keys: |
+          ${{ steps.cache-keys.outputs.drain-cache-restore-key }}
+
+    - name: Restore fingerprint history
+      continue-on-error: true
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.history-dir }}
+        key: ${{ steps.cache-keys.outputs.history-cache-key }}
+        restore-keys: |
+          ${{ steps.cache-keys.outputs.history-cache-restore-key }}
+          rca-history-
 
     - name: Run collector
       id: collect
@@ -210,6 +253,9 @@ runs:
         RCA_SSL_CERT_FILE: ${{ inputs.ssl-cert-file }}
         RCA_ANALYZE_PIPELINE_LOGS: ${{ inputs.analyze-pipeline-logs }}
         RCA_MAX_PIPELINE_LOG_ARTIFACTS: ${{ inputs.max-pipeline-log-artifacts }}
+        RCA_DRAIN_CACHE_KEY: ${{ steps.cache-keys.outputs.drain-cache-key }}
+        RCA_HISTORY_CACHE_KEY: ${{ steps.cache-keys.outputs.history-cache-key }}
+        RCA_WORKFLOW_NAME: ${{ inputs.workflow-name != '' && inputs.workflow-name || github.event.workflow_run.name || github.workflow }}
         SSL_CERT_FILE: ${{ env.SSL_CERT_FILE }}
         REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
       run: |
@@ -266,6 +312,22 @@ runs:
           --requires-analysis "$RCA_REQUIRES_ANALYSIS" \
           --stgpt-key-present "$RCA_STGPT_KEY_PRESENT" \
           "${extra[@]}"
+
+    - name: Save Drain3 baseline
+      if: inputs.mode == 'train'
+      continue-on-error: true
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ inputs.drain-cache-dir }}
+        key: ${{ steps.cache-keys.outputs.drain-cache-key }}
+
+    - name: Save fingerprint history
+      if: inputs.mode == 'collect'
+      continue-on-error: true
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ inputs.history-dir }}
+        key: ${{ steps.cache-keys.outputs.history-cache-key }}
 
     - name: Write job summary
       if: inputs.write-job-summary == 'true' && inputs.mode == 'collect'

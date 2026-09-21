@@ -65,6 +65,9 @@ _CITATION_SOURCES = {
     "deterministic_rule",
 }
 ChatFn = Callable[[str, Sequence[Mapping[str, str]]], ChatResult]
+_INFRA_FLAKE_SHORT = frozenset(
+    {"infra_runner", "infra_widespread", "flake_same_sha_passed"}
+)
 
 
 def cache_key(summary: Summary) -> str:
@@ -105,10 +108,6 @@ def analyze_summary(
         analyzed_at=now,
     )
     try:
-        gated = _gate(summary)
-        if gated is not None:
-            return gated
-
         cached = _cache_get(cache_dir, key)
         if cached is not None:
             return cached.model_copy(
@@ -139,7 +138,7 @@ def analyze_summary(
         )
         record = _run_personas(evidence, caller, base)
         redacted = redact_record(record)
-        redacted = ensure_display_result(summary, redacted, source="ai")
+        redacted = finalize_user_card(summary, redacted)
         if redacted.status == "ok":
             _cache_put(cache_dir, key, redacted)
         return redacted
@@ -163,12 +162,8 @@ def write_analysis(
         src_summary = Summary.model_validate_json(Path(summary_path).read_text(encoding="utf-8"))
     except Exception:
         src_summary = None
-    if src_summary is not None and (
-        record.result is None
-        or not (record.result.root_cause or "").strip()
-        or not (record.result.suggested_fix or "").strip()
-    ):
-        record = ensure_display_result(src_summary, record, source="deterministic")
+    if src_summary is not None:
+        record = finalize_user_card(src_summary, record)
 
     analysis_path = out_dir / "analysis.json"
     analysis_dump = json.loads(record.model_dump_json())
@@ -221,10 +216,13 @@ def redact_record(record: AnalysisRecord) -> AnalysisRecord:
     return AnalysisRecord.model_validate(cleaned)
 
 
-def _gate(summary: Summary) -> AnalysisRecord | None:
-    if summary.verdict.short_circuit:
-        return skipped_record(summary, "short_circuit")
-    return None
+def _contradicts_infra_flake(summary: Summary, result: AnalysisResult) -> bool:
+    """Keep a high-confidence infra/flake rule when the model invents a code bug."""
+    short = summary.verdict.short_circuit
+    if short not in _INFRA_FLAKE_SHORT:
+        return False
+    side = (result.infra_or_code or "").strip().lower()
+    return side == "code"
 
 
 def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> AnalysisRecord:
@@ -528,18 +526,18 @@ def decide_stgpt_call(
     from_completion: object | None = None,
     api_key: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Whether to call STGPT. Returns (call, reason_code)."""
+    """Whether to call STGPT. Returns (call, reason_code).
+
+    Call when mode=collect, analyze is not explicitly false, and a key
+    (or --from-completion) is present. Do not skip because
+    requires_analysis=false or short_circuit is set. ``requires_analysis``
+    is accepted for CLI compatibility and ignored for the model gate.
+    """
+    _ = (summary, requires_analysis)
     if (mode or "collect") != "collect":
         return False, "mode_not_collect"
     if _as_bool(analyze_enabled, True) is False:
         return False, "analyze_disabled"
-    if summary.verdict.short_circuit:
-        return False, "short_circuit"
-    required = _as_bool(requires_analysis, None)
-    if required is None:
-        required = bool(summary.verdict.requires_analysis)
-    if required is False:
-        return False, "deterministic_sufficient"
     key_present = _as_bool(stgpt_key_present, None)
     if key_present is None:
         key_present = bool(resolve_stgpt_api_key(api_key))
@@ -666,25 +664,78 @@ def ensure_display_result(
     summary: Summary, record: AnalysisRecord, *, source: str = "ai"
 ) -> AnalysisRecord:
     """Never leave root_cause / suggested_fix empty after a successful collect."""
+    _ = source
+    return finalize_user_card(summary, record)
+
+
+def finalize_user_card(summary: Summary, record: AnalysisRecord) -> AnalysisRecord:
+    """Model card when ok; deterministic templates when the model is unusable.
+
+    Deterministic output is input + fallback, not the user-facing answer, except
+    when the model fails / is empty / cannot_determine, or when it contradicts
+    a high-confidence infra/flake short-circuit.
+    """
     det = analysis_result_from_summary(summary, source="deterministic")
+    if record.status in {"skipped", "gated"}:
+        result = record.result
+        if (
+            result is None
+            or not (result.root_cause or "").strip()
+            or not (result.suggested_fix or "").strip()
+        ):
+            return record.model_copy(update={"result": det})
+        return record
+
     result = record.result
-    if result is None:
-        return record.model_copy(update={"result": det})
-    root = (result.root_cause or "").strip()
-    fix = (result.suggested_fix or "").strip()
-    if not root:
-        result.root_cause = det.root_cause
-        source = "mixed"
-    if not fix:
-        result.suggested_fix = det.suggested_fix
-        source = "mixed"
-    if not result.citations:
-        result.citations = det.citations
-    if not result.used_deterministic_rule:
-        result.used_deterministic_rule = det.used_deterministic_rule
-    if not result.source:
-        result.source = "mixed" if source == "mixed" else source
-    return record.model_copy(update={"result": result})
+    already = (
+        result is not None
+        and (result.root_cause or "").strip()
+        and (result.suggested_fix or "").strip()
+        and (result.source or "") in {"ai", "mixed", "deterministic"}
+    )
+    if already and result is not None:
+        if (
+            record.status in {"ok", "cached"}
+            and result.source == "ai"
+            and _contradicts_infra_flake(summary, result)
+        ):
+            notes = list(record.notes)
+            notes.append(f"model root_cause: {result.root_cause}")
+            if (result.suggested_fix or "").strip():
+                notes.append(f"model suggested_fix: {result.suggested_fix}")
+            kept = det.model_copy(update={"source": "mixed"})
+            return record.model_copy(update={"result": kept, "notes": notes})
+        return record
+
+    usable = (
+        record.status in {"ok", "cached"}
+        and result is not None
+        and bool((result.root_cause or "").strip())
+        and not result.cannot_determine
+    )
+    if usable and result is not None:
+        if _contradicts_infra_flake(summary, result):
+            notes = list(record.notes)
+            notes.append(f"model root_cause: {result.root_cause}")
+            if (result.suggested_fix or "").strip():
+                notes.append(f"model suggested_fix: {result.suggested_fix}")
+            kept = det.model_copy(update={"source": "mixed"})
+            return record.model_copy(update={"result": kept, "notes": notes})
+        source = "mixed" if (result.used_deterministic_rule or "").strip() else "ai"
+        filled = result.model_copy(update={"source": source})
+        if not (filled.suggested_fix or "").strip():
+            filled.suggested_fix = det.suggested_fix
+            filled.source = "mixed"
+        if not filled.citations:
+            filled.citations = det.citations
+        if not filled.used_deterministic_rule:
+            filled.used_deterministic_rule = det.used_deterministic_rule
+        return record.model_copy(update={"result": filled})
+
+    notes = list(record.notes)
+    if result is not None and (result.root_cause or "").strip():
+        notes.append(f"model root_cause: {result.root_cause}")
+    return record.model_copy(update={"result": det, "notes": notes})
 
 
 def _record(

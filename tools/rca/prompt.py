@@ -8,8 +8,13 @@ from .models import PipelineLogStream, Summary
 
 SYSTEM_PROMPT = (
     f"You are a CI root-cause assistant (prompt {PROMPT_VERSION}). "
-    "You are filling gaps the collector could not. "
-    "Do not restate R* one_liners unless you disagree with evidence. "
+    "DETERMINISTIC_HINT is collector input + fallback, not the user-facing answer. "
+    "Use DETERMINISTIC_HINT when it matches the first_error_window. "
+    "If the log clearly names another cause (Artifactory version already exists, "
+    "missing package, compile file:line, ERESOLVE, JUnit failure), "
+    "PREFER the log and ignore a generic ci_config / workflow-changed hint. "
+    "When short_circuit is infra_runner, infra_widespread, or flake_same_sha_passed, "
+    "do not invent an application code bug. "
     "Prefer pipeline_logs over job log when both exist. "
     "Use only the text inside <EVIDENCE>. Do not invent log lines, file paths, or test names. "
     "Quote only from <EVIDENCE>. Reply with ONLY a single JSON object. "
@@ -55,7 +60,9 @@ def build_messages(
             "role": "user",
             "content": (
                 f"{evidence}\n\n"
-                "Fill only the gaps the collector could not. JSON only, citations from <EVIDENCE>."
+                "Use DETERMINISTIC_HINT when it matches first_error_window. "
+                "If the log names a more specific cause, prefer the log. "
+                "JSON only, citations from <EVIDENCE>."
             ),
         },
     ]
@@ -68,6 +75,41 @@ def build_messages(
             }
         )
     return messages
+
+
+_INFRA_FLAKE_SHORT = frozenset(
+    {"infra_runner", "infra_widespread", "flake_same_sha_passed"}
+)
+
+
+def _deterministic_hint_lines(summary: Summary) -> list[str]:
+    """Always-on compact hint. Deterministic output is input + fallback."""
+    diag = summary.diagnosis
+    verdict = summary.verdict
+    cls = summary.classification
+    rule = (diag.rule_id if diag is not None else "") or (verdict.reason or "")
+    one = (diag.one_liner if diag is not None else "") or ""
+    fix = (diag.fix_one_liner if diag is not None else None) or ""
+    stage = (diag.suspected_stage if diag is not None else None) or ""
+    files = ",".join(list(diag.suspected_files if diag is not None else [])[:8])
+    short = verdict.short_circuit or ""
+    lines = [
+        "DETERMINISTIC_HINT:",
+        f"  rule_id: {rule}",
+        f"  category: {cls.category}",
+        f"  one_liner: {one}",
+        f"  suggested_fix: {fix}",
+        f"  suspected_stage: {stage}",
+        f"  suspected_files: {files}",
+        f"  requires_analysis: {str(bool(verdict.requires_analysis)).lower()}",
+        f"  short_circuit: {short}",
+    ]
+    if short in _INFRA_FLAKE_SHORT:
+        lines.append(
+            "  instruction: High-confidence infrastructure/flake verdict; "
+            "do not invent a code bug."
+        )
+    return lines
 
 
 def _evidence_lines(summary: Summary) -> list[str]:
@@ -84,6 +126,7 @@ def _evidence_lines(summary: Summary) -> list[str]:
         f"classification: {cls.category} ({cls.confidence}) "
         f"infra_vs_code={cls.is_infra_vs_code} flaky={cls.is_flaky}",
     ]
+    lines.extend(_deterministic_hint_lines(summary))
     if diagnosis is not None:
         lines.append(f"rule_id: {diagnosis.rule_id}")
         lines.append(f"one_liner: {diagnosis.one_liner}")

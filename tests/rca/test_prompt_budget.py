@@ -33,6 +33,7 @@ def test_analyze_evidence_cap_on_noisy_fixture(tmp_path: Path) -> None:
     summary = Summary.model_validate_json((out / "summary.json").read_text(encoding="utf-8"))
     evidence = build_evidence(summary)
     assert evidence.startswith("<EVIDENCE>")
+    assert "DETERMINISTIC_HINT:" in evidence
     assert token_count(evidence) <= TOKEN_BUDGET_ANALYZE + 20
     assert "### step_table" not in evidence
     assert "### tail_window" not in evidence or "### first_error_window" in evidence

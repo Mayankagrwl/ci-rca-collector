@@ -41,6 +41,12 @@ def test_consumer_stub_for_github_com() -> None:
     assert "summary.json notes" in text
     assert "api-ai-bridge" not in text
     assert "github.st.com" not in text
+    assert "never hits on the next failure" in text
+    assert "continue-on-error: true" in text
+    assert "drain3-${{ github.event.workflow_run.name }}" not in text
+    assert "rca-history-${{ github.event.workflow_run.id }}" not in text
+    assert "steps.keys.outputs.drain-cache-key" in text
+    assert "steps.keys.outputs.history-cache-key" in text
 
 
 def test_test_failures_example_is_not_a_repo_workflow() -> None:

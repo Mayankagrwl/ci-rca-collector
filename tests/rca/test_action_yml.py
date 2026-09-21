@@ -101,3 +101,21 @@ def test_reusable_workflow_exists() -> None:
     assert ".rca-history/" in text
     assert "github.st.com" not in text
     assert "api.github.com" not in text
+    assert "run-id-only" in text or "run-id only" in text or "never hits on the next failure" in text
+    assert "continue-on-error: true" in text
+    assert "drain3-${{ inputs.workflow-name }}" not in text
+    assert "rca-history-${{ inputs.run-id }}" not in text
+    assert "steps.keys.outputs.drain-cache-key" in text
+    assert "steps.keys.outputs.history-cache-key" in text
+
+
+def test_action_yml_emits_sanitized_cache_keys() -> None:
+    assert "id: cache-keys" in ACTION
+    assert "python -m tools.rca.cli cache-keys" in ACTION
+    assert "drain-cache-key:" in ACTION
+    assert "history-cache-key:" in ACTION
+    assert "continue-on-error: true" in ACTION
+    assert "actions/cache/restore@v4" in ACTION
+    assert "actions/cache/save@v4" in ACTION
+    assert "RCA_DRAIN_CACHE_KEY" in ACTION
+    assert "RCA_HISTORY_CACHE_KEY" in ACTION
