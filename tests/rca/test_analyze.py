@@ -13,7 +13,7 @@ import pytest
 from tools.rca.analyze import analyze_summary, cache_key, write_analysis
 from tools.rca.budget import token_count
 from tools.rca.cli import main
-from tools.rca.config import PROMPT_VERSION, STGPT_CLIENT_APP_NAME
+from tools.rca.config import PROMPT_VERSION, STGPT_CLIENT_APP_NAME, TOKEN_BUDGET_ANALYZE
 from tools.rca.models import ChangeContext, Summary
 from tools.rca.prompt import build_evidence
 from tools.rca.redact import REPLACEMENT
@@ -454,7 +454,7 @@ def test_ungrounded_citation_repair_succeeds(tmp_path: Path) -> None:
     assert evidence.endswith("</EVIDENCE>")
     assert "DETERMINISTIC_HINT:" in evidence
     assert "rule_id:" in evidence
-    assert token_count(evidence) <= 2500 + 20
+    assert token_count(evidence) <= TOKEN_BUDGET_ANALYZE + 20
 
     completions = [_result(_INVENTED), _result(_QUOTE)]
     record = analyze_summary(

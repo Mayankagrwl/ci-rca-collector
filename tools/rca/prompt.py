@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-from .budget import trim_middle
-from .config import PROMPT_VERSION, TOKEN_BUDGET_ANALYZE
-from .models import PipelineLogStream, Summary
+import re
+
+from .budget import token_count
+from .config import ANALYZE_EVIDENCE_CAP, PROMPT_VERSION
+from .models import FailedJob, Summary
 
 SYSTEM_PROMPT = (
     f"You are a CI root-cause assistant (prompt {PROMPT_VERSION}). "
+    "The job failed at failed_step. Cite that step's excerpt first. "
+    "Do not treat a later permission/403/template as the root cause if an earlier "
+    "failed step already explained the exit (version exists, tests failed, compile error). "
+    "Follow-on errors after the failed step are symptoms. "
     "DETERMINISTIC_HINT is collector input + fallback, not the user-facing answer. "
-    "Use DETERMINISTIC_HINT when it matches the first_error_window. "
+    "Use DETERMINISTIC_HINT when it matches the first_error_window or failed_step_excerpt. "
     "If the log clearly names another cause (Artifactory version already exists, "
     "missing package, compile file:line, ERESOLVE, JUnit failure), "
     "PREFER the log and ignore a generic ci_config / workflow-changed hint. "
     "When short_circuit is infra_runner, infra_widespread, or flake_same_sha_passed, "
     "do not invent an application code bug. "
-    "Prefer pipeline_logs over job log when both exist. "
+    "Prefer the job log failed_step_excerpt and first_error_window over pipeline_logs. "
     "Use only the text inside <EVIDENCE>. Do not invent log lines, file paths, or test names. "
     "Quote only from <EVIDENCE>. Reply with ONLY a single JSON object. "
     "No markdown fences, no prose, no commentary. "
@@ -28,7 +34,8 @@ SYSTEM_PROMPT = (
     "Each citations[].quote MUST be a verbatim substring of <EVIDENCE>. "
     "source must be one of: first_error_window, tail_window, stack_traces, "
     "log_templates, junit, change_context, annotations, history, step_table, "
-    "pipeline_logs, code_context, last_green_compare, deterministic_rule. "
+    "pipeline_logs, code_context, last_green_compare, deterministic_rule, "
+    "failed_step_excerpt. "
     "If evidence is insufficient, cannot_determine=true, confidence=low — do not invent files."
 )
 
@@ -39,13 +46,30 @@ _REPAIR = (
     "citations[].quote must be copied verbatim from <EVIDENCE>."
 )
 
+_INFRA_FLAKE_SHORT = frozenset(
+    {"infra_runner", "infra_widespread", "flake_same_sha_passed"}
+)
+_PIPELINE_STEP = re.compile(
+    r"docker|container|build|compile|package|test|pytest|lint|e2e|integration",
+    re.IGNORECASE,
+)
+
 
 def build_evidence(summary: Summary, *, cap_tokens: int | None = None) -> str:
-    """Render a MINIMAL evidence packet. Analyze cap is 2500 tokens."""
-    cap = TOKEN_BUDGET_ANALYZE if cap_tokens is None else cap_tokens
-    body = "\n".join(_evidence_lines(summary))
-    trimmed, _, _, _ = trim_middle(body, cap)
-    return f"<EVIDENCE>\n{trimmed}\n</EVIDENCE>"
+    """Priority-packed evidence. failed_step_excerpt is mandatory and untrimmed."""
+    cap = ANALYZE_EVIDENCE_CAP if cap_tokens is None else cap_tokens
+    packed: list[str] = []
+    used = 0
+    for mandatory, lines in _priority_sections(summary):
+        block = "\n".join(line for line in lines if line is not None and str(line) != "")
+        if not block.strip():
+            continue
+        tokens = token_count(block)
+        if not mandatory and used + tokens > cap:
+            continue
+        packed.append(block)
+        used += tokens
+    return "<EVIDENCE>\n" + "\n".join(packed) + "\n</EVIDENCE>"
 
 
 def build_messages(
@@ -60,8 +84,8 @@ def build_messages(
             "role": "user",
             "content": (
                 f"{evidence}\n\n"
-                "Use DETERMINISTIC_HINT when it matches first_error_window. "
-                "If the log names a more specific cause, prefer the log. "
+                "The job failed at failed_step. Cite that excerpt first. "
+                "Follow-on permission/403 lines after the failed step are symptoms. "
                 "JSON only, citations from <EVIDENCE>."
             ),
         },
@@ -77,9 +101,91 @@ def build_messages(
     return messages
 
 
-_INFRA_FLAKE_SHORT = frozenset(
-    {"infra_runner", "infra_widespread", "flake_same_sha_passed"}
-)
+def _priority_sections(summary: Summary) -> list[tuple[bool, list[str]]]:
+    """(mandatory, lines) in STGPT order. Stop packing optional sections at cap."""
+    return [
+        (True, _excerpt_lines(summary)),
+        (False, _job_first_error_lines(summary)),
+        (False, _deterministic_hint_lines(summary)),
+        (False, _template_lines(summary)),
+        (False, _pipeline_window_lines(summary)),
+        (False, _change_one_liner(summary)),
+    ]
+
+
+def _excerpt_lines(summary: Summary) -> list[str]:
+    job = _primary_job(summary)
+    if job is None:
+        return []
+    excerpt = job.failed_step_excerpt
+    name = (excerpt.name if excerpt is not None else None) or job.failed_step_name or ""
+    lines = list(excerpt.lines if excerpt is not None else [])
+    if not name and not lines:
+        return []
+    out = ["### failed_step_excerpt", f"failed_step: {name}"]
+    out.extend(lines)
+    return out
+
+
+def _job_first_error_lines(summary: Summary) -> list[str]:
+    job = _primary_job(summary)
+    if job is None:
+        return []
+    first = [w for w in job.windows if w.label == "first_error"]
+    if not first:
+        first = [w for w in job.windows if w.label == "merged"]
+    if not first or not first[0].content.strip():
+        return []
+    return ["### first_error_window", first[0].content]
+
+
+def _template_lines(summary: Summary) -> list[str]:
+    templates = []
+    if summary.drain is not None:
+        templates.extend(summary.drain.templates)
+    chosen = [t for t in templates if t.tier in {"T1", "T2"}]
+    if not chosen:
+        return []
+    lines = ["### log_templates"]
+    for tmpl in chosen[:5]:
+        lines.append(f"[{tmpl.tier}] {tmpl.template} count={tmpl.count}")
+        if tmpl.representative_line:
+            lines.append(tmpl.representative_line)
+    return lines
+
+
+def _pipeline_window_lines(summary: Summary) -> list[str]:
+    job = _primary_job(summary)
+    step = ""
+    if job is not None:
+        if job.failed_step_excerpt is not None:
+            step = job.failed_step_excerpt.name or ""
+        step = step or (job.failed_step_name or "")
+    if not _PIPELINE_STEP.search(step):
+        return []
+    if not summary.pipeline_logs:
+        return []
+    stream = summary.pipeline_logs[0]
+    windows = [w for w in stream.windows if w.label in {"first_error", "merged"}]
+    if not windows:
+        return []
+    return ["### pipeline_logs", windows[0].content]
+
+
+def _change_one_liner(summary: Summary) -> list[str]:
+    changes = summary.changes
+    if changes is None:
+        return []
+    classes = ",".join(changes.classes)
+    return [
+        "### change_context",
+        f"range {changes.range_basis} {changes.base_sha}..{changes.head_sha} "
+        f"classes={classes}",
+    ]
+
+
+def _primary_job(summary: Summary) -> FailedJob | None:
+    return summary.failed_jobs[0] if summary.failed_jobs else None
 
 
 def _deterministic_hint_lines(summary: Summary) -> list[str]:
@@ -110,164 +216,3 @@ def _deterministic_hint_lines(summary: Summary) -> list[str]:
             "do not invent a code bug."
         )
     return lines
-
-
-def _evidence_lines(summary: Summary) -> list[str]:
-    run = summary.run
-    verdict = summary.verdict
-    cls = summary.classification
-    diagnosis = summary.diagnosis
-    lines = [
-        f"workflow: {run.workflow_name}",
-        f"event: {run.event}",
-        f"branch: {run.head_branch}",
-        f"head_sha: {run.head_sha}",
-        f"failed_jobs: {run.failed_jobs_analysed}/{run.failed_job_total}",
-        f"classification: {cls.category} ({cls.confidence}) "
-        f"infra_vs_code={cls.is_infra_vs_code} flaky={cls.is_flaky}",
-    ]
-    lines.extend(_deterministic_hint_lines(summary))
-    if diagnosis is not None:
-        lines.append(f"rule_id: {diagnosis.rule_id}")
-        lines.append(f"one_liner: {diagnosis.one_liner}")
-        if diagnosis.suspected_stage:
-            lines.append(f"suspected_stage: {diagnosis.suspected_stage}")
-        if diagnosis.suspected_files:
-            lines.append("suspected_files: " + ", ".join(diagnosis.suspected_files[:8]))
-        lines.append(f"winning_stream: {diagnosis.winning_stream_id or ''}")
-    elif verdict.reason:
-        lines.append(f"verdict.reason: {verdict.reason}")
-    if diagnosis and diagnosis.suspected_stage:
-        pass
-    elif summary.failed_jobs:
-        lines.append(f"suspected_stage: {summary.failed_jobs[0].failed_step_name or ''}")
-
-    window_lines, stack_lines, _source = _winning_stream_evidence(summary)
-    lines.extend(window_lines)
-    lines.extend(stack_lines)
-
-    t1 = _t1_templates(summary)
-    if t1:
-        lines.append("### log_templates")
-        for tmpl in t1[:3]:
-            lines.append(f"[T1] {tmpl.template} count={tmpl.count}")
-            if tmpl.representative_line:
-                lines.append(tmpl.representative_line)
-            for var in tmpl.variables[:4]:
-                if var.values:
-                    lines.append(f"  {var.mask}=" + ", ".join(var.values[:5]))
-
-    junit = summary.junit
-    if junit is not None and junit.failures:
-        lines.append("### junit")
-        for failure in junit.failures[:3]:
-            lines.append(f"{failure.classname}::{failure.name} {failure.message or ''}")
-            if failure.body:
-                lines.append("\n".join(failure.body.splitlines()[:10]))
-
-    changes = summary.changes
-    if changes is not None:
-        lines.append("### change_context")
-        lines.append(
-            f"range {changes.range_basis} {changes.base_sha}..{changes.head_sha} "
-            f"classes={','.join(changes.classes)}"
-        )
-        for commit in changes.commits[:5]:
-            lines.append(f"{commit.sha} {commit.subject}")
-        suspected = list((diagnosis.suspected_files if diagnosis else []) or [])
-        if changes.diffstat and suspected:
-            keep = [
-                row
-                for row in changes.diffstat.splitlines()
-                if any(name in row for name in suspected)
-            ]
-            if keep:
-                lines.extend(keep)
-        elif changes.diffstat:
-            lines.extend(changes.diffstat.splitlines()[:8])
-
-    if summary.code_context and summary.code_context.hunks:
-        lines.append("### code_context")
-        for hunk in summary.code_context.hunks[:3]:
-            loc = f"{hunk.path}:{hunk.start_line}-{hunk.end_line}"
-            if hunk.note:
-                lines.append(f"{loc} {hunk.note}")
-            else:
-                lines.append(loc)
-                lines.append(hunk.content)
-
-    compare = summary.last_green_compare
-    if compare is not None and compare.novel_templates:
-        lines.append("### last_green_compare")
-        for name in compare.novel_templates[:8]:
-            lines.append(name)
-
-    history = summary.history
-    if history is not None:
-        lines.append("### history")
-        lines.append(f"match={history.match} seen={history.seen_count}")
-        if history.previous_resolution:
-            lines.append(f"resolution: {history.previous_resolution}")
-
-    return [line for line in lines if line is not None]
-
-
-def _winning_stream_evidence(summary: Summary) -> tuple[list[str], list[str], str]:
-    sid = summary.diagnosis.winning_stream_id if summary.diagnosis else None
-    pipeline = _pick_pipeline_stream(summary, sid)
-    if pipeline is not None:
-        windows = _first_error_windows(pipeline.windows)
-        traces = pipeline.stack_traces[:1]
-        source = "pipeline_logs"
-        lines = ["### first_error_window", *[w.content for w in windows]]
-        if not windows:
-            tails = [w for w in pipeline.windows if w.label == "tail"]
-            if tails:
-                lines = ["### tail_window", tails[0].content]
-        stack_lines: list[str] = []
-        if traces:
-            stack_lines = ["### stack_traces", traces[0].content]
-        return lines, stack_lines, source
-
-    lines: list[str] = []
-    stack_lines = []
-    for job in summary.failed_jobs[:1]:
-        first = [w for w in job.windows if w.label in {"first_error", "merged"}]
-        if first:
-            lines = ["### first_error_window", first[0].content]
-        elif job.windows:
-            lines = ["### tail_window", job.windows[0].content]
-        if job.stack_traces:
-            stack_lines = ["### stack_traces", job.stack_traces[0].content]
-        break
-    return lines, stack_lines, "job"
-
-
-def _pick_pipeline_stream(
-    summary: Summary, sid: str | None
-) -> PipelineLogStream | None:
-    if not summary.pipeline_logs:
-        return None
-    if sid:
-        for stream in summary.pipeline_logs:
-            ident = f"artifact:{stream.artifact_name}:{stream.file}"
-            if ident == sid or sid == f"artifact:{stream.artifact_name}":
-                return stream
-    return summary.pipeline_logs[0]
-
-
-def _first_error_windows(windows: list) -> list:
-    first = [w for w in windows if w.label in {"first_error", "merged"}]
-    return first[:1]
-
-
-def _t1_templates(summary: Summary):
-    templates = []
-    if summary.drain is not None:
-        templates.extend(summary.drain.templates)
-    for stream in summary.pipeline_logs:
-        templates.extend(stream.templates)
-    t1 = [t for t in templates if t.tier == "T1"]
-    if t1:
-        return t1
-    return [t for t in templates if t.has_error_match or t.tier == "T3"]

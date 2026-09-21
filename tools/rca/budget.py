@@ -53,6 +53,7 @@ def apply_budget(
             section_used[key] = section_used.get(key, 0) + after
             new_windows.append(window)
         job.windows = new_windows
+        # failed_step_excerpt is mandatory STGPT input and is never middle-trimmed.
 
         stack_cap = caps.get("stack_traces", 600)
         new_traces: list[StackTrace] = []

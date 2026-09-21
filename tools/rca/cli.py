@@ -36,7 +36,7 @@ from .drain_index import (
     template_hash,
     train as drain_train,
 )
-from .extract import extract_from_lines
+from .extract import extract_from_lines, failed_step_excerpt_lines
 from .github_api import GitHubAPIError, GitHubClient
 from .junit import (
     artifact_looks_like_junit,
@@ -54,6 +54,7 @@ from .models import (
     BudgetReport,
     Classification,
     FailedJob,
+    FailedStepExcerpt,
     FailureRecord,
     HistoryContext,
     JUnitReport,
@@ -1767,14 +1768,25 @@ def _failed_job_from_api(
     extracted_errors = []
     extracted_annotations: list[str] = []
     extracted_exit: int | None = None
+    excerpt_lines: list[str] = []
     if raw_log is not None:
         cleaned = clean_log(raw_log, keep_post_cleanup=keep_post)
-        extracted = extract_from_lines(cleaned.lines)
+        extracted = extract_from_lines(
+            cleaned.lines,
+            failed_step_name=failed_step.name if failed_step else None,
+        )
         extracted_windows = extracted.windows
         extracted_stacks = extracted.stack_traces
         extracted_errors = extracted.error_lines
         extracted_annotations = extracted.annotations
         extracted_exit = extracted.exit_code
+        excerpt_lines = list(extracted.excerpt_lines)
+        grouped = failed_step_excerpt_lines(
+            raw_log.splitlines(),
+            step_name=failed_step.name if failed_step else None,
+        )
+        if grouped:
+            excerpt_lines = grouped
 
     queue_seconds = _seconds_between(job.get("created_at"), job.get("started_at"))
     if queue_seconds is not None and queue_seconds >= QUEUE_SECONDS_THRESHOLD:
@@ -1809,6 +1821,14 @@ def _failed_job_from_api(
         stack_traces=extracted_stacks,
         error_lines=extracted_errors,
         annotations=extracted_annotations,
+        failed_step_excerpt=(
+            FailedStepExcerpt(
+                name=(failed_step.name if failed_step else "") or "unknown",
+                lines=excerpt_lines,
+            )
+            if excerpt_lines
+            else None
+        ),
     )
 
 

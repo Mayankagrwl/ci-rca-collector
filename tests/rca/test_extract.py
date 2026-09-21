@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tools.rca.extract import extract_from_lines
+from tools.rca.extract import extract_from_lines, failed_step_excerpt_lines
 
 
 def _noisy_lines() -> list[str]:
@@ -34,3 +34,26 @@ def test_noisy_window_skips_script_and_centers_on_executed_error() -> None:
     assert "ERROR failed to flush buffer" in window.content
     assert "for i in $(seq 1 20000)" not in window.content
     assert "INFO processing record 1 of 20000" not in window.content
+
+
+def test_semantic_already_exists_is_first_error() -> None:
+    lines = [
+        "##[group]Run Check Version in Artifactory",
+        "Checking 3.1.21",
+        "This release already exists on Artifactory. You need to update package.json",
+        "##[error]Process completed with exit code 1.",
+        "##[endgroup]",
+        "Not enough permissions to delete",
+    ]
+    extracted = extract_from_lines(lines, failed_step_name="Check Version in Artifactory")
+    texts = [item.text for item in extracted.error_lines]
+    assert any("already exists on Artifactory" in text for text in texts)
+    window = next(item for item in extracted.windows if item.label in {"first_error", "merged"})
+    assert "already exists on Artifactory" in window.content
+    assert extracted.excerpt_lines
+    assert any("already exists on Artifactory" in line for line in extracted.excerpt_lines)
+    excerpt = failed_step_excerpt_lines(
+        lines, step_name="Check Version in Artifactory"
+    )
+    assert any("already exists on Artifactory" in line for line in excerpt)
+    assert len(excerpt) <= 40

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from .config import (
+    FAILED_STEP_EXCERPT_LINES,
     FIRST_ERROR_CONTEXT_LINES,
     STACK_TRACE_BOTTOM_FRAMES,
     STACK_TRACE_TOP_FRAMES,
@@ -27,6 +28,16 @@ _WINDOW_ERROR = re.compile(
     r"Exception:|(?<![A-Za-z])ERROR(?![A-Za-z])|panic:|##\[error\]|fatal error:",
     re.IGNORECASE,
 )
+# Cause lines that are not tagged ERROR / ##[error] (Artifactory version, npm, …).
+_SEMANTIC_CAUSE = re.compile(
+    r"already exists|must update|version exists|not found|"
+    r"ERESOLVE|you need to update",
+    re.IGNORECASE,
+)
+_TIMESTAMP_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ?")
+_GROUP_RUN = re.compile(r"^##\[group\]Run\s+(.*)$", re.IGNORECASE)
+_GROUP_ANY = re.compile(r"^##\[group\](.*)$", re.IGNORECASE)
+_ENDGROUP = re.compile(r"^##\[endgroup\]")
 _SHELL_LINE = re.compile(r"^shell:\s", re.IGNORECASE)
 _ENV_HEADER = re.compile(r"^env:\s*$", re.IGNORECASE)
 _EXIT_CODE = re.compile(r"Process completed with exit code (\d+)", re.IGNORECASE)
@@ -57,6 +68,7 @@ class Extracted:
     error_lines: list[ErrorLine] = field(default_factory=list)
     annotations: list[str] = field(default_factory=list)
     exit_code: int | None = None
+    excerpt_lines: list[str] = field(default_factory=list)
 
 
 _SOURCE_PATHS = (
@@ -101,7 +113,11 @@ def parse_exit_code(text: str | list[str]) -> int | None:
     return int(match.group(1))
 
 
-def extract_from_lines(lines: list[str]) -> Extracted:
+def extract_from_lines(
+    lines: list[str],
+    *,
+    failed_step_name: str | None = None,
+) -> Extracted:
     """Operate on cleaned logical records. No GitHub API calls."""
     error_lines = _error_lines(lines)
     annotations = [
@@ -111,12 +127,14 @@ def extract_from_lines(lines: list[str]) -> Extracted:
     ]
     windows = _windows(lines)
     stacks = _stack_traces(lines)
+    excerpt = failed_step_excerpt_lines(lines, step_name=failed_step_name)
     return Extracted(
         windows=windows,
         stack_traces=stacks,
         error_lines=error_lines,
         annotations=annotations,
         exit_code=parse_exit_code(lines),
+        excerpt_lines=excerpt,
     )
 
 
@@ -130,7 +148,7 @@ def _flatten(lines: list[str]) -> list[str]:
 def _error_lines(lines: list[str]) -> list[ErrorLine]:
     found: list[ErrorLine] = []
     for number, record in enumerate(lines, start=1):
-        if ERROR_LINE.search(record):
+        if ERROR_LINE.search(record) or _SEMANTIC_CAUSE.search(record):
             text = record.split("\n", 1)[0]
             found.append(ErrorLine(line_number=number, text=text))
     return found
@@ -158,12 +176,97 @@ def _skip_script_preamble(lines: list[str]) -> int:
 def _first_error_index(lines: list[str]) -> int | None:
     start = _skip_script_preamble(lines)
     for index in range(start, len(lines)):
+        if _SEMANTIC_CAUSE.search(lines[index]):
+            return index
+    for index in range(start, len(lines)):
         if _WINDOW_ERROR.search(lines[index]):
             return index
     for index in range(start, len(lines)):
         if ERROR_LINE.search(lines[index]):
             return index
+    for index in range(start, len(lines)):
+        if _EXIT_CODE.search(lines[index]):
+            for back in range(index, start - 1, -1):
+                if _SEMANTIC_CAUSE.search(lines[back]) or ERROR_LINE.search(lines[back]):
+                    return back
+            return index
     return None
+
+
+def _strip_ts(line: str) -> str:
+    text = line.lstrip("\ufeff")
+    return _TIMESTAMP_PREFIX.sub("", text, count=1)
+
+
+def failed_step_excerpt_lines(
+    lines: list[str],
+    *,
+    step_name: str | None = None,
+    max_lines: int = FAILED_STEP_EXCERPT_LINES,
+) -> list[str]:
+    """Last `max_lines` of the first failed step (GitHub group when present)."""
+    stripped = [_strip_ts(record.split("\n", 1)[0]) for record in lines]
+    group = _pick_failed_group(stripped, step_name)
+    if group is not None:
+        start, end = group
+        chunk = [line for line in stripped[start:end] if line.strip()]
+        return chunk[-max_lines:]
+    start = _skip_script_preamble(stripped)
+    error_index = _first_error_index(stripped)
+    if error_index is None:
+        chunk = [line for line in stripped[start:] if line.strip()]
+        return chunk[-max_lines:]
+    end = min(len(stripped), error_index + 2)
+    begin = max(start, end - max_lines)
+    chunk = [line for line in stripped[begin:end] if line.strip()]
+    return chunk[-max_lines:]
+
+
+def _pick_failed_group(
+    lines: list[str],
+    step_name: str | None,
+) -> tuple[int, int] | None:
+    groups = _github_groups(lines)
+    if not groups:
+        return None
+    wanted = (step_name or "").strip().lower()
+    if wanted:
+        for title, start, end in groups:
+            lowered = title.lower()
+            if wanted in lowered or lowered in wanted:
+                return start, end
+    for title, start, end in groups:
+        blob = "\n".join(lines[start:end])
+        if (
+            _SEMANTIC_CAUSE.search(blob)
+            or _WINDOW_ERROR.search(blob)
+            or ERROR_LINE.search(blob)
+            or _EXIT_CODE.search(blob)
+        ):
+            return start, end
+    return None
+
+
+def _github_groups(lines: list[str]) -> list[tuple[str, int, int]]:
+    groups: list[tuple[str, int, int]] = []
+    title: str | None = None
+    start: int | None = None
+    for index, line in enumerate(lines):
+        head = line.strip()
+        match = _GROUP_RUN.match(head) or _GROUP_ANY.match(head)
+        if match:
+            if title is not None and start is not None:
+                groups.append((title, start, index))
+            title = (match.group(1) or "").strip()
+            start = index + 1
+            continue
+        if _ENDGROUP.match(head) and title is not None and start is not None:
+            groups.append((title, start, index))
+            title = None
+            start = None
+    if title is not None and start is not None:
+        groups.append((title, start, len(lines)))
+    return groups
 
 
 def _windows(lines: list[str]) -> list[LogWindow]:

@@ -242,6 +242,13 @@ class DrainReport(BaseModel):
         return self
 
 
+class FailedStepExcerpt(BaseModel):
+    """Last lines of the first failed step. Never middle-trimmed for STGPT."""
+
+    name: str
+    lines: list[str] = []
+
+
 class FailedJob(BaseModel):
     job_id: int
     name: str
@@ -261,6 +268,7 @@ class FailedJob(BaseModel):
     error_lines: list[ErrorLine] = []
     annotations: list[str] = []
     timeout_minutes: int | None = None
+    failed_step_excerpt: FailedStepExcerpt | None = None
 
 
 class CommitInfo(BaseModel):
@@ -417,6 +425,7 @@ AnalysisCitationSource = Literal[
     "code_context",
     "last_green_compare",
     "deterministic_rule",
+    "failed_step_excerpt",
 ]
 
 
@@ -441,7 +450,7 @@ class AnalysisResult(BaseModel):
 
 class AnalysisRecord(BaseModel):
     status: AnalysisStatus
-    prompt_version: str = "p2.3"
+    prompt_version: str = "p2.4"
     persona: str | None = None
     fingerprint: str | None = None
     schema_version: str | None = None

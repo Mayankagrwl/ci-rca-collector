@@ -61,6 +61,9 @@ def test_collect_from_fixture(tmp_path: Path) -> None:
     job = payload["failed_jobs"][0]
     assert job["name"] == "build (node-20)"
     assert job["failed_step_name"] == "Install dependencies"
+    excerpt = job.get("failed_step_excerpt") or {}
+    assert excerpt.get("name") == "Install dependencies"
+    assert any("ERESOLVE" in line for line in excerpt.get("lines") or [])
     assert job["log_unavailable"] is False
     assert job["log_lines_clean"] > 0
     assert job["runner"]["image"] == "ubuntu-24.04@20260818.1.0"

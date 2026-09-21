@@ -63,6 +63,7 @@ _CITATION_SOURCES = {
     "code_context",
     "last_green_compare",
     "deterministic_rule",
+    "failed_step_excerpt",
 }
 ChatFn = Callable[[str, Sequence[Mapping[str, str]]], ChatResult]
 _INFRA_FLAKE_SHORT = frozenset(
