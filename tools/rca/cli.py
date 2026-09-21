@@ -171,6 +171,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="analysis cache directory (default: <out>/analysis-cache)",
     )
+    analyze.add_argument(
+        "--mode",
+        default="collect",
+        help="collect | train. STGPT is only considered in collect.",
+    )
+    analyze.add_argument(
+        "--analyze-enabled",
+        default="true",
+        help="false when the action analyze input is off.",
+    )
+    analyze.add_argument(
+        "--requires-analysis",
+        default=None,
+        help="true|false from collect output; default is summary.verdict.",
+    )
+    analyze.add_argument(
+        "--stgpt-key-present",
+        default=None,
+        help="true|false; default infers from STGPT_API / API_KEY.",
+    )
     return parser
 
 
@@ -487,7 +507,7 @@ def _summary_if_readable(path: Path) -> Summary | None:
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:
-    from .analyze import analyze_summary, write_analysis
+    from .analyze import analyze_summary, decide_stgpt_call, skipped_record, write_analysis
     from .models import AnalysisRecord
     from .outputs import write_analysis_github_output
 
@@ -496,11 +516,22 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     cache_dir = Path(args.cache_dir) if args.cache_dir else out / "analysis-cache"
     try:
         summary = Summary.model_validate_json(summary_path.read_text(encoding="utf-8"))
-        record = analyze_summary(
+        call, reason = decide_stgpt_call(
             summary,
+            analyze_enabled=getattr(args, "analyze_enabled", "true"),
+            requires_analysis=getattr(args, "requires_analysis", None),
+            stgpt_key_present=getattr(args, "stgpt_key_present", None),
+            mode=getattr(args, "mode", "collect"),
             from_completion=args.from_completion,
-            cache_dir=cache_dir,
         )
+        if call:
+            record = analyze_summary(
+                summary,
+                from_completion=args.from_completion,
+                cache_dir=cache_dir,
+            )
+        else:
+            record = skipped_record(summary, reason or "analyze_disabled")
         write_analysis(record, summary_path=summary_path, out_dir=out)
         write_analysis_github_output(record, summary=summary)
     except Exception as exc:  # noqa: BLE001

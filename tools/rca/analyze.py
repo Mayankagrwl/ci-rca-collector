@@ -20,7 +20,7 @@ from .config import (
     resolve_stgpt_api_url,
     resolve_stgpt_client_app_name,
 )
-from .models import AnalysisRecord, AnalysisResult, Summary
+from .models import AnalysisCitation, AnalysisRecord, AnalysisResult, Summary
 from .prompt import build_evidence, build_messages
 from .redact import redact_text
 from .stgpt_client import (
@@ -107,7 +107,7 @@ def analyze_summary(
     try:
         gated = _gate(summary)
         if gated is not None:
-            return base.model_copy(update=gated)
+            return gated
 
         cached = _cache_get(cache_dir, key)
         if cached is not None:
@@ -118,6 +118,7 @@ def analyze_summary(
                     "analyzed_at": now,
                     "prompt_version": PROMPT_VERSION,
                     "fingerprint": summary.fingerprint,
+                    "model_called": True,
                 }
             )
 
@@ -126,12 +127,7 @@ def analyze_summary(
             and from_completion is None
             and not resolve_stgpt_api_key(api_key)
         ):
-            return base.model_copy(
-                update={
-                    "status": "gated",
-                    "notes": ["skipped: missing STGPT_API"],
-                }
-            )
+            return skipped_record(summary, "missing_stgpt_key")
 
         evidence = build_evidence(summary, cap_tokens=TOKEN_BUDGET_ANALYZE)
         caller = chat_fn or _make_chat_fn(
@@ -143,6 +139,7 @@ def analyze_summary(
         )
         record = _run_personas(evidence, caller, base)
         redacted = redact_record(record)
+        redacted = ensure_display_result(summary, redacted, source="ai")
         if redacted.status == "ok":
             _cache_put(cache_dir, key, redacted)
         return redacted
@@ -161,6 +158,18 @@ def write_analysis(
 ) -> None:
     """Write analysis.json, merge into summary.json, append ## AI diagnosis."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    src_summary = None
+    try:
+        src_summary = Summary.model_validate_json(Path(summary_path).read_text(encoding="utf-8"))
+    except Exception:
+        src_summary = None
+    if src_summary is not None and (
+        record.result is None
+        or not (record.result.root_cause or "").strip()
+        or not (record.result.suggested_fix or "").strip()
+    ):
+        record = ensure_display_result(src_summary, record, source="deterministic")
+
     analysis_path = out_dir / "analysis.json"
     analysis_dump = json.loads(record.model_dump_json())
     analysis_dump.pop("raw_completion", None)
@@ -203,7 +212,7 @@ def write_analysis(
     ):
         dest_md.write_text(src_md.read_text(encoding="utf-8"), encoding="utf-8")
     existing = dest_md.read_text(encoding="utf-8") if dest_md.exists() else ""
-    dest_md.write_text(_upsert_diagnosis(existing, record), encoding="utf-8")
+    dest_md.write_text(_upsert_diagnosis(existing, record, summary=src_summary), encoding="utf-8")
 
 
 def redact_record(record: AnalysisRecord) -> AnalysisRecord:
@@ -212,17 +221,11 @@ def redact_record(record: AnalysisRecord) -> AnalysisRecord:
     return AnalysisRecord.model_validate(cleaned)
 
 
-def _gate(summary: Summary) -> dict[str, Any] | None:
+def _gate(summary: Summary) -> AnalysisRecord | None:
     if summary.verdict.requires_analysis is False:
-        return {
-            "status": "gated",
-            "notes": ["skipped: requires_analysis is false"],
-        }
+        return skipped_record(summary, "deterministic_sufficient")
     if summary.verdict.short_circuit:
-        return {
-            "status": "gated",
-            "notes": [f"skipped: short_circuit={summary.verdict.short_circuit}"],
-        }
+        return skipped_record(summary, "short_circuit")
     return None
 
 
@@ -493,6 +496,226 @@ def _call_chat(
         return None
 
 
+SKIP_REASONS = {
+    "deterministic_sufficient": (
+        "Deterministic diagnosis was sufficient; STGPT was not called."
+    ),
+    "short_circuit": "A short-circuit verdict was reached; STGPT was not called.",
+    "analyze_disabled": "Analyze input is false; STGPT was not called.",
+    "missing_stgpt_key": "STGPT API key is not set; STGPT was not called.",
+    "mode_not_collect": "Analyze is only run in collect mode.",
+}
+
+
+def _as_bool(value: object, default: bool | None = None) -> bool | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+def decide_stgpt_call(
+    summary: Summary,
+    *,
+    analyze_enabled: bool | str | None = True,
+    requires_analysis: bool | str | None = None,
+    stgpt_key_present: bool | str | None = None,
+    mode: str | None = "collect",
+    from_completion: object | None = None,
+    api_key: str | None = None,
+) -> tuple[bool, str | None]:
+    """Whether to call STGPT. Returns (call, reason_code)."""
+    if (mode or "collect") != "collect":
+        return False, "mode_not_collect"
+    if _as_bool(analyze_enabled, True) is False:
+        return False, "analyze_disabled"
+    if summary.verdict.short_circuit:
+        return False, "short_circuit"
+    required = _as_bool(requires_analysis, None)
+    if required is None:
+        required = bool(summary.verdict.requires_analysis)
+    if required is False:
+        return False, "deterministic_sufficient"
+    key_present = _as_bool(stgpt_key_present, None)
+    if key_present is None:
+        key_present = bool(resolve_stgpt_api_key(api_key))
+    if from_completion is None and not key_present:
+        return False, "missing_stgpt_key"
+    return True, None
+
+
+def skipped_record(summary: Summary, reason_code: str) -> AnalysisRecord:
+    """Build a skip record. Does not call STGPT."""
+    human = SKIP_REASONS.get(reason_code, "STGPT was not called.")
+    if reason_code == "short_circuit" and summary.verdict.short_circuit:
+        human = (
+            f"Short-circuit {summary.verdict.short_circuit}; STGPT was not called."
+        )
+    if reason_code == "deterministic_sufficient" and summary.diagnosis is not None:
+        human = (
+            f"{human} See deterministic rule {summary.diagnosis.rule_id}: "
+            f"{summary.diagnosis.one_liner}"
+        )
+    return AnalysisRecord(
+        status="skipped",
+        prompt_version=PROMPT_VERSION,
+        fingerprint=summary.fingerprint,
+        schema_version=summary.schema_version or SCHEMA_VERSION,
+        result=analysis_result_from_summary(summary, source="deterministic"),
+        notes=[reason_code, human],
+        analyzed_at=datetime.now(timezone.utc),
+        reason_code=reason_code,
+        model_called=False,
+    )
+
+
+def analysis_result_from_summary(
+    summary: Summary, *, source: str = "deterministic"
+) -> AnalysisResult:
+    """Fill the four display fields from collector diagnosis. Never invent files."""
+    from .diagnose import looks_like_fix
+
+    diag = summary.diagnosis
+    rule = diag.rule_id if diag is not None else None
+    one = (
+        (diag.one_liner if diag is not None else None)
+        or summary.verdict.reason
+        or summary.classification.category
+        or "Collector named this failure."
+    )
+    fix = (diag.fix_one_liner if diag is not None else None) or ""
+    if looks_like_fix(one):
+        category = summary.classification.category or "failure"
+        root = f"{rule or 'R18'}: {category} failure."
+        if one not in root:
+            root = f"{root} {one}"
+        fix = fix or one
+    else:
+        root = one
+        if not fix:
+            from .diagnose import fix_for_rule
+
+            fix = fix_for_rule(rule) or one
+    root = (root or "").strip() or "Deterministic collector diagnosis."
+    fix = (fix or "").strip() or "See the deterministic diagnosis in this report."
+    conf = summary.classification.confidence
+    if conf not in {"high", "medium", "low"}:
+        conf = "medium"
+    citations = citations_from_summary(summary)
+    if not citations:
+        citations = [
+            AnalysisCitation(quote=one[:240], source="deterministic_rule")
+        ]
+    return AnalysisResult(
+        root_cause=root,
+        suggested_fix=fix,
+        confidence=conf,  # type: ignore[arg-type]
+        citations=citations,
+        suspected_files=list(diag.suspected_files if diag is not None else []),
+        suspected_stage=diag.suspected_stage if diag is not None else None,
+        infra_or_code=summary.classification.is_infra_vs_code,
+        used_deterministic_rule=rule,
+        source=source,
+    )
+
+
+def citations_from_summary(summary: Summary) -> list[AnalysisCitation]:
+    """Citations only from collector evidence. Never fabricate files."""
+    from .diagnose import display_citation_quotes
+
+    quotes = display_citation_quotes(
+        summary,
+        extra=summary.diagnosis.one_liner if summary.diagnosis is not None else None,
+    )
+    out: list[AnalysisCitation] = []
+    lockfiles = set()
+    if summary.changes is not None:
+        from .changes import classify_path
+
+        lockfiles = {
+            path
+            for path in summary.changes.files
+            if classify_path(path) in {"lockfile", "dependency", "ci_config", "container"}
+        }
+    pipeline_bits = []
+    for stream in summary.pipeline_logs:
+        for window in stream.windows:
+            pipeline_bits.append(window.content)
+    error_bits = []
+    for job in summary.failed_jobs:
+        for err in job.error_lines:
+            error_bits.append(err.text)
+        for window in job.windows:
+            error_bits.append(window.content)
+    last_green = []
+    if summary.last_green_compare is not None:
+        last_green.extend(summary.last_green_compare.novel_templates)
+    last_sha = (
+        summary.history.last_success_sha if summary.history is not None else None
+    )
+    for quote in quotes:
+        source: str = "deterministic_rule"
+        line = None
+        if quote in lockfiles:
+            source = "change_context"
+        elif any(quote in bit for bit in pipeline_bits):
+            source = "pipeline_logs"
+        elif last_sha and quote == last_sha:
+            source = "history"
+        elif quote in last_green:
+            source = "last_green_compare"
+        elif any(quote in bit for bit in error_bits):
+            source = "first_error_window"
+            for job in summary.failed_jobs:
+                for err in job.error_lines:
+                    if err.text.strip() == quote:
+                        line = err.line_number
+                        break
+        elif summary.diagnosis is not None and quote == summary.diagnosis.one_liner:
+            source = "deterministic_rule"
+        out.append(
+            AnalysisCitation(
+                quote=quote[:240],
+                source=source,  # type: ignore[arg-type]
+                line=line,
+            )
+        )
+        if len(out) >= 5:
+            break
+    return out
+
+
+def ensure_display_result(
+    summary: Summary, record: AnalysisRecord, *, source: str = "ai"
+) -> AnalysisRecord:
+    """Never leave root_cause / suggested_fix empty after a successful collect."""
+    det = analysis_result_from_summary(summary, source="deterministic")
+    result = record.result
+    if result is None:
+        return record.model_copy(update={"result": det})
+    root = (result.root_cause or "").strip()
+    fix = (result.suggested_fix or "").strip()
+    if not root:
+        result.root_cause = det.root_cause
+        source = "mixed"
+    if not fix:
+        result.suggested_fix = det.suggested_fix
+        source = "mixed"
+    if not result.citations:
+        result.citations = det.citations
+    if not result.used_deterministic_rule:
+        result.used_deterministic_rule = det.used_deterministic_rule
+    if not result.source:
+        result.source = "mixed" if source == "mixed" else source
+    return record.model_copy(update={"result": result})
+
+
 def _record(
     base: AnalysisRecord,
     *,
@@ -515,6 +738,7 @@ def _record(
             "notes": notes,
             "raw_completion": raw_completion,
             "stgpt_responses": list(stgpt_responses or []),
+            "model_called": True,
         }
     )
 
@@ -826,8 +1050,10 @@ def _redact_walk(value: Any) -> tuple[Any, int]:
     return value, 0
 
 
-def _upsert_diagnosis(markdown: str, record: AnalysisRecord) -> str:
-    block = _diagnosis_markdown(record)
+def _upsert_diagnosis(
+    markdown: str, record: AnalysisRecord, *, summary: Summary | None = None
+) -> str:
+    block = _diagnosis_markdown(record, summary=summary)
     marker = "## AI diagnosis"
     if marker in markdown:
         prefix = markdown[: markdown.index(marker)].rstrip()
@@ -838,14 +1064,42 @@ def _upsert_diagnosis(markdown: str, record: AnalysisRecord) -> str:
     return block
 
 
-def _diagnosis_markdown(record: AnalysisRecord) -> str:
-    lines = ["## AI diagnosis", "", f"**Status:** {record.status}"]
+def _diagnosis_markdown(
+    record: AnalysisRecord, *, summary: Summary | None = None
+) -> str:
+    called = "yes" if record.model_called else "no"
+    if record.status in {"ok", "cached", "unvalidated"}:
+        called = "yes"
+    if record.status in {"skipped", "gated"}:
+        called = "no"
+    lines = [
+        "## AI diagnosis",
+        "",
+        f"**Status:** {record.status}",
+        f"**Model called:** {called}",
+    ]
+    reason = record.reason_code or (
+        record.notes[0] if record.notes and record.status in {"skipped", "gated"} else None
+    )
+    if reason:
+        lines.append(f"**Reason code:** {reason}")
+    if called == "no":
+        diag = summary.diagnosis if summary is not None else None
+        if diag is not None and diag.rule_id:
+            pointer = f"`{diag.rule_id}`"
+            if diag.one_liner:
+                pointer += f" — {diag.one_liner}"
+            lines.append(f"**Deterministic rule:** {pointer}")
     if record.persona:
         lines.append(f"**Persona:** {record.persona}")
     if record.cache_hit:
         lines.append("**Cache:** hit")
     result = record.result
     if result is not None:
+        source = result.source or (
+            "ai" if called == "yes" else "deterministic"
+        )
+        lines.append(f"**Source:** {source}")
         if result.cannot_determine:
             lines.append("**Cannot determine:** true")
         lines.extend(
@@ -857,11 +1111,13 @@ def _diagnosis_markdown(record: AnalysisRecord) -> str:
                 f"**Suggested fix:** {result.suggested_fix}",
             ]
         )
+        lines.extend(["", "**Citations:**"])
         if result.citations:
-            lines.extend(["", "**Citations:**"])
             for cite in result.citations:
                 loc = f" ({cite.source}" + (f":{cite.line}" if cite.line else "") + ")"
                 lines.append(f"- `{cite.quote}`{loc}")
+        else:
+            lines.append("- (none)")
     if record.notes:
         lines.extend(["", "**Notes:** " + "; ".join(record.notes)])
     return "\n".join(lines) + "\n"

@@ -57,6 +57,41 @@ _ROLLBACK_ONE_LINERS = {
     "build_config": "Inspect workflow/action changes in this range; revert the pipeline edit.",
 }
 _INFRA_CONFIG_CATEGORIES = frozenset({"dependency", "image_pull", "auth"})
+_FIX_BY_RULE = {
+    "R1": "Retry the job; if this is widespread, check runner/GitHub status.",
+    "R2": "Treat as infrastructure; wait or retry after checking GitHub/runner health.",
+    "R3": "Re-run the job; the same SHA previously succeeded.",
+    "R4": "Raise timeout-minutes or fix the hang/retry loop.",
+    "R5": "Raise the job/container memory limit; this is not a runner infra OOM.",
+    "R6": "Free disk space or use a larger runner disk.",
+    "R7": "Fix image name/registry auth; compare digest to last green.",
+    "R8": "Roll back the lockfile / pin the bumped package; do not chase app code.",
+    "R9": "Fix the compile error in the suspected source file(s).",
+    "R10": "Fix the failing test assertion.",
+    "R11": "Stop the retry storm; check for a hang or flaky network.",
+    "R12": "Investigate the novel error template that replaced healthy traffic.",
+    "R13": "Diff the novel pipeline/docker template against last green.",
+    "R14": "Inspect workflow/action or Dockerfile changes; revert the pipeline edit.",
+    "R15": "Reuse the previous resolution recorded in history.",
+    "R16": "Treat as flaky; the same fingerprint failed on another branch.",
+    "R17": "Diagnose from the pipeline/docker log, not the job tail.",
+    "R18": "Inspect the collector evidence bundle and compare with last green.",
+}
+_FIX_PREFIX = (
+    "roll back",
+    "inspect ",
+    "revert ",
+    "raise ",
+    "retry ",
+    "fix ",
+    "treat ",
+    "re-run",
+    "stop ",
+    "diff ",
+    "free ",
+    "pin ",
+    "reuse ",
+)
 _LOCK_OR_MANIFEST = frozenset({"lockfile", "dependency"})
 _CONFIG_ONLY = frozenset({"ci_config", "container"})
 _SHORT_CIRCUITS = frozenset(
@@ -116,6 +151,7 @@ class DeterministicVerdict:
     matched_pattern: str | None = None
     matched_line: int | None = None
     other_matches: list[str] = field(default_factory=list)
+    fix_one_liner: str | None = None
 
 
 def diagnose(summary: Summary) -> DeterministicVerdict:
@@ -126,7 +162,7 @@ def diagnose(summary: Summary) -> DeterministicVerdict:
     files_from_logs = _error_paths(summary, ignore_job=ignore_job)
 
     def finish(verdict: DeterministicVerdict) -> DeterministicVerdict:
-        return refine_blast_radius(summary, verdict)
+        return enrich_display(summary, refine_blast_radius(summary, verdict))
 
     r1 = _rule_short_circuits(summary)
     if r1 is not None:
@@ -223,6 +259,7 @@ def apply_verdict(summary: Summary, verdict: DeterministicVerdict) -> Summary:
         suspected_files=list(verdict.suspected_files),
         citations=list(verdict.citations),
         winning_stream_id=verdict.winning_stream_id,
+        fix_one_liner=verdict.fix_one_liner,
     )
     if is_blast_radius_skip(summary):
         classes = sorted(set(summary.changes.classes or []))  # type: ignore[union-attr]
@@ -230,6 +267,74 @@ def apply_verdict(summary: Summary, verdict: DeterministicVerdict) -> Summary:
         if note not in summary.collection_notes:
             summary.collection_notes.append(note)
     return summary
+
+
+def fix_for_rule(rule_id: str | None) -> str:
+    if not rule_id:
+        return "Inspect the collector evidence; compare with last green."
+    return _FIX_BY_RULE.get(
+        rule_id, "Inspect the collector evidence; compare with last green."
+    )
+
+
+def looks_like_fix(text: str | None) -> bool:
+    lowered = (text or "").strip().lower()
+    return bool(lowered) and any(lowered.startswith(prefix) for prefix in _FIX_PREFIX)
+
+
+def enrich_display(summary: Summary, verdict: DeterministicVerdict) -> DeterministicVerdict:
+    """Fill fix_one_liner and citation quotes without changing the winning rule."""
+    if not verdict.fix_one_liner:
+        if looks_like_fix(verdict.one_liner):
+            verdict.fix_one_liner = verdict.one_liner
+        else:
+            verdict.fix_one_liner = _FIX_BY_RULE.get(verdict.rule_id) or (
+                "Inspect the collector evidence; compare with last green."
+            )
+    if not verdict.citations:
+        verdict.citations = display_citation_quotes(summary, extra=verdict.one_liner)
+    return verdict
+
+
+def display_citation_quotes(summary: Summary, *, extra: str | None = None) -> list[str]:
+    """Quotes already present on the summary; never invent file paths."""
+    quotes: list[str] = []
+
+    def _add(text: str | None) -> None:
+        item = (text or "").strip()
+        if not item or item in quotes:
+            return
+        quotes.append(item[:240])
+
+    _add(extra)
+    if summary.diagnosis is not None and summary.diagnosis.one_liner:
+        _add(summary.diagnosis.one_liner)
+    for job in summary.failed_jobs:
+        for err in job.error_lines[:2]:
+            _add(err.text)
+        for window in job.windows:
+            if window.label in {"first_error", "merged"} and window.content:
+                line = next((ln for ln in window.content.splitlines() if ln.strip()), "")
+                _add(line)
+                break
+    for stream in summary.pipeline_logs:
+        for window in stream.windows:
+            if window.content:
+                line = next((ln for ln in window.content.splitlines() if ln.strip()), "")
+                _add(line)
+                break
+    if summary.changes is not None:
+        from .changes import classify_path
+
+        for path in summary.changes.files:
+            if classify_path(path) in {"lockfile", "dependency", "ci_config", "container"}:
+                _add(path)
+    if summary.history is not None and summary.history.last_success_sha:
+        _add(summary.history.last_success_sha)
+    if summary.last_green_compare is not None:
+        for tmpl in summary.last_green_compare.novel_templates[:2]:
+            _add(tmpl)
+    return quotes[:6]
 
 
 def refine_blast_radius(

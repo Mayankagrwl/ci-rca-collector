@@ -8,11 +8,13 @@ from pathlib import Path
 
 import httpx
 
+import pytest
+
 from tools.rca.analyze import analyze_summary, cache_key, write_analysis
 from tools.rca.budget import token_count
 from tools.rca.cli import main
 from tools.rca.config import PROMPT_VERSION, STGPT_CLIENT_APP_NAME
-from tools.rca.models import Summary
+from tools.rca.models import ChangeContext, Summary
 from tools.rca.prompt import build_evidence
 from tools.rca.redact import REPLACEMENT
 
@@ -72,14 +74,201 @@ def test_skip_when_requires_analysis_false(tmp_path: Path) -> None:
     )
     assert rc == 0
     analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
-    assert analysis["status"] == "gated"
+    assert analysis["status"] == "skipped"
     assert analysis["cache_hit"] is False
-    assert analysis["result"] is None
+    assert analysis["result"] is not None
+    assert analysis["result"]["root_cause"].strip()
+    assert analysis["result"]["suggested_fix"].strip()
+    assert analysis["model_called"] is False
+    assert analysis["reason_code"] == "deterministic_sufficient"
+    assert analysis["notes"][0] == "deterministic_sufficient"
     merged = json.loads((out / "summary.json").read_text(encoding="utf-8"))
-    assert merged["analysis"]["status"] == "gated"
+    assert merged["analysis"]["status"] == "skipped"
     md = (out / "summary.md").read_text(encoding="utf-8")
     assert "## AI diagnosis" in md
+    assert "**Model called:** no" in md
+    assert "**Reason code:** deterministic_sufficient" in md
+    assert "**Root cause:**" in md
+    assert "**Suggested fix:**" in md
+    assert analysis["result"]["root_cause"][:20] in md
     assert list((tmp_path / "cache").glob("*.json")) == []
+
+
+def test_missing_key_skips_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STGPT_API", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    called: list[int] = []
+
+    def boom(*_a: object, **_k: object) -> None:
+        called.append(1)
+        raise AssertionError("STGPT must not be called")
+
+    monkeypatch.setattr("tools.rca.stgpt_client.post_chat", boom)
+    monkeypatch.setattr("tools.rca.analyze.post_chat", boom)
+    out = _collect(tmp_path)
+    rc = main(
+        [
+            "analyze",
+            "--summary",
+            str(out / "summary.json"),
+            "--out",
+            str(out),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--stgpt-key-present",
+            "false",
+        ]
+    )
+    assert rc == 0
+    assert called == []
+    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["status"] == "skipped"
+    assert analysis["reason_code"] == "missing_stgpt_key"
+    assert analysis["result"] is not None
+    assert analysis["result"]["root_cause"].strip()
+    assert analysis["result"]["suggested_fix"].strip()
+    assert analysis["model_called"] is False
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "## AI diagnosis" in md
+    assert "**Model called:** no" in md
+    assert "missing_stgpt_key" in md
+
+
+def test_analyze_disabled_skips_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[int] = []
+
+    def boom(*_a: object, **_k: object) -> None:
+        called.append(1)
+        raise AssertionError("STGPT must not be called")
+
+    monkeypatch.setattr("tools.rca.analyze.post_chat", boom)
+    out = _collect(tmp_path)
+    rc = main(
+        [
+            "analyze",
+            "--summary",
+            str(out / "summary.json"),
+            "--out",
+            str(out),
+            "--from-completion",
+            _OK_COMPLETION,
+            "--analyze-enabled",
+            "false",
+        ]
+    )
+    assert rc == 0
+    assert called == []
+    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["status"] == "skipped"
+    assert analysis["reason_code"] == "analyze_disabled"
+    assert analysis["result"] is not None
+    assert analysis["result"]["root_cause"].strip()
+    assert analysis["result"]["suggested_fix"].strip()
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "**Model called:** no" in md
+    assert "analyze_disabled" in md
+
+
+def test_happy_path_writes_status_ok_and_root_cause(tmp_path: Path) -> None:
+    out = _collect(tmp_path)
+    rc = main(
+        [
+            "analyze",
+            "--summary",
+            str(out / "summary.json"),
+            "--out",
+            str(out),
+            "--from-completion",
+            _OK_COMPLETION,
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    )
+    assert rc == 0
+    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["status"] == "ok"
+    assert analysis["result"]["root_cause"]
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "**Status:** ok" in md
+    assert "**Model called:** yes" in md
+    assert "**Root cause:**" in md
+    merged = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert merged["analysis"]["status"] == "ok"
+
+
+def test_job_summary_file_includes_ai_section_after_write(tmp_path: Path) -> None:
+    out = _collect(tmp_path)
+    payload = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    payload["verdict"]["requires_analysis"] = False
+    (out / "summary.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    rc = main(
+        [
+            "analyze",
+            "--summary",
+            str(out / "summary.json"),
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "## AI diagnosis" in md
+    assert "**Model called:** no" in md
+    assert "**Root cause:**" in md
+    assert "**Suggested fix:**" in md
+    assert (out / "analysis.json").is_file()
+    job_summary = tmp_path / "step_summary.md"
+    job_summary.write_text(md, encoding="utf-8")
+    text = job_summary.read_text(encoding="utf-8")
+    assert "## AI diagnosis" in text
+    assert "**Model called:** no" in text
+
+
+def test_r8_skip_has_root_cause_and_suggested_fix(tmp_path: Path) -> None:
+    from tools.rca.diagnose import diagnose, apply_verdict
+
+    out = _collect(tmp_path)
+    summary = _summary(out)
+    summary.changes = ChangeContext(
+        head_sha=summary.run.head_sha,
+        range_basis="last_success",
+        classes=["lockfile"],
+        files=["package-lock.json"],
+    )
+    apply_verdict(summary, diagnose(summary))
+    assert summary.diagnosis is not None
+    assert summary.diagnosis.rule_id == "R8"
+    assert summary.verdict.requires_analysis is False
+    (out / "summary.json").write_text(summary.model_dump_json(indent=2), encoding="utf-8")
+    rc = main(
+        [
+            "analyze",
+            "--summary",
+            str(out / "summary.json"),
+            "--out",
+            str(out),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    )
+    assert rc == 0
+    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["status"] == "skipped"
+    assert analysis["model_called"] is False
+    result = analysis["result"]
+    assert result is not None
+    assert result["root_cause"].strip()
+    assert result["suggested_fix"].strip()
+    assert result["confidence"] in {"high", "medium", "low"}
+    assert result["source"] == "deterministic"
+    assert result["citations"]
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "## AI diagnosis" in md
+    assert "**Root cause:**" in md
+    assert result["root_cause"][:40] in md
+    assert "**Suggested fix:**" in md
+    assert result["suggested_fix"][:40] in md
+    assert "package-lock.json" in (result["suggested_fix"] + md + json.dumps(result["citations"]))
 
 
 def test_cache_hit_skips_http(tmp_path: Path) -> None:
@@ -109,6 +298,8 @@ def test_cache_hit_skips_http(tmp_path: Path) -> None:
             str(out),
             "--cache-dir",
             str(cache),
+            "--stgpt-key-present",
+            "true",
         ]
     )
     assert second == 0
@@ -340,14 +531,16 @@ def test_invalid_application_name_fails_without_root_cause(tmp_path: Path) -> No
     )
     write_analysis(record, summary_path=out / "summary.json", out_dir=out)
     assert record.status == "failed"
-    assert record.result is None
+    assert record.result is not None
+    assert record.result.root_cause.strip()
+    assert record.result.suggested_fix.strip()
     blob = " ".join(record.notes)
     assert "Invalid application name" in blob
     assert "clientAppName_repr='gtrd_srmtdpplm'" in blob
     assert "clientAppName_len=14" in blob
     assert "test-stgpt-key" not in blob
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "**Root cause:**" not in md
+    assert "**Root cause:**" in md
     assert err in md
 
 
@@ -383,16 +576,17 @@ def test_errorcode_payload_fails_without_root_cause(tmp_path: Path) -> None:
     assert formats[0] == "json_object"
     assert formats[0] not in {"json", "JSON", "json-schema", ""}
     assert record.status == "failed"
-    assert record.result is None
+    assert record.result is not None
+    assert record.result.root_cause.strip()
     blob = " ".join(record.notes)
     assert err in blob
     assert "test-stgpt-key" not in blob
     merged = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert merged["analysis"]["status"] == "failed"
-    assert merged["analysis"].get("result") is None
+    assert merged["analysis"]["result"]["root_cause"].strip()
     md = (out / "summary.md").read_text(encoding="utf-8")
     assert err in md
-    assert "**Root cause:**" not in md
+    assert "**Root cause:**" in md
 
 
 def test_empty_completion_200_is_failed_with_keys(tmp_path: Path) -> None:

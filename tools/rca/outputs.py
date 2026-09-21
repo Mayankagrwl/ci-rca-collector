@@ -37,6 +37,7 @@ ANALYSIS_OUTPUT_KEYS = (
     "analysis-status",
     "analysis-notes",
     "diagnosis-source",
+    "requires-analysis",
     "suspected-stage",
     "suspected-files",
     "deterministic-rule",
@@ -127,7 +128,10 @@ def diagnosis_source(summary: Summary, record: AnalysisRecord | None = None) -> 
     if record is not None:
         if record.status in {"ok", "cached"}:
             return "ai"
-        if record.status == "gated":
+        code = record.reason_code or (record.notes[0] if record.notes else "")
+        if record.status in {"skipped", "gated"}:
+            if code in {"deterministic_sufficient", "short_circuit"}:
+                return "deterministic"
             return "gated"
     if (
         summary.diagnosis is not None
@@ -198,18 +202,20 @@ def analysis_outputs(
         "ai"
         if record.status in {"ok", "cached"}
         else "gated"
-        if record.status == "gated"
+        if record.status in {"gated", "skipped"}
         else "none"
     )
     stage = ""
     files = ""
     rule = ""
+    requires = ""
     if summary is not None:
         stage = _normalize_stage(
             summary.diagnosis.suspected_stage if summary.diagnosis else None
         )
         files = _format_files(suspected_files_for_output(summary, record))
         rule = _deterministic_rule(summary)
+        requires = _bool_str(bool(summary.verdict.requires_analysis))
     raw = {
         "root-cause": result.root_cause if result is not None else "",
         "suggested-fix": result.suggested_fix if result is not None else "",
@@ -217,6 +223,7 @@ def analysis_outputs(
         "analysis-status": record.status or "",
         "analysis-notes": "; ".join(record.notes),
         "diagnosis-source": source,
+        "requires-analysis": requires,
         "suspected-stage": stage,
         "suspected-files": files,
         "deterministic-rule": rule,

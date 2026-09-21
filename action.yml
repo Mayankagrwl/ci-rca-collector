@@ -126,8 +126,8 @@ outputs:
     description: 'infra_runner | flake_same_sha_passed | no_failed_jobs | empty string.'
     value: ${{ steps.collect.outputs.short-circuit }}
   requires-analysis:
-    description: 'false when a deterministic verdict was reached. Phase 2 gates the LLM call on this.'
-    value: ${{ steps.collect.outputs.requires-analysis }}
+    description: 'false when a deterministic verdict was reached. Always set by Report analysis in collect mode.'
+    value: ${{ steps.analyze.outputs.requires-analysis || steps.collect.outputs.requires-analysis }}
   fingerprint:
     description: '16-hex-char failure fingerprint.'
     value: ${{ steps.collect.outputs.fingerprint }}
@@ -233,13 +233,9 @@ runs:
           --history-backend "$RCA_HISTORY_BACKEND" \
           "${extra[@]}"
 
-    - name: Analyze
+    - name: Report analysis
       id: analyze
-      if: >
-        inputs.analyze == 'true' &&
-        inputs.mode == 'collect' &&
-        steps.collect.outputs.requires-analysis == 'true' &&
-        (inputs.stgpt-api-key != '' || env.STGPT_API != '')
+      if: inputs.mode == 'collect'
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}
@@ -249,6 +245,10 @@ runs:
         RCA_SSL_CERT_FILE: ${{ inputs.ssl-cert-file }}
         SSL_CERT_FILE: ${{ env.SSL_CERT_FILE }}
         REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
+        RCA_MODE: ${{ inputs.mode }}
+        RCA_ANALYZE_ENABLED: ${{ inputs.analyze }}
+        RCA_REQUIRES_ANALYSIS: ${{ steps.collect.outputs.requires-analysis }}
+        RCA_STGPT_KEY_PRESENT: ${{ (inputs.stgpt-api-key != '' || env.STGPT_API != '') && 'true' || 'false' }}
         STGPT_API: ${{ inputs.stgpt-api-key != '' && inputs.stgpt-api-key || env.STGPT_API }}
         STGPT_API_URL: ${{ inputs.stgpt-api-url != '' && inputs.stgpt-api-url || env.STGPT_API_URL }}
         STGPT_CLIENT_APP_NAME: ${{ inputs.stgpt-client-app-name != '' && inputs.stgpt-client-app-name || env.STGPT_CLIENT_APP_NAME }}
@@ -261,6 +261,10 @@ runs:
         python -m tools.rca.cli analyze \
           --summary "$RCA_OUT/summary.json" \
           --out "$RCA_OUT" \
+          --mode "$RCA_MODE" \
+          --analyze-enabled "$RCA_ANALYZE_ENABLED" \
+          --requires-analysis "$RCA_REQUIRES_ANALYSIS" \
+          --stgpt-key-present "$RCA_STGPT_KEY_PRESENT" \
           "${extra[@]}"
 
     - name: Write job summary

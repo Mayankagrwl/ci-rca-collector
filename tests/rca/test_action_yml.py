@@ -72,8 +72,12 @@ def test_action_yml_analyze_is_separate_gated_step() -> None:
     assert "default: 'true'" in ACTION
     assert "id: analyze" in ACTION
     assert "python -m tools.rca.cli analyze" in ACTION
-    assert "steps.collect.outputs.requires-analysis == 'true'" in ACTION
-    assert "inputs.stgpt-api-key != '' || env.STGPT_API != ''" in ACTION
+    assert "Report analysis" in ACTION
+    assert "if: inputs.mode == 'collect'" in ACTION
+    assert "steps.collect.outputs.requires-analysis == 'true'" not in ACTION
+    assert "--analyze-enabled" in ACTION
+    assert "--stgpt-key-present" in ACTION
+    assert "--requires-analysis" in ACTION
     assert "STGPT_API: ${{ inputs.stgpt-api-key != '' && inputs.stgpt-api-key || env.STGPT_API }}" in ACTION
     assert "RCA_SSL_VERIFY: ${{ inputs.ssl-verify }}" in ACTION
     assert "root-cause:" in ACTION

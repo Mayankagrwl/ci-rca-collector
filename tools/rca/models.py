@@ -361,6 +361,7 @@ class DeterministicDiagnosis(BaseModel):
     suspected_files: list[str] = []
     citations: list[str] = []
     winning_stream_id: str | None = None
+    fix_one_liner: str | None = None
 
 
 class Summary(BaseModel):
@@ -393,6 +394,7 @@ AnalysisStatus = Literal[
     "ok",
     "cached",
     "gated",
+    "skipped",
     "unvalidated",
     "failed",
     "parse_error",
@@ -434,6 +436,7 @@ class AnalysisResult(BaseModel):
     suspected_stage: str | None = None
     infra_or_code: str | None = None
     used_deterministic_rule: str | None = None
+    source: str | None = None
 
 
 class AnalysisRecord(BaseModel):
@@ -450,3 +453,5 @@ class AnalysisRecord(BaseModel):
     analyzed_at: datetime | None = None
     raw_completion: str | None = None
     stgpt_responses: list[dict[str, Any]] = []
+    reason_code: str | None = None
+    model_called: bool = False
