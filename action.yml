@@ -208,18 +208,21 @@ runs:
           --job-name "$RCA_JOB_NAME" \
           --repository "$RCA_REPO"
 
-    - name: Restore Drain3 baseline
+    # Combined cache@v4 (restore at start, save at job end). Nested
+    # actions/cache/restore and actions/cache/save are often missing on
+    # GHES mirrors ("repository not found").
+    - name: Cache Drain3 baseline
       continue-on-error: true
-      uses: actions/cache/restore@v4
+      uses: actions/cache@v4
       with:
         path: ${{ inputs.drain-cache-dir }}
         key: ${{ steps.cache-keys.outputs.drain-cache-key }}
         restore-keys: |
           ${{ steps.cache-keys.outputs.drain-cache-restore-key }}
 
-    - name: Restore fingerprint history
+    - name: Cache fingerprint history
       continue-on-error: true
-      uses: actions/cache/restore@v4
+      uses: actions/cache@v4
       with:
         path: ${{ inputs.history-dir }}
         key: ${{ steps.cache-keys.outputs.history-cache-key }}
@@ -312,22 +315,6 @@ runs:
           --requires-analysis "$RCA_REQUIRES_ANALYSIS" \
           --stgpt-key-present "$RCA_STGPT_KEY_PRESENT" \
           "${extra[@]}"
-
-    - name: Save Drain3 baseline
-      if: inputs.mode == 'train'
-      continue-on-error: true
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ inputs.drain-cache-dir }}
-        key: ${{ steps.cache-keys.outputs.drain-cache-key }}
-
-    - name: Save fingerprint history
-      if: inputs.mode == 'collect'
-      continue-on-error: true
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ inputs.history-dir }}
-        key: ${{ steps.cache-keys.outputs.history-cache-key }}
 
     - name: Write job summary
       if: inputs.write-job-summary == 'true' && inputs.mode == 'collect'

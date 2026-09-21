@@ -107,6 +107,9 @@ def test_reusable_workflow_exists() -> None:
     assert "rca-history-${{ inputs.run-id }}" not in text
     assert "steps.keys.outputs.drain-cache-key" in text
     assert "steps.keys.outputs.history-cache-key" in text
+    assert "actions/cache@v4" in text
+    assert "actions/cache/restore@" not in text
+    assert "actions/cache/save@" not in text
 
 
 def test_action_yml_emits_sanitized_cache_keys() -> None:
@@ -115,7 +118,8 @@ def test_action_yml_emits_sanitized_cache_keys() -> None:
     assert "drain-cache-key:" in ACTION
     assert "history-cache-key:" in ACTION
     assert "continue-on-error: true" in ACTION
-    assert "actions/cache/restore@v4" in ACTION
-    assert "actions/cache/save@v4" in ACTION
+    assert "actions/cache@v4" in ACTION
+    assert "actions/cache/restore@" not in ACTION
+    assert "actions/cache/save@" not in ACTION
     assert "RCA_DRAIN_CACHE_KEY" in ACTION
     assert "RCA_HISTORY_CACHE_KEY" in ACTION

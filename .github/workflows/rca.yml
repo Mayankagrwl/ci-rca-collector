@@ -73,18 +73,21 @@ jobs:
             echo "history-cache-restore-key=rca-history-${repo}-"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Restore Drain3 baseline
+      # Combined cache@v4 (restore at start, save at job end). Nested
+      # actions/cache/restore and actions/cache/save are often missing on
+      # GHES mirrors ("repository not found").
+      - name: Cache Drain3 baseline
         continue-on-error: true
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: .drain/
           key: ${{ steps.keys.outputs.drain-cache-key }}
           restore-keys: |
             ${{ steps.keys.outputs.drain-cache-restore-key }}
 
-      - name: Restore fingerprint history
+      - name: Cache fingerprint history
         continue-on-error: true
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: .rca-history/
           key: ${{ steps.keys.outputs.history-cache-key }}
@@ -101,22 +104,6 @@ jobs:
           mode: ${{ inputs.conclusion == 'success' && 'train' || 'collect' }}
           github-api-url: ''
           workflow-name: ${{ inputs.workflow-name }}
-
-      - name: Save Drain3 baseline
-        if: inputs.conclusion == 'success'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: .drain/
-          key: ${{ steps.keys.outputs.drain-cache-key }}
-
-      - name: Save fingerprint history
-        if: inputs.conclusion == 'failure'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: .rca-history/
-          key: ${{ steps.keys.outputs.history-cache-key }}
 
       - name: Upload artifact
         if: inputs.conclusion == 'failure'

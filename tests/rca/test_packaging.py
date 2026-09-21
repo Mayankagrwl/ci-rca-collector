@@ -47,6 +47,9 @@ def test_consumer_stub_for_github_com() -> None:
     assert "rca-history-${{ github.event.workflow_run.id }}" not in text
     assert "steps.keys.outputs.drain-cache-key" in text
     assert "steps.keys.outputs.history-cache-key" in text
+    assert "actions/cache@v4" in text
+    assert "actions/cache/restore@" not in text
+    assert "actions/cache/save@" not in text
 
 
 def test_test_failures_example_is_not_a_repo_workflow() -> None:
