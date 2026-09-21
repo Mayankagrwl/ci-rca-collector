@@ -20,11 +20,30 @@ _PATTERNS: list[re.Pattern[str]] = [
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
         re.DOTALL,
     ),
+    # npm registry auth (//host/:_authToken= and //host/_authToken=)
+    re.compile(r"//[^\s]*_authToken=\S+", re.IGNORECASE),
+    re.compile(r"//[^\s]*_password=\S+", re.IGNORECASE),
+    re.compile(r"(?i)(?:^|[\s;])_authToken\s*[:=]\s*\S+"),
+    re.compile(r"(?i)(?:^|[\s;])_password\s*[:=]\s*\S+"),
+    re.compile(r"(?i)(?:^|[\s;])_auth\s*[:=]\s*\S+"),
+    # docker / registry / hub tokens (values and assignments)
+    re.compile(
+        r"(?i)(?:export\s+)?(?:DOCKER_PASSWORD|DOCKER_TOKEN|DOCKER_AUTH|"
+        r"DOCKERHUB_TOKEN|GHCR_TOKEN|GITLAB_TOKEN|PYPI_TOKEN|"
+        r"NPM_TOKEN|NODE_AUTH_TOKEN)\s*[:=]\s*\S+"
+    ),
+    re.compile(r"(?i)(?:export\s+)?KUBECONFIG\s*[:=]\s*\S+"),
+    re.compile(r"kubernetes\.io/service-account-token[^\s]*", re.IGNORECASE),
+    re.compile(
+        r"(?i)(?:client-key-data|client-certificate-data|certificate-authority-data)"
+        r":\s*\S+"
+    ),
     re.compile(
         r'(?i)\b(password|token|secret|api[_-]?key)\s*[:=]\s*([^\s"\']+)',
     ),
     re.compile(
-        r'(?i)(?:export\s+)?[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|API[_-]?KEY)[A-Z0-9_]*\s*=\s*\S+'
+        r"(?i)(?:export\s+)?[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|API[_-]?KEY)"
+        r"[A-Z0-9_]*\s*[:=]\s*\S+"
     ),
 ]
 

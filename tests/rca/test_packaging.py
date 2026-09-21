@@ -7,6 +7,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_reusable_workflow_forwards_new_outputs() -> None:
+    text = (ROOT / ".github" / "workflows" / "rca.yml").read_text(encoding="utf-8")
+    assert "jobs.collect.outputs.suspected-stage" in text
+    assert "jobs.collect.outputs.suspected-files" in text
+    assert "jobs.collect.outputs.deterministic-rule" in text
+    assert "jobs.collect.outputs.diagnosis-source" in text
+    assert "steps.rca.outputs.suspected-files" in text
+
+
 def test_self_test_workflow_is_offline() -> None:
     text = (ROOT / ".github" / "workflows" / "self-test.yml").read_text(encoding="utf-8")
     assert "--from-fixture" in text

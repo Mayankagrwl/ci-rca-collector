@@ -46,6 +46,7 @@ class ClassificationHit:
     short_circuit: str | None = None
     reason: str | None = None
     requires_analysis: bool = True
+    matched_stream: str | None = None
 
 
 def _side(category: str) -> str:
@@ -148,6 +149,52 @@ def check_runner_health(
             requires_analysis=False,
         )
     return None
+
+
+def classify_union(
+    streams: Sequence[tuple[str, Sequence[str]]],
+) -> ClassificationHit:
+    """First high-confidence CLASSIFY_RULES hit across streams wins.
+
+    ``streams`` is ``(stream_id, lines)`` in caller-preferred order
+    (failed-stage pipeline files first, then job logs).
+    """
+    fallback: ClassificationHit | None = None
+    others: list[str] = []
+    seen: set[str] = set()
+    for category, compiled, confidence in _RULE_RES:
+        for stream_id, lines in streams:
+            for index, line in enumerate(lines, start=1):
+                if not compiled.search(line):
+                    continue
+                hit = ClassificationHit(
+                    category=category,
+                    confidence=confidence,
+                    matched_pattern=compiled.pattern,
+                    matched_line=index,
+                    is_infra_vs_code=_side(category),
+                    matched_stream=stream_id,
+                )
+                if confidence == "high":
+                    hit.other_matches = [
+                        item for item in others if item != category
+                    ]
+                    return hit
+                if fallback is None:
+                    fallback = hit
+                    seen.add(category)
+                elif category not in seen:
+                    others.append(category)
+                    seen.add(category)
+                break
+    if fallback is None:
+        return ClassificationHit(
+            category="unknown",
+            confidence="low",
+            is_infra_vs_code="unknown",
+        )
+    fallback.other_matches = [item for item in others if item != fallback.category]
+    return fallback
 
 
 def classify_lines(lines: Sequence[str]) -> ClassificationHit:

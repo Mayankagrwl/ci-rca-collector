@@ -59,6 +59,40 @@ class Extracted:
     exit_code: int | None = None
 
 
+_SOURCE_PATHS = (
+    re.compile(r'File "([^"]+)", line (\d+)'),
+    re.compile(
+        r"(?:^|[\s'`\"(])([A-Za-z0-9_./\\-]+\.[A-Za-z][A-Za-z0-9]*)\((\d+),\d+\):"
+    ),
+    re.compile(
+        r"(?:^|[\s'`\"(])([A-Za-z0-9_./\\-]+\.[A-Za-z][A-Za-z0-9]*):(\d+)(?::\d+)?"
+    ),
+    re.compile(r"\(([^():]+):(\d+)(?::\d+)?\)"),
+)
+
+
+def extract_source_paths(text: str) -> list[tuple[str, int | None]]:
+    """Paths (and optional line numbers) mentioned in log or stack text."""
+    found: list[tuple[str, int | None]] = []
+    seen: set[str] = set()
+    for compiled in _SOURCE_PATHS:
+        for match in compiled.finditer(text or ""):
+            path = (match.group(1) or "").replace("\\", "/").strip()
+            if not path or path in seen:
+                continue
+            if path.startswith("http:") or path.startswith("https:"):
+                continue
+            line: int | None = None
+            if match.lastindex and match.lastindex >= 2:
+                try:
+                    line = int(match.group(2))
+                except (TypeError, ValueError):
+                    line = None
+            seen.add(path)
+            found.append((path, line))
+    return found
+
+
 def parse_exit_code(text: str | list[str]) -> int | None:
     blob = text if isinstance(text, str) else "\n".join(text)
     match = _EXIT_CODE.search(blob)

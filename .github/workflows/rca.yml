@@ -14,6 +14,10 @@ on:
       fingerprint:   { value: ${{ jobs.collect.outputs.fingerprint }} }
       is-flaky:      { value: ${{ jobs.collect.outputs.is-flaky }} }
       requires-analysis: { value: ${{ jobs.collect.outputs.requires-analysis }} }
+      suspected-stage: { value: ${{ jobs.collect.outputs.suspected-stage }} }
+      suspected-files: { value: ${{ jobs.collect.outputs.suspected-files }} }
+      deterministic-rule: { value: ${{ jobs.collect.outputs.deterministic-rule }} }
+      diagnosis-source: { value: ${{ jobs.collect.outputs.diagnosis-source }} }
 
 permissions:
   actions: read
@@ -28,6 +32,10 @@ jobs:
       fingerprint: ${{ steps.rca.outputs.fingerprint }}
       is-flaky: ${{ steps.rca.outputs.is-flaky }}
       requires-analysis: ${{ steps.rca.outputs.requires-analysis }}
+      suspected-stage: ${{ steps.rca.outputs.suspected-stage }}
+      suspected-files: ${{ steps.rca.outputs.suspected-files }}
+      deterministic-rule: ${{ steps.rca.outputs.deterministic-rule }}
+      diagnosis-source: ${{ steps.rca.outputs.diagnosis-source }}
     steps:
       - name: Restore Drain3 baseline
         uses: actions/cache@v4

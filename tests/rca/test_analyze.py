@@ -125,7 +125,7 @@ def test_ungrounded_citation_repair_succeeds(tmp_path: Path) -> None:
     assert _QUOTE in evidence
     assert evidence.startswith("<EVIDENCE>")
     assert evidence.endswith("</EVIDENCE>")
-    assert token_count(evidence) <= 6000 + 20
+    assert token_count(evidence) <= 2500 + 20
 
     completions = [_result(_INVENTED), _result(_QUOTE)]
     record = analyze_summary(
@@ -563,6 +563,6 @@ def test_cache_key_is_sha256_prefix() -> None:
         fingerprint_coarse="coarsecoarsecoar",
         budget_report=BudgetReport(),
     )
-    raw = f"finefinefinefine|dependency||{PROMPT_VERSION}"
+    raw = f"finefinefinefine|dependency||{PROMPT_VERSION}||"
     assert cache_key(summary) == hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     assert len(cache_key(summary)) == 16

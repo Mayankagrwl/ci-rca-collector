@@ -78,6 +78,32 @@ def apply_budget(
                 job.annotations = content.split("\n")
             section_used["annotations"] = section_used.get("annotations", 0) + after
 
+    pipe_cap = caps.get("pipeline_logs", 1000)
+    for stream in summary.pipeline_logs:
+        new_windows = []
+        for window in stream.windows:
+            content, trimmed, before, after = trim_middle(window.content, pipe_cap)
+            if trimmed:
+                window.truncated = True
+                notes.append(
+                    f"pipeline_logs from {before} → {after} tokens (middle elided)"
+                )
+            window.content = content
+            section_used["pipeline_logs"] = section_used.get("pipeline_logs", 0) + after
+            new_windows.append(window)
+        stream.windows = new_windows
+
+    if summary.code_context and summary.code_context.hunks:
+        hunk_cap = caps.get("code_context", 400)
+        for hunk in summary.code_context.hunks:
+            content, trimmed, before, after = trim_middle(hunk.content, hunk_cap)
+            if trimmed:
+                notes.append(
+                    f"code_context from {before} → {after} tokens (middle elided)"
+                )
+            hunk.content = content
+            section_used["code_context"] = section_used.get("code_context", 0) + after
+
     used = sum(section_used.values())
     summary.budget_report = BudgetReport(
         total_cap_tokens=cap_total,

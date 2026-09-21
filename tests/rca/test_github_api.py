@@ -73,6 +73,30 @@ def test_get_run_sends_bearer_token() -> None:
     assert client.rate_limit_remaining == 900
 
 
+def test_get_file_decodes_base64_and_404_is_none() -> None:
+    import base64
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path.endswith("/src/foo.ts"):
+            payload = base64.b64encode(b"export const x = 1\n").decode("ascii")
+            return httpx.Response(
+                200,
+                json={"type": "file", "encoding": "base64", "content": payload},
+            )
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    with GitHubClient(transport=httpx.MockTransport(handler), sleep=lambda _d: None) as client:
+        text = client.get_file("acme/widgets", "src/foo.ts", "abc123")
+        missing = client.get_file("acme/widgets", "nope.ts", "abc123")
+    assert text == "export const x = 1\n"
+    assert missing is None
+    assert "contents/src/foo.ts" in seen[0]
+    assert "ref=abc123" in seen[0]
+
+
 def test_list_jobs_paginates() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if "page=2" in str(request.url):

@@ -47,6 +47,20 @@ def test_run_steps_declare_bash() -> None:
     assert "pip --version" in ACTION
 
 
+def test_action_yml_pipeline_log_inputs() -> None:
+    assert "analyze-pipeline-logs:" in ACTION
+    assert "max-pipeline-log-artifacts:" in ACTION
+    assert "RCA_ANALYZE_PIPELINE_LOGS:" in ACTION
+    assert "RCA_MAX_PIPELINE_LOG_ARTIFACTS:" in ACTION
+    assert "--no-analyze-pipeline-logs" in ACTION
+    assert "suspected-stage:" in ACTION
+    assert "suspected-files:" in ACTION
+    assert "deterministic-rule:" in ACTION
+    assert "diagnosis-source:" in ACTION
+    assert "steps.analyze.outcome == 'skipped' && steps.collect.outputs.diagnosis-source || steps.analyze.outputs.diagnosis-source" in ACTION
+    assert "steps.analyze.outcome == 'skipped' && steps.collect.outputs.suspected-files || steps.analyze.outputs.suspected-files" in ACTION
+
+
 def test_action_yml_analyze_is_separate_gated_step() -> None:
     assert "analyze:" in ACTION
     assert "stgpt-api-key:" in ACTION

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import ssl
 import time
@@ -357,6 +358,60 @@ class GitHubClient:
         if response.status_code >= 400:
             return None
         return response.content
+
+    def get_file(self, repo: str, path: str, ref: str) -> str | None:
+        """Fetch a file at *ref*. 404/403 return None; never raises for those."""
+        quoted = quote(path.lstrip("/"), safe="/")
+        url = f"repos/{repo}/contents/{quoted}?ref={quote(str(ref), safe='')}"
+        try:
+            response = self._request("GET", url)
+        except GitHubAPIError as exc:
+            if exc.status_code in (404, 403):
+                return None
+            raise
+        if response.status_code in (404, 403):
+            return None
+        if response.status_code >= 400:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            text = response.text
+            return text if isinstance(text, str) else None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") and payload.get("type") != "file":
+            return None
+        content = payload.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        try:
+            return base64.b64decode(content).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def list_commit_files(self, repo: str, sha: str) -> list[str]:
+        """Filenames changed in a single commit. 404/403 → empty list."""
+        url = f"repos/{repo}/commits/{quote(str(sha), safe='')}"
+        try:
+            response = self._request("GET", url)
+        except GitHubAPIError as exc:
+            if exc.status_code in (404, 403):
+                return []
+            raise
+        if response.status_code in (404, 403) or response.status_code >= 400:
+            return []
+        try:
+            payload = response.json()
+        except ValueError:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        names: list[str] = []
+        for item in payload.get("files") or []:
+            if isinstance(item, dict) and item.get("filename"):
+                names.append(str(item["filename"]))
+        return names
 
     def get_job_log(self, repo: str, job_id: int) -> str | None:
         """Fetch plaintext job logs. Follows the short-lived 302; does not cache it."""

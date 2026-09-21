@@ -1,0 +1,15 @@
+{
+  "id": 9911,
+  "name": "CI",
+  "html_url": "https://example.invalid/acme/widgets/actions/runs/9911",
+  "event": "push",
+  "status": "completed",
+  "conclusion": "failure",
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "head_branch": "main",
+  "run_attempt": 1,
+  "actor": {
+    "login": "tester"
+  },
+  "pull_requests": []
+}

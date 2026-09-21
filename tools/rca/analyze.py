@@ -15,7 +15,7 @@ from .config import (
     PERSONAS,
     PROMPT_VERSION,
     SCHEMA_VERSION,
-    TOKEN_BUDGET_TOTAL,
+    TOKEN_BUDGET_ANALYZE,
     resolve_stgpt_api_key,
     resolve_stgpt_api_url,
     resolve_stgpt_client_app_name,
@@ -59,18 +59,27 @@ _CITATION_SOURCES = {
     "annotations",
     "history",
     "step_table",
+    "pipeline_logs",
+    "code_context",
+    "last_green_compare",
+    "deterministic_rule",
 }
 ChatFn = Callable[[str, Sequence[Mapping[str, str]]], ChatResult]
 
 
 def cache_key(summary: Summary) -> str:
-    """sha256(fine|category|masking_hash|prompt_version)[:16]."""
+    """sha256(fine|category|masking|prompt_version|winning_stream_id|rule_id)[:16]."""
     fine = summary.fingerprint or ""
     category = summary.classification.category or ""
     masking = ""
     if summary.drain is not None and summary.drain.masking_config_hash:
         masking = summary.drain.masking_config_hash
-    raw = f"{fine}|{category}|{masking}|{PROMPT_VERSION}"
+    stream = ""
+    rule = ""
+    if summary.diagnosis is not None:
+        stream = summary.diagnosis.winning_stream_id or ""
+        rule = summary.diagnosis.rule_id or ""
+    raw = f"{fine}|{category}|{masking}|{PROMPT_VERSION}|{stream}|{rule}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -124,7 +133,7 @@ def analyze_summary(
                 }
             )
 
-        evidence = build_evidence(summary, cap_tokens=TOKEN_BUDGET_TOTAL)
+        evidence = build_evidence(summary, cap_tokens=TOKEN_BUDGET_ANALYZE)
         caller = chat_fn or _make_chat_fn(
             api_key=api_key,
             from_completion=from_completion,
@@ -638,6 +647,24 @@ def _normalize_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             mapped["suggested_fix"] = ""
     mapped["confidence"] = _confidence(mapped.get("confidence"))
     mapped["citations"] = _normalize_citations(mapped.get("citations"))
+    files = mapped.get("suspected_files")
+    if isinstance(files, list):
+        mapped["suspected_files"] = [str(item) for item in files if item]
+    elif files:
+        mapped["suspected_files"] = [str(files)]
+    else:
+        mapped["suspected_files"] = []
+    stage = mapped.get("suspected_stage")
+    mapped["suspected_stage"] = str(stage) if isinstance(stage, str) and stage.strip() else None
+    side = mapped.get("infra_or_code")
+    if isinstance(side, str) and side.strip().lower() in {"infra", "code", "unknown"}:
+        mapped["infra_or_code"] = side.strip().lower()
+    else:
+        mapped["infra_or_code"] = None
+    rule = mapped.get("used_deterministic_rule")
+    mapped["used_deterministic_rule"] = (
+        str(rule) if isinstance(rule, str) and rule.strip() else None
+    )
     flag = mapped.get("cannot_determine")
     if isinstance(flag, str):
         mapped["cannot_determine"] = flag.strip().lower() in {"1", "true", "yes"}

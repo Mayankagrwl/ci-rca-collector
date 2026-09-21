@@ -21,6 +21,7 @@ from .config import (
     ARTIFACT_DOWNLOAD_MAX_BYTES,
     COLLECTOR_VERSION,
     MAX_FAILED_JOBS_ANALYSED,
+    MAX_PIPELINE_LOG_ARTIFACTS,
     QUEUE_SECONDS_THRESHOLD,
 )
 from .changes import change_context_from_compare, resolve_compare_base
@@ -29,6 +30,7 @@ from .drain_index import (
     fingerprint_coarse,
     fingerprint_fine,
     masking_config_hash,
+    merge_fingerprint_inputs,
     novelty,
     remask_templates,
     template_hash,
@@ -55,6 +57,7 @@ from .models import (
     FailureRecord,
     HistoryContext,
     JUnitReport,
+    LastGreenCompare,
     RunnerInfo,
     RunMeta,
     StepInfo,
@@ -183,6 +186,18 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="cache | none. Default none for fixtures, cache for live collect.",
     )
+    parser.add_argument(
+        "--analyze-pipeline-logs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Download and parse pipeline/docker log artifacts (default on).",
+    )
+    parser.add_argument(
+        "--max-pipeline-log-artifacts",
+        type=int,
+        default=MAX_PIPELINE_LOG_ARTIFACTS,
+        help="Max pipeline/docker log zips to download (fail-side first).",
+    )
 
 
 def _resolve_drain_dir(args: argparse.Namespace) -> Path:
@@ -300,6 +315,62 @@ def _cmd_capture(args: argparse.Namespace) -> int:
                     (logs_dir / f"{job_id}.unavailable").write_text("", encoding="utf-8")
                 else:
                     (logs_dir / f"{job_id}.log").write_text(text, encoding="utf-8")
+            try:
+                artifacts = client.list_artifacts(args.repo, args.run_id)
+            except GitHubAPIError as exc:
+                _LOG.warning("artifacts unavailable: %s", exc)
+                artifacts = []
+            _write_json(out / "artifacts.json", {"artifacts": artifacts})
+            art_dir = out / "artifacts"
+            art_dir.mkdir(exist_ok=True)
+            from .junit import artifact_looks_like_junit
+            from .pipeline_logs import match_pipeline_artifact_name
+
+            downloaded = 0
+            for raw in artifacts:
+                name = str(raw.get("name") or "artifact")
+                size = int(raw.get("size_in_bytes") or raw.get("size_bytes") or 0)
+                if size > ARTIFACT_DOWNLOAD_MAX_BYTES or raw.get("expired"):
+                    continue
+                pipeline = match_pipeline_artifact_name(name)
+                junit = artifact_looks_like_junit(name)
+                if not pipeline and not junit:
+                    continue
+                if pipeline and downloaded >= MAX_PIPELINE_LOG_ARTIFACTS:
+                    continue
+                if raw.get("id") is None:
+                    continue
+                blob = client.download_artifact_zip(args.repo, int(raw["id"]))
+                if not blob:
+                    continue
+                (art_dir / f"{name}.zip").write_bytes(blob)
+                if pipeline:
+                    downloaded += 1
+            if last_success is not None and last_success.get("id") is not None:
+                try:
+                    green_arts = client.list_artifacts(args.repo, int(last_success["id"]))
+                except GitHubAPIError as exc:
+                    _LOG.warning("last-green artifacts unavailable: %s", exc)
+                    green_arts = []
+                green_dir = out / "last_green_artifacts"
+                wanted = {
+                    str(raw.get("name") or "")
+                    for raw in artifacts
+                    if match_pipeline_artifact_name(str(raw.get("name") or ""))
+                }
+                remaining = max(0, MAX_PIPELINE_LOG_ARTIFACTS - downloaded)
+                for raw in green_arts:
+                    if remaining <= 0:
+                        break
+                    name = str(raw.get("name") or "")
+                    if name not in wanted or raw.get("id") is None:
+                        continue
+                    blob = client.download_artifact_zip(args.repo, int(raw["id"]))
+                    if not blob:
+                        continue
+                    green_dir.mkdir(exist_ok=True)
+                    (green_dir / f"{name}.zip").write_bytes(blob)
+                    remaining -= 1
     except Exception as exc:  # noqa: BLE001
         _LOG.exception("capture failed")
         if args.strict:
@@ -320,10 +391,19 @@ def _cmd_collect(args: argparse.Namespace) -> int:
             if not args.run_id or not args.repo:
                 raise ValueError("collect requires --from-fixture or both --run-id and --repo")
             bundle = _fetch_live(
-                args.repo, args.run_id, api_url=args.api_url, token=args.token
+                args.repo,
+                args.run_id,
+                api_url=args.api_url,
+                token=args.token,
+                analyze_pipeline=bool(getattr(args, "analyze_pipeline_logs", True)),
+                max_pipeline=int(
+                    getattr(args, "max_pipeline_log_artifacts", None)
+                    or MAX_PIPELINE_LOG_ARTIFACTS
+                ),
             )
             notes.extend(bundle.pop("notes", []))
         summary = _build_summary(bundle, extra_notes=notes, args=args)
+        summary = _maybe_fetch_code_context(summary, bundle, args)
     except Exception as exc:  # noqa: BLE001 — always emit a partial summary
         _LOG.exception("collect failed")
         _safe_emit(
@@ -397,6 +477,15 @@ def _cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def _summary_if_readable(path: Path) -> Summary | None:
+    try:
+        if path.is_file():
+            return Summary.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
 def _cmd_analyze(args: argparse.Namespace) -> int:
     from .analyze import analyze_summary, write_analysis
     from .models import AnalysisRecord
@@ -413,7 +502,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             cache_dir=cache_dir,
         )
         write_analysis(record, summary_path=summary_path, out_dir=out)
-        write_analysis_github_output(record)
+        write_analysis_github_output(record, summary=summary)
     except Exception as exc:  # noqa: BLE001
         _LOG.exception("analyze error")
         record = AnalysisRecord(
@@ -423,7 +512,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         )
         try:
             write_analysis(record, summary_path=summary_path, out_dir=out)
-            write_analysis_github_output(record)
+            loaded = _summary_if_readable(summary_path)
+            write_analysis_github_output(record, summary=loaded)
         except Exception:
             _LOG.exception("failed to write analysis.json")
             _emit_failed_analysis(args, f"analyze error: {exc}")
@@ -449,14 +539,16 @@ def _emit_failed_analysis(args: argparse.Namespace, note: str) -> None:
     )
     try:
         write_analysis(record, summary_path=summary_path, out_dir=out)
-        write_analysis_github_output(record)
+        write_analysis_github_output(record, summary=_summary_if_readable(summary_path))
     except Exception:
         out.mkdir(parents=True, exist_ok=True)
         (out / "analysis.json").write_text(
             record.model_dump_json(indent=2) + "\n", encoding="utf-8"
         )
         try:
-            write_analysis_github_output(record)
+            write_analysis_github_output(
+                record, summary=_summary_if_readable(summary_path)
+            )
         except Exception:
             _LOG.exception("failed to write analysis GITHUB_OUTPUT")
 
@@ -546,6 +638,8 @@ def _fetch_live(
     *,
     api_url: str | None,
     token: str | None,
+    analyze_pipeline: bool = True,
+    max_pipeline: int = MAX_PIPELINE_LOG_ARTIFACTS,
 ) -> dict[str, Any]:
     notes: list[str] = []
     with GitHubClient(api_url=api_url, token=token) as client:
@@ -623,8 +717,17 @@ def _fetch_live(
                 notes.append(f"compare unavailable: {exc}")
         elif not optional:
             notes.append("skipped compare (rate limit)")
-        artifact_infos, junit_report = _collect_artifacts_live(
-            client, repo, run_id, notes, optional=optional
+        failed_stage = _failed_stage_from_jobs(jobs)
+        artifact_infos, junit_report, pipeline_zips, green_zips = _collect_artifacts_live(
+            client,
+            repo,
+            run_id,
+            notes,
+            optional=optional,
+            last_success_run_id=(last_success or {}).get("id"),
+            failed_stage=failed_stage,
+            max_pipeline=max_pipeline,
+            analyze_pipeline=analyze_pipeline,
         )
         notes.extend(client.collection_notes)
         return {
@@ -640,6 +743,8 @@ def _fetch_live(
             "pull": pull_obj,
             "artifacts": artifact_infos,
             "junit": junit_report,
+            "pipeline_zips": pipeline_zips,
+            "green_pipeline_zips": green_zips,
             "from_fixture": False,
             "notes": notes,
         }
@@ -681,6 +786,7 @@ def _load_fixture(path: Path) -> dict[str, Any]:
             else:
                 logs[int(stem)] = file.read_text(encoding="utf-8-sig")
     artifact_infos, junit_report = _load_fixture_artifacts(path)
+    pipeline_zips, green_zips = _load_fixture_pipeline_zips(path)
     return {
         "repo": meta.get("repo"),
         "run": run,
@@ -694,6 +800,8 @@ def _load_fixture(path: Path) -> dict[str, Any]:
         "pull": _optional_obj(path / "pull.json"),
         "artifacts": artifact_infos,
         "junit": junit_report,
+        "pipeline_zips": pipeline_zips,
+        "green_pipeline_zips": green_zips,
         "from_fixture": True,
         "notes": [
             "replayed from fixture (no network)",
@@ -749,14 +857,30 @@ def _enrich_same_sha_jobs(
 
 
 def _artifact_info(raw: Mapping[str, Any], *, parsed: bool = False) -> ArtifactInfo:
+    from .pipeline_logs import match_pipeline_artifact_name
+
     size = raw.get("size_bytes")
     if size is None:
         size = raw.get("size_in_bytes") or 0
+    name = str(raw.get("name") or "artifact")
+    kind = "other"
+    stage = None
+    matched = match_pipeline_artifact_name(name)
+    if matched is not None:
+        kind, stage = matched
+    elif artifact_looks_like_junit(name):
+        kind = "junit"
+    skipped = None
+    if int(size or 0) > ARTIFACT_DOWNLOAD_MAX_BYTES:
+        skipped = f"size {size} > {ARTIFACT_DOWNLOAD_MAX_BYTES}"
     return ArtifactInfo(
-        name=str(raw.get("name") or "artifact"),
+        name=name,
         size_bytes=int(size or 0),
         expired=bool(raw.get("expired")),
         parsed=parsed,
+        kind=kind,  # type: ignore[arg-type]
+        stage=stage,
+        skipped_reason=skipped,
     )
 
 
@@ -767,23 +891,52 @@ def _collect_artifacts_live(
     notes: list[str],
     *,
     optional: bool,
-) -> tuple[list[ArtifactInfo], JUnitReport | None]:
+    last_success_run_id: int | None = None,
+    failed_stage: str | None = None,
+    max_pipeline: int = MAX_PIPELINE_LOG_ARTIFACTS,
+    analyze_pipeline: bool = True,
+) -> tuple[
+    list[ArtifactInfo],
+    JUnitReport | None,
+    list[tuple[str, str | None, bytes]],
+    dict[str, bytes],
+]:
     if not optional:
         notes.append("skipped artifacts (rate limit)")
-        return [], None
+        return [], None, [], {}
     try:
         raw_artifacts = client.list_artifacts(repo, run_id)
     except GitHubAPIError as exc:
         notes.append(f"artifacts unavailable: {exc}")
-        return [], None
+        return [], None, [], {}
+    from .pipeline_logs import match_pipeline_artifact_name, rank_pipeline_artifacts
+
     infos: list[ArtifactInfo] = []
     reports: list[JUnitReport | None] = []
+    pipeline_zips: list[tuple[str, str | None, bytes]] = []
+    pipeline_names = rank_pipeline_artifacts(
+        [
+            str(raw.get("name") or "")
+            for raw in raw_artifacts
+            if match_pipeline_artifact_name(str(raw.get("name") or ""))
+        ],
+        failed_stage=failed_stage,
+    )[: max(0, max_pipeline if analyze_pipeline else 0)]
+    raw_by_name = {str(raw.get("name") or ""): raw for raw in raw_artifacts}
     for raw in raw_artifacts:
         size = int(raw.get("size_in_bytes") or raw.get("size_bytes") or 0)
         name = str(raw.get("name") or "artifact")
         expired = bool(raw.get("expired"))
         parsed = False
+        skipped = None
+        kind, stage = "other", None
+        matched = match_pipeline_artifact_name(name)
+        if matched is not None:
+            kind, stage = matched
+        elif artifact_looks_like_junit(name):
+            kind = "junit"
         if size > ARTIFACT_DOWNLOAD_MAX_BYTES:
+            skipped = f"size {size} > {ARTIFACT_DOWNLOAD_MAX_BYTES}"
             notes.append(
                 f"skipped artifact {name!r} ({size} bytes > {ARTIFACT_DOWNLOAD_MAX_BYTES} bytes)"
             )
@@ -800,9 +953,66 @@ def _collect_artifacts_live(
                     reports.append(report)
                     parsed = True
         infos.append(
-            ArtifactInfo(name=name, size_bytes=size, expired=expired, parsed=parsed)
+            ArtifactInfo(
+                name=name,
+                size_bytes=size,
+                expired=expired,
+                parsed=parsed,
+                kind=kind,  # type: ignore[arg-type]
+                stage=stage,
+                skipped_reason=skipped,
+            )
         )
-    return infos, merge_junit_reports(reports)
+    for name in pipeline_names:
+        raw = raw_by_name.get(name)
+        if raw is None or raw.get("id") is None or raw.get("expired"):
+            continue
+        size = int(raw.get("size_in_bytes") or raw.get("size_bytes") or 0)
+        if size > ARTIFACT_DOWNLOAD_MAX_BYTES:
+            continue
+        if not client.optional_collection_allowed:
+            notes.append("skipped remaining pipeline-log artifacts (rate limit)")
+            break
+        blob = client.download_artifact_zip(repo, int(raw["id"]))
+        if not blob:
+            continue
+        matched = match_pipeline_artifact_name(name)
+        stage = matched[1] if matched else None
+        pipeline_zips.append((name, stage, blob))
+        for item in infos:
+            if item.name == name:
+                item.parsed = True
+    green_zips: dict[str, bytes] = {}
+    remaining = max(0, max_pipeline - len(pipeline_zips))
+    if (
+        remaining > 0
+        and last_success_run_id
+        and pipeline_zips
+        and client.optional_collection_allowed
+    ):
+        try:
+            green_arts = client.list_artifacts(repo, int(last_success_run_id))
+        except GitHubAPIError as exc:
+            notes.append(f"last-green artifacts unavailable: {exc}")
+            green_arts = []
+        wanted = {name for name, _stage, _blob in pipeline_zips}
+        for raw in green_arts:
+            if remaining <= 0:
+                break
+            name = str(raw.get("name") or "")
+            if name not in wanted or raw.get("id") is None or raw.get("expired"):
+                continue
+            size = int(raw.get("size_in_bytes") or raw.get("size_bytes") or 0)
+            if size > ARTIFACT_DOWNLOAD_MAX_BYTES:
+                continue
+            blob = client.download_artifact_zip(repo, int(raw["id"]))
+            if not blob:
+                continue
+            green_zips[name] = blob
+            remaining -= 1
+    elif last_success_run_id and pipeline_zips and remaining <= 0:
+        notes.append("skipped last-green pipeline logs (zip cap)")
+    return infos, merge_junit_reports(reports), pipeline_zips, green_zips
 
 
 def _load_fixture_artifacts(path: Path) -> tuple[list[ArtifactInfo], JUnitReport | None]:
@@ -865,6 +1075,181 @@ def _mark_parsed(infos: list[ArtifactInfo], name: str) -> None:
     for item in infos:
         if item.name == name or name.startswith(item.name):
             item.parsed = True
+            matched = None
+            try:
+                from .pipeline_logs import match_pipeline_artifact_name
+
+                matched = match_pipeline_artifact_name(item.name)
+            except Exception:
+                matched = None
+            if matched is not None:
+                item.kind = "pipeline_logs"
+                item.stage = matched[1]
+            elif artifact_looks_like_junit(item.name):
+                item.kind = "junit"
+
+
+def _failed_stage_from_jobs(jobs: list[dict[str, Any]]) -> str | None:
+    from .diagnose import _stage_from_step
+
+    for job in jobs:
+        if job.get("conclusion") not in _ANALYSE_CONCLUSIONS:
+            continue
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            if step.get("conclusion") == "failure":
+                return _stage_from_step(str(step.get("name") or ""))
+        return _stage_from_step(str(job.get("name") or ""))
+    return None
+
+
+def _load_fixture_pipeline_zips(
+    path: Path,
+) -> tuple[list[tuple[str, str | None, bytes]], dict[str, bytes]]:
+    from .pipeline_logs import match_pipeline_artifact_name
+
+    zips: list[tuple[str, str | None, bytes]] = []
+    green: dict[str, bytes] = {}
+    search = [path / "artifacts", path]
+    seen: set[Path] = set()
+    for root in search:
+        if not root.is_dir():
+            continue
+        for file in root.glob("*.zip"):
+            if file in seen:
+                continue
+            seen.add(file)
+            matched = match_pipeline_artifact_name(file.stem)
+            if matched is None:
+                continue
+            zips.append((file.stem, matched[1], file.read_bytes()))
+    green_dir = path / "last_green_artifacts"
+    if green_dir.is_dir():
+        for file in green_dir.glob("*.zip"):
+            green[file.stem] = file.read_bytes()
+    return zips, green
+
+
+def _parse_pipeline_bundle(
+    bundle: dict[str, Any],
+    *,
+    failed_stage: str | None,
+    analyze: bool,
+    limit: int,
+    notes: list[str],
+) -> tuple[list[Any], LastGreenCompare | None]:
+    from .pipeline_logs import compare_green_fail, parse_pipeline_zip, rank_pipeline_artifacts
+
+    if not analyze:
+        return [], None
+    raw_zips: list[tuple[str, str | None, bytes]] = list(bundle.get("pipeline_zips") or [])
+    names = rank_pipeline_artifacts([name for name, _s, _b in raw_zips], failed_stage=failed_stage)
+    by_name = {name: (stage, blob) for name, stage, blob in raw_zips}
+    streams = []
+    for name in names[:limit]:
+        stage, blob = by_name[name]
+        try:
+            streams.extend(parse_pipeline_zip(blob, artifact_name=name, stage=stage))
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"pipeline-log {name!r} parse failed: {exc}")
+    last_green = None
+    green = bundle.get("green_pipeline_zips") or {}
+    if streams:
+        primary = streams[0].artifact_name
+        fail_lines = [
+            line
+            for stream in streams
+            if stream.artifact_name == primary
+            for window in stream.windows
+            for line in window.content.splitlines()
+        ]
+        if primary in green:
+            try:
+                g_streams = parse_pipeline_zip(
+                    green[primary], artifact_name=primary, stage=streams[0].stage
+                )
+                green_lines = [
+                    line
+                    for stream in g_streams
+                    for window in stream.windows
+                    for line in window.content.splitlines()
+                ]
+                last_green = compare_green_fail(
+                    green_lines, fail_lines, artifact_name=primary
+                )
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"last-green compare failed: {exc}")
+                last_green = LastGreenCompare(
+                    artifact_name=primary,
+                    available=False,
+                    skipped_reason=str(exc),
+                )
+        elif bundle.get("last_success"):
+            last_green = LastGreenCompare(
+                artifact_name=primary,
+                available=False,
+                skipped_reason="green artifact missing",
+            )
+    return streams, last_green
+
+
+def _maybe_fetch_code_context(
+    summary: Summary, bundle: dict[str, Any], args: argparse.Namespace
+) -> Summary:
+    from .code_context import fetch_code_context
+    from .diagnose import (
+        apply_verdict,
+        diagnose,
+        is_blast_radius_skip,
+        should_fetch_code_context,
+    )
+
+    verdict = diagnose(summary)
+    if is_blast_radius_skip(summary) and not should_fetch_code_context(summary, verdict):
+        summary.code_context = fetch_code_context(
+            summary,
+            verdict,
+            get_file=lambda _repo, _path, _ref: None,
+            repo="",
+        )
+        return apply_verdict(summary, verdict)
+    if bundle.get("from_fixture"):
+        return summary
+    repo = bundle.get("repo") or getattr(args, "repo", None)
+    if not repo or not should_fetch_code_context(summary, verdict):
+        return summary
+    try:
+        with GitHubClient(api_url=getattr(args, "api_url", None), token=getattr(args, "token", None)) as client:
+            _fill_first_failing_files(summary, client, str(repo))
+            summary.code_context = fetch_code_context(
+                summary,
+                verdict,
+                get_file=client.get_file,
+                repo=str(repo),
+            )
+    except Exception as exc:  # noqa: BLE001
+        summary.collection_notes.append(f"code_context skipped: {exc}")
+        return summary
+    return apply_verdict(summary, diagnose(summary))
+
+
+def _fill_first_failing_files(summary: Summary, client: GitHubClient, repo: str) -> None:
+    hist = summary.history
+    if hist is None or not hist.first_failing_sha or summary.changes is None:
+        return
+    target = hist.first_failing_sha
+    for commit in summary.changes.commits:
+        sha = commit.sha or ""
+        if not (target.startswith(sha) or sha.startswith(target) or sha == target):
+            continue
+        if commit.files:
+            return
+        try:
+            commit.files = client.list_commit_files(repo, target)
+        except Exception as exc:  # noqa: BLE001
+            summary.collection_notes.append(f"commit files unavailable: {exc}")
+        return
 
 
 def _build_summary(
@@ -947,6 +1332,39 @@ def _build_summary(
     except Exception as exc:  # noqa: BLE001
         notes.append(f"Drain3 skipped: {exc}")
 
+    analyze_pipeline = True
+    max_pipeline = MAX_PIPELINE_LOG_ARTIFACTS
+    if args is not None:
+        analyze_pipeline = bool(getattr(args, "analyze_pipeline_logs", True))
+        max_pipeline = int(
+            getattr(args, "max_pipeline_log_artifacts", None) or MAX_PIPELINE_LOG_ARTIFACTS
+        )
+    failed_stage = _failed_stage_from_jobs(jobs)
+    pipeline_streams, last_green = _parse_pipeline_bundle(
+        bundle,
+        failed_stage=failed_stage,
+        analyze=analyze_pipeline,
+        limit=max_pipeline,
+        notes=notes,
+    )
+    if pipeline_streams:
+        groups = []
+        if drain_report is not None:
+            groups.append(drain_report.templates)
+        for stream in pipeline_streams:
+            groups.append(stream.templates)
+        available = bool(drain_report and drain_report.baseline_available) or bool(
+            last_green and last_green.available
+        )
+        try:
+            fine, coarse, _hash_input = merge_fingerprint_inputs(*groups, available=available)
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"pipeline fingerprint merge skipped: {exc}")
+        for item in bundle.get("artifacts") or []:
+            if getattr(item, "name", None) in {s.artifact_name for s in pipeline_streams}:
+                item.parsed = True
+                item.kind = "pipeline_logs"
+
     backend = getattr(args, "history_backend", None)
     if not backend:
         backend = "none" if bundle.get("from_fixture") else "cache"
@@ -964,6 +1382,10 @@ def _build_summary(
             for t in (drain_report.templates if drain_report else [])
             if t.tier in {"T1", "T2", "T3"}
         ]
+        for stream in pipeline_streams:
+            for tmpl in stream.templates:
+                if tmpl.tier in {"T1", "T2", "T3"} or tmpl.has_error_match:
+                    templates_for_hash.append(tmpl.template)
         hit_rec = lookup_recurrence(
             store,
             fine=fine,
@@ -1049,6 +1471,8 @@ def _build_summary(
         failed_jobs=failed_jobs,
         junit=bundle.get("junit"),
         artifacts=list(bundle.get("artifacts") or []),
+        pipeline_logs=pipeline_streams,
+        last_green_compare=last_green,
         drain=drain_report,
         changes=changes,
         history=history,
@@ -1058,6 +1482,12 @@ def _build_summary(
         budget_report=BudgetReport(),
         collection_notes=notes,
     )
+    try:
+        from .diagnose import apply_verdict, diagnose
+
+        summary = apply_verdict(summary, diagnose(summary))
+    except Exception as exc:  # noqa: BLE001
+        summary.collection_notes.append(f"diagnose skipped: {exc}")
     return summary
 
 

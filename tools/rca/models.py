@@ -149,6 +149,7 @@ class Classification(BaseModel):
     other_matches: list[str] = []
     is_infra_vs_code: Literal["infra", "code", "unknown"]
     is_flaky: bool = False
+    matched_stream: str | None = None
 
 
 class StepInfo(BaseModel):
@@ -165,6 +166,9 @@ class ArtifactInfo(BaseModel):
     size_bytes: int
     expired: bool = False
     parsed: bool = False
+    kind: Literal["pipeline_logs", "junit", "other"] = "other"
+    stage: str | None = None
+    skipped_reason: str | None = None
 
 
 class RunnerInfo(BaseModel):
@@ -256,6 +260,7 @@ class FailedJob(BaseModel):
     stack_traces: list[StackTrace] = []
     error_lines: list[ErrorLine] = []
     annotations: list[str] = []
+    timeout_minutes: int | None = None
 
 
 class CommitInfo(BaseModel):
@@ -264,6 +269,7 @@ class CommitInfo(BaseModel):
     author: str | None = None
     authored_at: datetime
     files_changed: int
+    files: list[str] = []
     is_revert: bool = False
     is_merge: bool = False
 
@@ -280,6 +286,7 @@ class ChangeContext(BaseModel):
     deletions: int = 0
     diffstat: str | None = None
     classes: list[str] = []
+    files: list[str] = []
     lockfile_deltas: dict[str, list[str]] = {}
     stack_trace_diffs: dict[str, str] = {}
     pr_title: str | None = None
@@ -311,6 +318,51 @@ class HistoryContext(BaseModel):
     backend_degraded: bool = False
 
 
+class PipelineLogStream(BaseModel):
+    artifact_name: str
+    stage: str | None = None
+    file: str
+    windows: list[LogWindow] = []
+    error_lines: list[ErrorLine] = []
+    stack_traces: list[StackTrace] = []
+    templates: list[LogTemplate] = []
+
+
+class LastGreenCompare(BaseModel):
+    artifact_name: str | None = None
+    novel_templates: list[str] = []
+    missing_on_fail: list[str] = []
+    present_on_green: list[str] = []
+    available: bool = False
+    skipped_reason: str | None = None
+
+
+class CodeHunk(BaseModel):
+    path: str
+    ref: str | None = None
+    start_line: int = 1
+    end_line: int = 1
+    content: str = ""
+    note: str | None = None
+
+
+class CodeContext(BaseModel):
+    hunks: list[CodeHunk] = []
+    notes: list[str] = []
+    skipped_reason: str | None = None
+    ref_sha: str | None = None
+    basis: Literal["first_failing", "head"] | None = None
+
+
+class DeterministicDiagnosis(BaseModel):
+    rule_id: str
+    one_liner: str
+    suspected_stage: str | None = None
+    suspected_files: list[str] = []
+    citations: list[str] = []
+    winning_stream_id: str | None = None
+
+
 class Summary(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     collector_version: str
@@ -321,6 +373,10 @@ class Summary(BaseModel):
     failed_jobs: list[FailedJob]
     junit: JUnitReport | None = None
     artifacts: list[ArtifactInfo] = []
+    pipeline_logs: list[PipelineLogStream] = []
+    last_green_compare: LastGreenCompare | None = None
+    code_context: CodeContext | None = None
+    diagnosis: DeterministicDiagnosis | None = None
     drain: DrainReport | None = None
     changes: ChangeContext | None = None
     history: HistoryContext | None = None
@@ -355,6 +411,10 @@ AnalysisCitationSource = Literal[
     "annotations",
     "history",
     "step_table",
+    "pipeline_logs",
+    "code_context",
+    "last_green_compare",
+    "deterministic_rule",
 ]
 
 
@@ -370,11 +430,15 @@ class AnalysisResult(BaseModel):
     confidence: Literal["high", "medium", "low"]
     citations: list[AnalysisCitation] = []
     cannot_determine: bool = False
+    suspected_files: list[str] = []
+    suspected_stage: str | None = None
+    infra_or_code: str | None = None
+    used_deterministic_rule: str | None = None
 
 
 class AnalysisRecord(BaseModel):
     status: AnalysisStatus
-    prompt_version: str = "p2.1"
+    prompt_version: str = "p2.2"
     persona: str | None = None
     fingerprint: str | None = None
     schema_version: str | None = None

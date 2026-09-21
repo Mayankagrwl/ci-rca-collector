@@ -68,7 +68,7 @@ def test_config_phase2_defaults() -> None:
     assert STGPT_SERVICE == "chat"
     assert STGPT_VERSION == "1.0"
     assert PERSONAS == ("trinity_for_api", "alfred_for_api")
-    assert PROMPT_VERSION == "p2.1"
+    assert PROMPT_VERSION == "p2.2"
 
 
 def test_resolve_stgpt_api_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

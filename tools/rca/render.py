@@ -6,15 +6,26 @@ from urllib.parse import urlparse
 
 from .models import FailedJob, LogWindow, Summary
 
+
+def _sha_prefix_match(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    a, b = left.lower(), right.lower()
+    return a == b or a.startswith(b) or b.startswith(a)
+
 SECTION_ORDER = (
     "Verdict",
     "Failed Jobs",
     "Annotations",
     "Heuristic Classification",
+    "Deterministic diagnosis",
     "First Error Window",
     "Tail Window",
     "Stack Traces",
+    "Pipeline / Docker logs",
+    "vs last green logs",
     "Log Templates",
+    "Code context",
     "Artifacts",
     "Failed Tests",
     "Changes Since Last Green",
@@ -40,14 +51,26 @@ def render_markdown(summary: Summary, *, repository: str | None = None) -> str:
     if annotations:
         parts.append(annotations)
     parts.append(_classification(summary))
+    diagnosis = _diagnosis(summary)
+    if diagnosis:
+        parts.append(diagnosis)
     for window_block in _windows(summary):
         parts.append(window_block)
     stacks = _stack_traces(summary)
     if stacks:
         parts.append(stacks)
+    pipeline = _pipeline_logs(summary)
+    if pipeline:
+        parts.append(pipeline)
+    green = _last_green(summary)
+    if green:
+        parts.append(green)
     templates = _log_templates(summary)
     if templates:
         parts.append(templates)
+    code = _code_context(summary)
+    if code:
+        parts.append(code)
     artifacts = _artifacts(summary)
     if artifacts:
         parts.append(artifacts)
@@ -212,6 +235,98 @@ def _annotations(summary: Summary) -> str:
         return ""
     lines = ["## Annotations", ""]
     lines.extend(f"- `{item}`" if not item.startswith("`") else f"- {item}" for item in items)
+    return "\n".join(lines)
+
+
+def _diagnosis(summary: Summary) -> str:
+    diag = summary.diagnosis
+    if diag is None:
+        return ""
+    lines = ["## Deterministic diagnosis", "", diag.one_liner]
+    lines.append("")
+    lines.append(f"- Rule: `{diag.rule_id}`")
+    if diag.suspected_stage:
+        lines.append(f"- Suspected stage: `{diag.suspected_stage}`")
+    if diag.suspected_files:
+        files = ", ".join(f"`{p}`" for p in diag.suspected_files)
+        lines.append(f"- Suspected files: {files}")
+    if diag.winning_stream_id:
+        lines.append(f"- Winning stream: `{diag.winning_stream_id}`")
+    if summary.verdict.reason:
+        lines.append(f"- Reason: {summary.verdict.reason}")
+    return "\n".join(lines)
+
+
+def _pipeline_logs(summary: Summary) -> str:
+    if not summary.pipeline_logs:
+        return ""
+    lines = ["## Pipeline / Docker logs"]
+    for stream in summary.pipeline_logs:
+        loc = f"`{stream.artifact_name}` / `{stream.file}`"
+        if stream.stage:
+            loc += f" (stage `{stream.stage}`)"
+        lines += ["", f"### {loc}"]
+        for window in stream.windows:
+            lines += ["", f"```text", window.content, "```"]
+        for tmpl in stream.templates[:8]:
+            novel = " novel" if tmpl.is_novel else ""
+            lines.append(f"- `{tmpl.template}` count={tmpl.count}{novel}")
+    return "\n".join(lines)
+
+
+def _last_green(summary: Summary) -> str:
+    compare = summary.last_green_compare
+    if compare is None:
+        return ""
+    lines = ["## vs last green logs"]
+    if not compare.available:
+        lines += ["", compare.skipped_reason or "last-green pipeline logs unavailable."]
+        return "\n".join(lines)
+    if compare.artifact_name:
+        lines += ["", f"Artifact `{compare.artifact_name}`."]
+    if compare.novel_templates:
+        lines += ["", "Novel on fail:"]
+        lines.extend(f"- `{item}`" for item in compare.novel_templates[:12])
+    if compare.missing_on_fail:
+        lines += ["", "Missing or depleted vs green:"]
+        lines.extend(f"- `{item}`" for item in compare.missing_on_fail[:8])
+    if (
+        not compare.novel_templates
+        and not compare.missing_on_fail
+        and not compare.present_on_green
+    ):
+        return ""
+    return "\n".join(lines)
+
+
+def _code_context(summary: Summary) -> str:
+    ctx = summary.code_context
+    if ctx is None:
+        return ""
+    if not ctx.hunks:
+        return ""
+    lines = ["## Code context"]
+    head = summary.run.head_sha or ""
+    ref = ctx.ref_sha or ""
+    if ctx.basis == "first_failing" and ref and head and not _sha_prefix_match(ref, head):
+        lines += [
+            "",
+            f"Code at first failing commit `{ref[:7]}` (not PR tip `{head[:7]}`)",
+        ]
+    elif ctx.basis == "head" and any(
+        "first_failing_sha unknown" in note for note in ctx.notes
+    ):
+        lines += ["", "first_failing_sha unknown; using head"]
+    if ctx.skipped_reason:
+        lines += ["", ctx.skipped_reason]
+    for hunk in ctx.hunks:
+        header = f"`{hunk.path}` L{hunk.start_line}–{hunk.end_line}"
+        if hunk.note:
+            header += f" — {hunk.note}"
+        if not hunk.content:
+            lines += ["", header]
+            continue
+        lines += ["", header, "", "```text", hunk.content, "```"]
     return "\n".join(lines)
 
 

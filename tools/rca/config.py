@@ -19,6 +19,7 @@ SCHEMA_VERSION = "1.0"
 MASKING_CONFIG_VERSION = "1"
 
 TOKEN_BUDGET_TOTAL = 6000
+TOKEN_BUDGET_ANALYZE = 2500
 SECTION_TOKEN_CAPS: dict[str, int] = {
     "metadata": 300,
     "step_table": 250,
@@ -30,11 +31,38 @@ SECTION_TOKEN_CAPS: dict[str, int] = {
     "junit": 800,
     "change_context": 900,
     "history": 200,
+    "pipeline_logs": 1000,
+    "code_context": 400,
+    "last_green_compare": 200,
 }
 
 MAX_FAILED_JOBS_ANALYSED = 3
 QUEUE_SECONDS_THRESHOLD = 300
 ARTIFACT_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024
+MAX_PIPELINE_LOG_ARTIFACTS = 3
+PIPELINE_STREAM_MAX_LINES = 20_000
+PIPELINE_STREAM_MAX_BYTES = 2 * 1024 * 1024
+CODE_HUNK_RADIUS = 25
+CODE_HUNK_MAX_LINES = 80
+CODE_HUNK_MAX_FILES = 3
+
+# Case-insensitive artifact names. Stage group is optional.
+PIPELINE_ARTIFACT_NAME_RE = (
+    r"^(?:pipelines?[-_]logs?(?:[-_](?P<stage>build|unit-tests?|tests?|"
+    r"integration|e2e|lint|compile|package))?|docker-logs|container-logs)$"
+)
+PIPELINE_STAGE_MAP: dict[str, str] = {
+    "build": "build",
+    "compile": "build",
+    "package": "build",
+    "unit-test": "test",
+    "unit-tests": "test",
+    "test": "test",
+    "tests": "test",
+    "integration": "e2e",
+    "e2e": "e2e",
+    "lint": "lint",
+}
 RATE_LIMIT_OPTIONAL_FLOOR = 50
 PR_BODY_EXCERPT_CHARS = 500
 MAX_COMMITS = 10
@@ -50,7 +78,7 @@ STGPT_CLIENT_APP_NAME = "gtrd_srmtdpplm"
 STGPT_SERVICE = "chat"
 STGPT_VERSION = "1.0"
 PERSONAS = ("trinity_for_api", "alfred_for_api")
-PROMPT_VERSION = "p2.1"
+PROMPT_VERSION = "p2.2"
 
 
 def _strip_env(*names: str) -> str | None:
@@ -119,6 +147,8 @@ CLASSIFY_RULES: list[ClassifyRule] = [
     {"category": "oom", "pattern": r"Killed process", "confidence": "high"},
     {"category": "oom", "pattern": r"signal: killed", "confidence": "high"},
     {"category": "oom", "pattern": r"JavaScript heap out of memory", "confidence": "high"},
+    {"category": "oom", "pattern": r"heap out of memory", "confidence": "high"},
+    {"category": "oom", "pattern": r"Cannot allocate memory", "confidence": "high"},
     {"category": "oom", "pattern": r"MemoryError", "confidence": "high"},
     {"category": "oom", "pattern": r"exit code 137", "confidence": "high"},
     {"category": "timeout", "pattern": r"timed out", "confidence": "medium"},
@@ -140,6 +170,8 @@ CLASSIFY_RULES: list[ClassifyRule] = [
     {"category": "dependency", "pattern": r"ERESOLVE", "confidence": "high"},
     {"category": "dependency", "pattern": r"Could not resolve dependency", "confidence": "high"},
     {"category": "dependency", "pattern": r"ModuleNotFoundError", "confidence": "high"},
+    {"category": "dependency", "pattern": r"ResolutionImpossible", "confidence": "high"},
+    {"category": "dependency", "pattern": r"Cannot find module", "confidence": "high"},
     {"category": "dependency", "pattern": r"go: .* not found", "confidence": "high"},
     {"category": "dependency", "pattern": r"Could not find artifact", "confidence": "high"},
     {
@@ -206,6 +238,15 @@ __all__ = [
     "RUNNER_FAILURE_PATTERNS",
     "SCHEMA_VERSION",
     "SECTION_TOKEN_CAPS",
+    "TOKEN_BUDGET_ANALYZE",
+    "MAX_PIPELINE_LOG_ARTIFACTS",
+    "PIPELINE_ARTIFACT_NAME_RE",
+    "PIPELINE_STAGE_MAP",
+    "PIPELINE_STREAM_MAX_BYTES",
+    "PIPELINE_STREAM_MAX_LINES",
+    "CODE_HUNK_MAX_FILES",
+    "CODE_HUNK_MAX_LINES",
+    "CODE_HUNK_RADIUS",
     "STGPT_API_URL",
     "STGPT_CLIENT_APP_NAME",
     "STGPT_SERVICE",

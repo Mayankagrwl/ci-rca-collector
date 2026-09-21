@@ -1,0 +1,14 @@
+{
+  "artifacts": [
+    {
+      "name": "pipeline-logs-build",
+      "size_in_bytes": 476,
+      "expired": false
+    },
+    {
+      "name": "docker-logs",
+      "size_in_bytes": 253,
+      "expired": false
+    }
+  ]
+}

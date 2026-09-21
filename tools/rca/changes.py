@@ -179,6 +179,7 @@ def change_context_from_compare(
         deletions=deletions,
         diffstat=diffstat,
         classes=classes,
+        files=paths[:80],
         lockfile_deltas=lockfile_deltas,
         stack_trace_diffs=stack_diffs,
     )
@@ -223,13 +224,22 @@ def _commit_info(item: Mapping[str, Any]) -> CommitInfo:
         authored_at = isoparse("1970-01-01T00:00:00Z")
     parents = item.get("parents") or []
     files = item.get("files")
-    files_changed = len(files) if isinstance(files, list) else 0
+    file_names: list[str] = []
+    files_changed = 0
+    if isinstance(files, list):
+        files_changed = len(files)
+        for entry in files:
+            if isinstance(entry, Mapping) and entry.get("filename"):
+                file_names.append(str(entry["filename"]))
+            elif isinstance(entry, str) and entry:
+                file_names.append(entry)
     return CommitInfo(
         sha=sha,
         subject=subject,
         author=author,
         authored_at=authored_at,
         files_changed=files_changed,
+        files=file_names,
         is_revert=is_revert(subject, message),
         is_merge=isinstance(parents, list) and len(parents) > 1,
     )

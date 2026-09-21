@@ -11,6 +11,8 @@ _MODULES = (
     "budget.py",
     "redact.py",
     "history.py",
+    "diagnose.py",
+    "pipeline_logs.py",
 )
 
 

@@ -112,6 +112,33 @@ def fingerprint_coarse(template: str | None) -> str:
     return hashlib.sha256(template.encode("utf-8")).hexdigest()[:16]
 
 
+def merge_fingerprint_inputs(
+    *groups: Sequence[LogTemplate],
+    available: bool = False,
+) -> tuple[str, str, list[str]]:
+    """Fine hash of T1/T2 (or T3) template strings; coarse is the first T1."""
+    hash_input: list[str] = []
+    t1: str | None = None
+    for templates in groups:
+        if not templates:
+            continue
+        hash_input.extend(_fingerprint_inputs(templates, available))
+        if t1 is None:
+            t1 = next((item.template for item in templates if item.tier == "T1"), None)
+    unique = list(dict.fromkeys(hash_input))
+    if t1 is None:
+        for templates in groups:
+            t1 = next((item.template for item in templates if item.tier == "T3"), None)
+            if t1:
+                break
+    if t1 is None:
+        for templates in groups:
+            if templates:
+                t1 = templates[0].template
+                break
+    return fingerprint_fine(unique), fingerprint_coarse(t1), unique
+
+
 def persistence_filename(key: str) -> str:
     safe = re.sub(r"[^\w.-]+", "_", key).strip("_") or "default"
     return f"{safe}.bin"
@@ -196,6 +223,34 @@ def train(
     return resolved
 
 
+def novelty_in_memory(
+    fail_lines: Sequence[str],
+    *,
+    green_lines: Sequence[str] | None = None,
+    config_path: str | Path | None = None,
+) -> NoveltyResult:
+    """Cluster fail lines in memory. Optional green training is not persisted."""
+    ini = str(config_path or default_config_path())
+    miner = TemplateMiner(None, _load_config(ini))
+    baseline_counts: dict[str, int] = {}
+    available = bool(green_lines)
+    if green_lines:
+        for line in green_lines:
+            if str(line).strip():
+                miner.add_log_message(line)
+        baseline_counts = {
+            cluster.get_template(): int(cluster.size) for cluster in miner.drain.clusters
+        }
+    return _novelty_from_miner(
+        miner,
+        fail_lines,
+        baseline_counts=baseline_counts,
+        available=available,
+        ini=ini,
+        fallback_file=None,
+    )
+
+
 def novelty(
     lines: Sequence[str],
     key: str,
@@ -215,6 +270,25 @@ def novelty(
         baseline_counts = {
             cluster.get_template(): int(cluster.size) for cluster in miner.drain.clusters
         }
+    return _novelty_from_miner(
+        miner,
+        lines,
+        baseline_counts=baseline_counts,
+        available=available,
+        ini=ini,
+        fallback_file=fallback_file,
+    )
+
+
+def _novelty_from_miner(
+    miner: TemplateMiner,
+    lines: Sequence[str],
+    *,
+    baseline_counts: dict[str, int],
+    available: bool,
+    ini: str,
+    fallback_file: str | None,
+) -> NoveltyResult:
     tallies: dict[str, dict[str, Any]] = {}
     for index, line in enumerate(lines, start=1):
         if not str(line).strip():
