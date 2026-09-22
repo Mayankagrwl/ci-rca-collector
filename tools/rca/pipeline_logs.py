@@ -13,6 +13,7 @@ from .config import (
     ARTIFACT_DOWNLOAD_MAX_BYTES,
     MAX_PIPELINE_LOG_ARTIFACTS,
     PIPELINE_ARTIFACT_NAME_RE,
+    PIPELINE_PHASE_TOKENS,
     PIPELINE_STAGE_MAP,
     PIPELINE_STREAM_MAX_BYTES,
     PIPELINE_STREAM_MAX_LINES,
@@ -60,6 +61,28 @@ _SKIP_SUFFIXES = {
     ".pb",
 }
 _STAGE_PRIORITY = {"build": 0, "test": 1, "e2e": 2, "lint": 3}
+_PHASE_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def pipeline_phase(file_name: str | None, artifact_name: str | None = None) -> str | None:
+    """Coarse phase of a docker sub-step log from its file (then artifact) name.
+
+    setup / teardown when a known token appears, "run" for any other named
+    stream, None for an empty/odd name. Pure string work; never raises.
+    """
+    for candidate in (file_name, artifact_name):
+        base = (candidate or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if "." in base:
+            base = base.rsplit(".", 1)[0]
+        tokens = [token for token in _PHASE_SPLIT.split(base) if token]
+        if not tokens:
+            continue
+        for token in tokens:
+            phase = PIPELINE_PHASE_TOKENS.get(token)
+            if phase:
+                return phase
+        return "run"
+    return None
 
 
 def match_pipeline_artifact_name(name: str) -> tuple[str, str | None] | None:
@@ -90,11 +113,12 @@ def rank_pipeline_artifacts(
 ) -> list[str]:
     """Failed-stage first, then build/test/e2e/lint, then name."""
 
-    def _key(name: str) -> tuple[int, int, str]:
+    def _key(name: str) -> tuple[int, int, int, str]:
         matched = match_pipeline_artifact_name(name)
         stage = matched[1] if matched else None
+        teardown = 1 if pipeline_phase(name) == "teardown" else 0
         preferred = 0 if failed_stage and stage == failed_stage else 1
-        return (preferred, _STAGE_PRIORITY.get(stage or "", 9), name.lower())
+        return (teardown, preferred, _STAGE_PRIORITY.get(stage or "", 9), name.lower())
 
     matched = [name for name in names if match_pipeline_artifact_name(name)]
     return sorted(matched, key=_key)
@@ -175,10 +199,13 @@ def _stream_from_text(
     extracted = extract_from_lines(cleaned)
     novelty = novelty_in_memory(cleaned)
     templates = _drain_subset(novelty.report.templates)
+    step_name = file.replace("\\", "/").rsplit("/", 1)[-1] or None
     return PipelineLogStream(
         artifact_name=artifact_name,
         stage=stage,
         file=file,
+        phase=pipeline_phase(file, artifact_name),
+        step_name=step_name,
         windows=extracted.windows,
         error_lines=extracted.error_lines[:50],
         stack_traces=extracted.stack_traces,

@@ -14,7 +14,12 @@ from .classify import (
     classify_lines,
     classify_union,
 )
-from .config import CLASSIFY_RULES, RUNNER_FAILURE_PATTERNS
+from .config import (
+    CLASSIFY_RULES,
+    RUNNER_FAILURE_PATTERNS,
+    SYMPTOM_PATTERNS,
+    TERMINAL_CAUSE_PATTERNS,
+)
 from .extract import extract_source_paths
 from .models import (
     ChangeContext,
@@ -156,6 +161,8 @@ _IMAGE_OR_WORKFLOW_RE = re.compile(
     re.IGNORECASE,
 )
 _RUNNER_RES = [re.compile(p, re.IGNORECASE) for p in RUNNER_FAILURE_PATTERNS]
+_TERMINAL_CAUSE_RES = [re.compile(p, re.IGNORECASE) for p in TERMINAL_CAUSE_PATTERNS]
+_SYMPTOM_RES = [re.compile(p, re.IGNORECASE) for p in SYMPTOM_PATTERNS]
 _RULE_RES = [
     (rule["category"], re.compile(rule["pattern"], re.IGNORECASE), rule["confidence"])
     for rule in CLASSIFY_RULES
@@ -357,8 +364,52 @@ def _error_from_workflow(summary: Summary) -> bool:
     return False
 
 
+def terminal_cause_present(summary: Summary) -> bool:
+    """True when the failed step's anchor holds a line that alone explains the exit.
+
+    Anchor = primary_failure_line + failed_step_excerpt + first-error window of
+    the primary failed job (Step 2 helper). Never raises.
+    """
+    from .prompt import failed_step_anchor_text
+
+    try:
+        anchor = failed_step_anchor_text(summary)
+    except Exception:  # noqa: BLE001 — cause selection must not crash
+        return False
+    if not anchor:
+        return False
+    return any(rx.search(anchor) for rx in _TERMINAL_CAUSE_RES)
+
+
+def _line_is_symptom(line: str) -> bool:
+    return any(rx.search(line) for rx in _SYMPTOM_RES)
+
+
+def _line_is_terminal(line: str) -> bool:
+    return any(rx.search(line) for rx in _TERMINAL_CAUSE_RES)
+
+
+def _stream_is_teardown(stream: PipelineLogStream) -> bool:
+    return getattr(stream, "phase", None) == "teardown"
+
+
+def _drop_symptom_lines(lines: Sequence[str]) -> list[str]:
+    """Remove follow-on symptom lines, but never the terminal-cause line itself."""
+    return [
+        line
+        for line in lines
+        if not (_line_is_symptom(line) and not _line_is_terminal(line))
+    ]
+
+
 def specific_log_cause(summary: Summary) -> str | None:
-    """First log line that names a concrete cause (already-exists, ERESOLVE, TS, JUnit)."""
+    """First log line that names a concrete cause (already-exists, ERESOLVE, TS, JUnit).
+
+    When a terminal cause is present at the failed step, teardown-phase pipeline
+    streams and follow-on symptom lines are dropped from selection (never the
+    terminal-cause line itself).
+    """
+    terminal = terminal_cause_present(summary)
     candidates: list[str] = []
     for job in summary.failed_jobs:
         for err in job.error_lines:
@@ -368,6 +419,8 @@ def specific_log_cause(summary: Summary) -> str | None:
             if window.label in {"first_error", "merged"} and window.content:
                 candidates.extend(window.content.splitlines())
     for stream in summary.pipeline_logs:
+        if terminal and _stream_is_teardown(stream):
+            continue
         for err in stream.error_lines:
             if err.text:
                 candidates.append(err.text)
@@ -383,7 +436,11 @@ def specific_log_cause(summary: Summary) -> str | None:
                 candidates.append(blob)
     for raw in candidates:
         line = (raw or "").strip()
-        if line and _SPECIFIC_CAUSE_RE.search(line):
+        if not line:
+            continue
+        if terminal and _line_is_symptom(line) and not _line_is_terminal(line):
+            continue
+        if _SPECIFIC_CAUSE_RE.search(line):
             return line[:240]
     return None
 
@@ -559,12 +616,19 @@ def enrich_display(summary: Summary, verdict: DeterministicVerdict) -> Determini
 
 
 def display_citation_quotes(summary: Summary, *, extra: str | None = None) -> list[str]:
-    """Quotes already present on the summary; never invent file paths."""
+    """Quotes already present on the summary; never invent file paths.
+
+    With a terminal cause at the failed step, teardown streams and follow-on
+    symptom lines are excluded so a symptom can never be cited as the cause.
+    """
+    terminal = terminal_cause_present(summary)
     quotes: list[str] = []
 
     def _add(text: str | None) -> None:
         item = (text or "").strip()
         if not item or item in quotes:
+            return
+        if terminal and _line_is_symptom(item) and not _line_is_terminal(item):
             return
         quotes.append(item[:240])
 
@@ -583,6 +647,8 @@ def display_citation_quotes(summary: Summary, *, extra: str | None = None) -> li
                 _add(line)
                 break
     for stream in summary.pipeline_logs:
+        if terminal and _stream_is_teardown(stream):
+            continue
         for window in stream.windows:
             if window.content:
                 line = next((ln for ln in window.content.splitlines() if ln.strip()), "")
@@ -610,6 +676,9 @@ def refine_blast_radius(
     A high-confidence classify signature is the cause. ci_config/lockfile in
     changes.classes is a hint unless the error line is a workflow/action file.
     """
+    if terminal_cause_present(summary):
+        # A terminal cause at the failed step outranks any blast-radius rewrite.
+        return verdict
     if verdict.category in SIGNATURE_CATEGORIES and not _error_from_workflow(summary):
         return verdict
     if not is_blast_radius_skip(summary):
@@ -1204,6 +1273,9 @@ def _rule_last_green(summary: Summary) -> DeterministicVerdict | None:
 
 
 def _rule_config_only(summary: Summary, hit: ClassificationHit) -> DeterministicVerdict | None:
+    if terminal_cause_present(summary):
+        # Do not let the generic "workflow changed" rule outrank a terminal cause.
+        return None
     if hit.confidence == "high" and hit.category in SIGNATURE_CATEGORIES:
         if not _error_from_workflow(summary):
             return None
@@ -1332,7 +1404,11 @@ def _rule_r18(
 ) -> DeterministicVerdict:
     files = list(dict.fromkeys(path for path, _line in files_from_logs))
     classes = set((summary.changes.classes if summary.changes else []) or [])
-    if classes and classes <= (_CONFIG_ONLY | {"build_config"}):
+    if (
+        not terminal_cause_present(summary)
+        and classes
+        and classes <= (_CONFIG_ONLY | {"build_config"})
+    ):
         return _v(
             "R14",
             "The CI workflow or action definition changed in this range and the job failed.",
@@ -1355,9 +1431,15 @@ def _rule_r18(
 
 
 def _union_hit(summary: Summary, *, ignore_job: bool) -> ClassificationHit:
+    terminal = terminal_cause_present(summary)
     streams: list[tuple[str, list[str]]] = []
     for stream in _sorted_pipeline_streams(summary):
-        streams.append((_stream_id(stream), _stream_lines(stream)))
+        if terminal and _stream_is_teardown(stream):
+            continue
+        lines = _stream_lines(stream)
+        if terminal:
+            lines = _drop_symptom_lines(lines)
+        streams.append((_stream_id(stream), lines))
     if not ignore_job:
         for job in summary.failed_jobs:
             streams.append((_job_stream_id(job), _job_lines(job)))
@@ -1380,15 +1462,21 @@ def _union_hit(summary: Summary, *, ignore_job: bool) -> ClassificationHit:
 
 
 def _sorted_pipeline_streams(summary: Summary) -> list[PipelineLogStream]:
+    """Failed stage first, then build/test/e2e/lint; teardown streams last.
+
+    Teardown streams are the classic source of follow-on permission/exit-0 noise,
+    so they sort below the failed stage everywhere streams are ordered.
+    """
     failed = None
     if summary.failed_jobs:
         failed = _stage_from_step(summary.failed_jobs[0].failed_step_name)
     order = {"build": 0, "test": 1, "e2e": 2, "lint": 3}
 
-    def _key(stream: PipelineLogStream) -> tuple[int, int, str]:
+    def _key(stream: PipelineLogStream) -> tuple[int, int, int, str]:
         stage = stream.stage
+        teardown = 1 if _stream_is_teardown(stream) else 0
         preferred = 0 if failed and stage == failed else 1
-        return (preferred, order.get(stage or "", 9), stream.file)
+        return (teardown, preferred, order.get(stage or "", 9), stream.file)
 
     return sorted(summary.pipeline_logs, key=_key)
 

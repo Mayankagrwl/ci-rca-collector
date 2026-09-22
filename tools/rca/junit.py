@@ -19,6 +19,35 @@ _JUNIT_ARTIFACT_NAME = re.compile(
 _BODY_LINES = 20
 
 
+def _normalized_message(failure: JUnitFailure) -> str:
+    """Whitespace-normalized message (or first body line) for collapse grouping."""
+    text = (failure.message or "").strip()
+    if not text and failure.body:
+        first = next((ln for ln in failure.body.splitlines() if ln.strip()), "")
+        text = first
+    normalized = " ".join(text.split()).lower()
+    # No shared message → keep distinct by test identity, never collapse together.
+    return normalized or f"{failure.classname}::{failure.name}"
+
+
+def collapse_failures(failures: Sequence[JUnitFailure]) -> list[JUnitFailure]:
+    """Collapse failures sharing a normalized message; keep one rep with a count.
+
+    Order and distinct messages are preserved; existing ``count`` values are
+    summed so this is idempotent across ``merge_junit_reports``.
+    """
+    groups: dict[str, JUnitFailure] = {}
+    order: list[str] = []
+    for failure in failures:
+        key = _normalized_message(failure)
+        if key not in groups:
+            groups[key] = failure.model_copy(update={"count": failure.count or 1})
+            order.append(key)
+        else:
+            groups[key].count += failure.count or 1
+    return [groups[key] for key in order]
+
+
 def artifact_looks_like_junit(name: str) -> bool:
     return bool(_JUNIT_ARTIFACT_NAME.search(name or ""))
 
@@ -72,10 +101,11 @@ def parse_junit_xml(text: str, *, source_artifact: str | None = None) -> JUnitRe
         total_failures = len(failures)
     if total_tests == 0:
         total_tests = len(failures)
+    collapsed = collapse_failures(failures)
     return JUnitReport(
         total_failures=total_failures,
         total_tests=total_tests or None,
-        failures=failures[:JUNIT_FAILURE_CAP],
+        failures=collapsed[:JUNIT_FAILURE_CAP],
         source_artifact=source_artifact,
     )
 
@@ -110,10 +140,11 @@ def merge_junit_reports(reports: Sequence[JUnitReport | None]) -> JUnitReport | 
         total_tests += report.total_tests or 0
         failures.extend(report.failures)
         source = source or report.source_artifact
+    collapsed = collapse_failures(failures)
     return JUnitReport(
         total_failures=total_failures,
         total_tests=total_tests or None,
-        failures=failures[:JUNIT_FAILURE_CAP],
+        failures=collapsed[:JUNIT_FAILURE_CAP],
         source_artifact=source,
     )
 

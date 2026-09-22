@@ -69,6 +69,7 @@ class Extracted:
     annotations: list[str] = field(default_factory=list)
     exit_code: int | None = None
     excerpt_lines: list[str] = field(default_factory=list)
+    primary_failure_line: str | None = None
 
 
 _SOURCE_PATHS = (
@@ -105,6 +106,40 @@ def extract_source_paths(text: str) -> list[tuple[str, int | None]]:
     return found
 
 
+def order_stack_traces_by_paths(
+    traces: list[StackTrace],
+    changed_paths: list[str],
+) -> list[StackTrace]:
+    """Stable-order traces so any naming a changed source path leads. No drops.
+
+    Source-agnostic: ``changed_paths`` is a plain list (the collect layer passes
+    ``changes.files``). Relevance is a lenient path match against the paths the
+    trace text mentions.
+    """
+    if not traces or not changed_paths:
+        return list(traces)
+    changed = [p.replace("\\", "/").strip() for p in changed_paths if p]
+
+    def _touches_changed(trace: StackTrace) -> bool:
+        text = f"{trace.headline or ''}\n{trace.content or ''}"
+        for path, _line in extract_source_paths(text):
+            tp = path.strip()
+            tp_base = tp.rsplit("/", 1)[-1]
+            for cp in changed:
+                cp_base = cp.rsplit("/", 1)[-1]
+                if tp == cp or tp.endswith("/" + cp) or cp.endswith("/" + tp):
+                    return True
+                if tp_base and tp_base == cp_base:
+                    return True
+        return False
+
+    relevant: list[StackTrace] = []
+    others: list[StackTrace] = []
+    for trace in traces:
+        (relevant if _touches_changed(trace) else others).append(trace)
+    return relevant + others
+
+
 def parse_exit_code(text: str | list[str]) -> int | None:
     blob = text if isinstance(text, str) else "\n".join(text)
     match = _EXIT_CODE.search(blob)
@@ -118,16 +153,23 @@ def extract_from_lines(
     *,
     failed_step_name: str | None = None,
 ) -> Extracted:
-    """Operate on cleaned logical records. No GitHub API calls."""
-    error_lines = _error_lines(lines)
+    """Operate on cleaned logical records. No GitHub API calls.
+
+    When ``failed_step_name`` resolves to a GitHub log group, the first-error
+    window, the error-line scan, and ``primary_failure_line`` are anchored
+    inside that group; otherwise they fall back to whole-log behaviour.
+    """
+    lo, hi = _failed_group_bounds(lines, failed_step_name)
+    error_lines = _error_lines(lines, lo, hi)
     annotations = [
         line.strip()
         for line in _flatten(lines)
         if "##[error]" in line
     ]
-    windows = _windows(lines)
+    windows = _windows(lines, lo=lo, hi=hi)
     stacks = _stack_traces(lines)
     excerpt = failed_step_excerpt_lines(lines, step_name=failed_step_name)
+    primary = _primary_failure_line(lines, lo, hi)
     return Extracted(
         windows=windows,
         stack_traces=stacks,
@@ -135,7 +177,37 @@ def extract_from_lines(
         annotations=annotations,
         exit_code=parse_exit_code(lines),
         excerpt_lines=excerpt,
+        primary_failure_line=primary,
     )
+
+
+def _failed_group_bounds(
+    lines: list[str],
+    failed_step_name: str | None,
+) -> tuple[int, int]:
+    """Bounds of the GitHub failed-step group, or the whole log if none resolves.
+
+    Only anchors when GitHub named a failed step; with no step name we keep
+    today's whole-log behaviour. When a step name is present, the group is
+    resolved against the same stripped view ``failed_step_excerpt_lines`` uses,
+    so the window/error-line/primary-line anchoring agrees with the excerpt.
+    """
+    if not (failed_step_name or "").strip():
+        return 0, len(lines)
+    stripped = [_strip_ts(record.split("\n", 1)[0]) for record in lines]
+    group = _pick_failed_group(stripped, failed_step_name)
+    if group is not None:
+        return group
+    return 0, len(lines)
+
+
+def _primary_failure_line(lines: list[str], lo: int, hi: int) -> str | None:
+    """First cause line inside [lo:hi]: semantic, then error window, then grep."""
+    for pattern in (_SEMANTIC_CAUSE, _WINDOW_ERROR, ERROR_LINE):
+        for index in range(lo, hi):
+            if pattern.search(lines[index]):
+                return _strip_ts(lines[index].split("\n", 1)[0]).strip() or None
+    return None
 
 
 def _flatten(lines: list[str]) -> list[str]:
@@ -145,12 +217,18 @@ def _flatten(lines: list[str]) -> list[str]:
     return out
 
 
-def _error_lines(lines: list[str]) -> list[ErrorLine]:
+def _error_lines(
+    lines: list[str],
+    lo: int = 0,
+    hi: int | None = None,
+) -> list[ErrorLine]:
+    hi = len(lines) if hi is None else hi
     found: list[ErrorLine] = []
-    for number, record in enumerate(lines, start=1):
+    for index in range(lo, hi):
+        record = lines[index]
         if ERROR_LINE.search(record) or _SEMANTIC_CAUSE.search(record):
             text = record.split("\n", 1)[0]
-            found.append(ErrorLine(line_number=number, text=text))
+            found.append(ErrorLine(line_number=index + 1, text=text))
     return found
 
 
@@ -173,18 +251,24 @@ def _skip_script_preamble(lines: list[str]) -> int:
     return 0
 
 
-def _first_error_index(lines: list[str]) -> int | None:
-    start = _skip_script_preamble(lines)
-    for index in range(start, len(lines)):
+def _first_error_index(
+    lines: list[str],
+    lo: int = 0,
+    hi: int | None = None,
+) -> int | None:
+    """Absolute index of the first-error anchor, optionally scoped to [lo:hi]."""
+    hi = len(lines) if hi is None else hi
+    start = lo + _skip_script_preamble(lines[lo:hi])
+    for index in range(start, hi):
         if _SEMANTIC_CAUSE.search(lines[index]):
             return index
-    for index in range(start, len(lines)):
+    for index in range(start, hi):
         if _WINDOW_ERROR.search(lines[index]):
             return index
-    for index in range(start, len(lines)):
+    for index in range(start, hi):
         if ERROR_LINE.search(lines[index]):
             return index
-    for index in range(start, len(lines)):
+    for index in range(start, hi):
         if _EXIT_CODE.search(lines[index]):
             for back in range(index, start - 1, -1):
                 if _SEMANTIC_CAUSE.search(lines[back]) or ERROR_LINE.search(lines[back]):
@@ -269,11 +353,17 @@ def _github_groups(lines: list[str]) -> list[tuple[str, int, int]]:
     return groups
 
 
-def _windows(lines: list[str]) -> list[LogWindow]:
+def _windows(
+    lines: list[str],
+    *,
+    lo: int = 0,
+    hi: int | None = None,
+) -> list[LogWindow]:
     if not lines:
         return []
     total = len(lines)
-    error_index = _first_error_index(lines)
+    # first_error is anchored inside the failed-step group; tail stays whole-log.
+    error_index = _first_error_index(lines, lo, hi)
     first: LogWindow | None = None
     if error_index is not None:
         start = max(1, error_index + 1 - FIRST_ERROR_CONTEXT_LINES)

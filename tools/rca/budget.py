@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from .config import SECTION_TOKEN_CAPS, TOKEN_BUDGET_TOTAL
+from .extract import _first_error_index
 from .models import BudgetReport, LogWindow, StackTrace, Summary
 
 _MIDDLE = "\n… middle elided …\n"
+_ELIDED = "… elided …"
 
 
 def token_count(text: str) -> int:
@@ -25,6 +27,54 @@ def trim_middle(text: str, cap_tokens: int) -> tuple[str, bool, int, int]:
     return trimmed, True, before, token_count(trimmed)
 
 
+def trim_around(
+    text: str,
+    cap_tokens: int,
+    *,
+    anchor_index: int | None = None,
+) -> tuple[str, bool, int, int]:
+    """Keep a cap-sized band of lines centered on the error anchor.
+
+    For a first_error / merged window the causal line can sit in the middle,
+    where head+tail trimming would drop it. This keeps the lines around the
+    anchor instead. Falls back to ``trim_middle`` when no anchor is found.
+    Returns (text, trimmed, before, after). Source-agnostic.
+    """
+    before = token_count(text)
+    if cap_tokens <= 0 or before <= cap_tokens:
+        return text, False, before, before
+    lines = text.split("\n")
+    if anchor_index is None:
+        anchor_index = _first_error_index(lines)
+    if anchor_index is None or not 0 <= anchor_index < len(lines):
+        return trim_middle(text, cap_tokens)
+
+    keep_chars = cap_tokens * 4
+    lo = hi = anchor_index
+    size = len(lines[anchor_index])
+    while True:
+        grew = False
+        if hi + 1 < len(lines) and size + 1 + len(lines[hi + 1]) <= keep_chars:
+            hi += 1
+            size += 1 + len(lines[hi])
+            grew = True
+        if lo - 1 >= 0 and size + 1 + len(lines[lo - 1]) <= keep_chars:
+            lo -= 1
+            size += 1 + len(lines[lo])
+            grew = True
+        if not grew:
+            break
+
+    parts: list[str] = []
+    if lo > 0:
+        parts.append(_ELIDED)
+    parts.extend(lines[lo : hi + 1])
+    if hi + 1 < len(lines):
+        parts.append(_ELIDED)
+    trimmed = "\n".join(parts)
+    return trimmed, True, before, token_count(trimmed)
+
+
 def apply_budget(
     summary: Summary,
     *,
@@ -39,16 +89,20 @@ def apply_budget(
     for job in summary.failed_jobs:
         new_windows: list[LogWindow] = []
         for window in job.windows:
-            key = (
-                "tail_window"
-                if window.label == "tail"
-                else "first_error_window"
-            )
-            cap = caps.get(key, 1000)
-            content, trimmed, before, after = trim_middle(window.content, cap)
+            if window.label == "tail":
+                key = "tail_window"
+                cap = caps.get(key, 1000)
+                content, trimmed, before, after = trim_middle(window.content, cap)
+                elision = "middle elided"
+            else:
+                # first_error / merged: keep the band around the causal line.
+                key = "first_error_window"
+                cap = caps.get(key, 1000)
+                content, trimmed, before, after = trim_around(window.content, cap)
+                elision = "error-centered"
             if trimmed:
                 window.truncated = True
-                notes.append(f"{key} from {before} → {after} tokens (middle elided)")
+                notes.append(f"{key} from {before} → {after} tokens ({elision})")
             window.content = content
             section_used[key] = section_used.get(key, 0) + after
             new_windows.append(window)
@@ -83,11 +137,16 @@ def apply_budget(
     for stream in summary.pipeline_logs:
         new_windows = []
         for window in stream.windows:
-            content, trimmed, before, after = trim_middle(window.content, pipe_cap)
+            if window.label in {"first_error", "merged"}:
+                content, trimmed, before, after = trim_around(window.content, pipe_cap)
+                elision = "error-centered"
+            else:
+                content, trimmed, before, after = trim_middle(window.content, pipe_cap)
+                elision = "middle elided"
             if trimmed:
                 window.truncated = True
                 notes.append(
-                    f"pipeline_logs from {before} → {after} tokens (middle elided)"
+                    f"pipeline_logs from {before} → {after} tokens ({elision})"
                 )
             window.content = content
             section_used["pipeline_logs"] = section_used.get("pipeline_logs", 0) + after

@@ -69,6 +69,53 @@ RATE_LIMIT_OPTIONAL_FLOOR = 50
 PR_BODY_EXCERPT_CHARS = 500
 MAX_COMMITS = 10
 JUNIT_FAILURE_CAP = 5
+# Max JUnit failures packed into the analyze evidence pack (Step 6).
+JUNIT_EVIDENCE_CAP = 3
+
+# Category-aware evidence ordering (Step 6). Each value is an ordered list of
+# section keys build_evidence packs; primary_failure_line + failed_step_excerpt
+# stay mandatory and first in every profile. Unlisted categories use the default
+# (the "unknown / residual" full set), which is where the model needs the most.
+_EVIDENCE_CODE = [
+    "primary_failure_line",
+    "failed_step_excerpt",
+    "first_error_window",
+    "stack_traces",
+    "junit",
+    "code_context",
+    "deterministic_hint",
+    "log_templates",
+    "pipeline_logs",
+    "change_context",
+]
+_EVIDENCE_DEPENDENCY = [
+    "primary_failure_line",
+    "failed_step_excerpt",
+    "first_error_window",
+    "deterministic_hint",
+    "change_context",
+    "log_templates",
+]
+_EVIDENCE_INFRA = [
+    "primary_failure_line",
+    "failed_step_excerpt",
+    "first_error_window",
+    "deterministic_hint",
+]
+EVIDENCE_PROFILE_DEFAULT: list[str] = list(_EVIDENCE_CODE)
+EVIDENCE_PROFILES: dict[str, list[str]] = {
+    "compile": list(_EVIDENCE_CODE),
+    "crash": list(_EVIDENCE_CODE),
+    "test_failure": list(_EVIDENCE_CODE),
+    "dependency": list(_EVIDENCE_DEPENDENCY),
+    "oom": list(_EVIDENCE_INFRA),
+    "timeout": list(_EVIDENCE_INFRA),
+    "disk_space": list(_EVIDENCE_INFRA),
+    "image_pull": list(_EVIDENCE_INFRA),
+    "auth": list(_EVIDENCE_INFRA),
+    "network_dns": list(_EVIDENCE_INFRA),
+    "infra_runner": list(_EVIDENCE_INFRA),
+}
 FIRST_ERROR_CONTEXT_LINES = 30
 TAIL_WINDOW_LINES = 150
 STACK_TRACE_TOP_FRAMES = 10
@@ -119,6 +166,65 @@ def resolve_stgpt_client_app_name(explicit: str | None = None) -> str:
     if explicit and explicit.strip():
         return explicit.strip()
     return _strip_env("STGPT_CLIENT_APP_NAME", "CLIENT_APP_NAME") or STGPT_CLIENT_APP_NAME
+
+
+# Case-insensitive regex tables driving Step 3 terminal-cause / symptom demotion.
+# Extend by editing these lists, never by branching in code.
+#
+# TERMINAL_CAUSE_PATTERNS: a line that ALONE explains the exit. Seeded as a
+# superset of extract._SEMANTIC_CAUSE and diagnose._SPECIFIC_CAUSE_RE markers
+# (kept working there) plus quality-gate / compile / dependency shapes.
+TERMINAL_CAUSE_PATTERNS: list[str] = [
+    r"already exists",
+    r"version exists",
+    r"must update",
+    r"you need to update",
+    r"artifactory",
+    r"ERESOLVE",
+    r"No matching distribution",
+    r"Could not find a version",
+    r"ModuleNotFoundError",
+    r"Cannot find module",
+    r"error TS\d+",
+    r"cannot find symbol",
+    r"AssertionError",
+    r"\bFAILED\s+\S+",
+    r"ENOSPC",
+    r"quality gate (?:failed|not passed)",
+    r"coverage .*(?:below|threshold|did not meet)",
+]
+
+# SYMPTOM_PATTERNS: follow-on lines that must never be the root cause when a
+# terminal cause precedes them (permission-to-delete/overwrite, 401/403 on
+# upload, connection reset during teardown, cleanup / container-stop noise).
+SYMPTOM_PATTERNS: list[str] = [
+    r"not enough permissions to (?:delete|overwrite|update|remove)",
+    r"(?:401|403)\b.*(?:upload|push|publish|delete|overwrite)",
+    r"connection reset",
+    r"Post job cleanup",
+    r"Cleaning up orphan processes",
+    r"Terminate orphan process",
+    r"\bStopping\b",
+    r"exited with code 0",
+    r"Removing (?:network|container|volume)",
+]
+
+# Docker sub-step name tokens → coarse pipeline phase. Anything unmatched is
+# treated as "run"; an empty/odd name yields phase None (see pipeline_logs).
+PIPELINE_PHASE_TOKENS: dict[str, str] = {
+    "up": "setup",
+    "start": "setup",
+    "flyway": "setup",
+    "migrate": "setup",
+    "seed": "setup",
+    "init": "setup",
+    "down": "teardown",
+    "stop": "teardown",
+    "rm": "teardown",
+    "cleanup": "teardown",
+    "teardown": "teardown",
+    "prune": "teardown",
+}
 
 
 # Case-insensitive. Matched against the raw job log (Stage 1).
@@ -245,12 +351,18 @@ __all__ = [
     "FAILED_STEP_EXCERPT_LINES",
     "MAX_PIPELINE_LOG_ARTIFACTS",
     "PIPELINE_ARTIFACT_NAME_RE",
+    "PIPELINE_PHASE_TOKENS",
     "PIPELINE_STAGE_MAP",
+    "SYMPTOM_PATTERNS",
+    "TERMINAL_CAUSE_PATTERNS",
     "PIPELINE_STREAM_MAX_BYTES",
     "PIPELINE_STREAM_MAX_LINES",
     "CODE_HUNK_MAX_FILES",
     "CODE_HUNK_MAX_LINES",
     "CODE_HUNK_RADIUS",
+    "EVIDENCE_PROFILES",
+    "EVIDENCE_PROFILE_DEFAULT",
+    "JUNIT_EVIDENCE_CAP",
     "STGPT_API_URL",
     "STGPT_CLIENT_APP_NAME",
     "STGPT_SERVICE",

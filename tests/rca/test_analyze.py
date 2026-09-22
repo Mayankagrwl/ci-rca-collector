@@ -89,7 +89,7 @@ def test_requires_analysis_false_still_calls_model(tmp_path: Path) -> None:
     assert "ERESOLVE" in analysis["result"]["root_cause"]
     assert analysis["result"]["source"] in {"ai", "mixed"}
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "## AI diagnosis" in md
+    assert "## AI Diagnosis" in md
     assert "**Model called:** yes" in md
     assert "revert the pipeline edit" not in md.lower()
     assert list((tmp_path / "cache").glob("*.json"))
@@ -132,7 +132,7 @@ def test_missing_key_skips_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert analysis["result"]["suggested_fix"].strip()
     assert analysis["model_called"] is False
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "## AI diagnosis" in md
+    assert "## AI Diagnosis" in md
     assert "**Model called:** no" in md
     assert "missing_stgpt_key" in md
 
@@ -219,7 +219,7 @@ def test_job_summary_file_includes_ai_section_after_write(tmp_path: Path) -> Non
     )
     assert rc == 0
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "## AI diagnosis" in md
+    assert "## AI Diagnosis" in md
     assert "**Model called:** no" in md
     assert "**Root cause:**" in md
     assert "**Suggested fix:**" in md
@@ -227,7 +227,7 @@ def test_job_summary_file_includes_ai_section_after_write(tmp_path: Path) -> Non
     job_summary = tmp_path / "step_summary.md"
     job_summary.write_text(md, encoding="utf-8")
     text = job_summary.read_text(encoding="utf-8")
-    assert "## AI diagnosis" in text
+    assert "## AI Diagnosis" in text
     assert "**Model called:** no" in text
 
 
@@ -395,7 +395,7 @@ def test_r8_skip_has_root_cause_and_suggested_fix(tmp_path: Path) -> None:
     assert result["source"] == "deterministic"
     assert result["citations"]
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "## AI diagnosis" in md
+    assert "## AI Diagnosis" in md
     assert "**Root cause:**" in md
     assert result["root_cause"][:40] in md
     assert "**Suggested fix:**" in md
@@ -436,6 +436,10 @@ def test_cache_hit_skips_http(tmp_path: Path) -> None:
             "true",
             "--requires-analysis",
             "true",
+            # auto would skip this anchored signature; force the call to exercise
+            # the cache-hit path this test is about.
+            "--analyze-policy",
+            "always",
         ]
     )
     assert second == 0
@@ -486,7 +490,7 @@ def test_invented_citation_after_repair_unvalidated(tmp_path: Path) -> None:
     notes = " ".join(record.notes)
     assert _INVENTED in notes or _INVENTED in (record.raw_completion or "")
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "## AI diagnosis" in md
+    assert "## AI Diagnosis" in md
     assert "unvalidated" in md
 
 
@@ -541,7 +545,7 @@ def test_from_completion_fixture_cli(tmp_path: Path, monkeypatch) -> None:
     merged = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert merged["analysis"]["status"] == "ok"
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "## AI diagnosis" in md
+    assert "## AI Diagnosis" in md
     assert "Root cause" in md
     text = gh_out.read_text(encoding="utf-8")
     assert "analysis-status=ok\n" in text

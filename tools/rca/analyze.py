@@ -21,7 +21,12 @@ from .config import (
     resolve_stgpt_client_app_name,
 )
 from .models import AnalysisCitation, AnalysisRecord, AnalysisResult, Summary
-from .prompt import build_evidence, build_messages
+from .prompt import (
+    build_evidence,
+    build_messages,
+    failed_step_anchor_text,
+    focused_evidence,
+)
 from .redact import redact_text
 from .stgpt_client import (
     ChatResult,
@@ -138,6 +143,7 @@ def analyze_summary(
             client_app_name=client_app_name,
         )
         record = _run_personas(evidence, caller, base)
+        record = _apply_grounding_gate(summary, record, evidence, caller)
         redacted = redact_record(record)
         redacted = finalize_user_card(summary, redacted)
         if redacted.status == "ok":
@@ -224,6 +230,83 @@ def _contradicts_infra_flake(summary: Summary, result: AnalysisResult) -> bool:
         return False
     side = (result.infra_or_code or "").strip().lower()
     return side == "code"
+
+
+def is_grounded(result: AnalysisResult, anchor_text: str) -> bool:
+    """True iff any non-empty citation quote is a substring of the anchor text.
+
+    Judged by the quote text itself, not the model's self-reported ``source``.
+    """
+    if not anchor_text:
+        return False
+    for cite in result.citations:
+        quote = (cite.quote or "").strip()
+        if quote and quote in anchor_text:
+            return True
+    return False
+
+
+def _ask_once(
+    chat_fn: ChatFn,
+    persona: str,
+    evidence: str,
+) -> AnalysisResult | None:
+    """Single focused re-ask: one persona, one call. None unless it validates ok."""
+    notes: list[str] = []
+    messages = build_messages(evidence)
+    chat = _call_chat(chat_fn, persona, messages, notes)
+    if chat is None or not _is_2xx(chat.status_code):
+        return None
+    if bridge_error_message(chat.body):
+        return None
+    completion = chat.completion
+    if not (isinstance(completion, str) and completion.strip()):
+        return None
+    outcome = _interpret_completion(completion, evidence)
+    if outcome.status == "ok" and outcome.result is not None:
+        return outcome.result
+    return None
+
+
+def _apply_grounding_gate(
+    summary: Summary,
+    record: AnalysisRecord,
+    evidence: str,
+    chat_fn: ChatFn,
+) -> AnalysisRecord:
+    """Anchor an ``ok`` model answer to the failed step (Step 2 citation gate).
+
+    Ungrounded → focused re-ask once (only when there were templates/pipeline
+    to drop) → if still ungrounded, prefer a grounded deterministic card.
+    Never raises: any failure falls back to the pre-gate record.
+    """
+    if record.status != "ok" or record.result is None:
+        return record
+    try:
+        anchor = failed_step_anchor_text(summary)
+        if is_grounded(record.result, anchor):
+            return record
+
+        focused = focused_evidence(summary, cap_tokens=TOKEN_BUDGET_ANALYZE)
+        if focused != evidence:
+            persona = record.persona or PERSONAS[0]
+            retry = _ask_once(chat_fn, persona, focused)
+            if retry is not None and is_grounded(retry, anchor):
+                notes = list(record.notes)
+                notes.append("focused re-ask grounded on failed step")
+                return record.model_copy(update={"result": retry, "notes": notes})
+
+        det = analysis_result_from_summary(summary, source="hybrid")
+        if is_grounded(det, anchor):
+            notes = list(record.notes)
+            notes.append(f"model root_cause: {record.result.root_cause}")
+            if (record.result.suggested_fix or "").strip():
+                notes.append(f"model suggested_fix: {record.result.suggested_fix}")
+            return record.model_copy(update={"result": det, "notes": notes})
+        return record
+    except Exception:  # noqa: BLE001 — the gate must not fail the workflow
+        _LOG.exception("grounding gate error")
+        return record
 
 
 def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> AnalysisRecord:
@@ -501,7 +584,16 @@ SKIP_REASONS = {
     "analyze_disabled": "Analyze input is false; STGPT was not called.",
     "missing_stgpt_key": "STGPT API key is not set; STGPT was not called.",
     "mode_not_collect": "Analyze is only run in collect mode.",
+    "policy_never": "Analyze policy is 'never'; STGPT was not called.",
+    "history_resolution": (
+        "An exact fingerprint match carried a recorded resolution; STGPT was not called."
+    ),
 }
+
+# Verdicts the collector solves on its own; the model adds nothing (Step 4 gate).
+_HARD_SHORT_CIRCUITS = frozenset(
+    {"infra_runner", "infra_widespread", "flake_same_sha_passed", "no_failed_jobs"}
+)
 
 
 def _as_bool(value: object, default: bool | None = None) -> bool | None:
@@ -517,6 +609,32 @@ def _as_bool(value: object, default: bool | None = None) -> bool | None:
     return default
 
 
+def _deterministic_sufficient(summary: Summary) -> bool:
+    """True when the deterministic card is trustworthy AND anchored at the failed step.
+
+    High-confidence signature category + a terminal cause present + the card is
+    grounded on the failed-step anchor + the winning rule is not R14/R18. Any
+    miss (or internal error) returns False, so the model is still called.
+    """
+    try:
+        from .diagnose import SIGNATURE_CATEGORIES, terminal_cause_present
+        from .prompt import failed_step_anchor_text
+
+        cls = summary.classification
+        if cls.confidence != "high" or cls.category not in SIGNATURE_CATEGORIES:
+            return False
+        if not terminal_cause_present(summary):
+            return False
+        rule = summary.diagnosis.rule_id if summary.diagnosis is not None else None
+        if rule in {"R14", "R18"}:
+            return False
+        card = analysis_result_from_summary(summary, source="deterministic")
+        return is_grounded(card, failed_step_anchor_text(summary))
+    except Exception:  # noqa: BLE001 — fail open toward analysis, never crash
+        _LOG.exception("deterministic-sufficient gate error")
+        return False
+
+
 def decide_stgpt_call(
     summary: Summary,
     *,
@@ -526,15 +644,19 @@ def decide_stgpt_call(
     mode: str | None = "collect",
     from_completion: object | None = None,
     api_key: str | None = None,
+    policy: str | None = "auto",
 ) -> tuple[bool, str | None]:
     """Whether to call STGPT. Returns (call, reason_code).
 
-    Call when mode=collect, analyze is not explicitly false, and a key
-    (or --from-completion) is present. Do not skip because
-    requires_analysis=false or short_circuit is set. ``requires_analysis``
-    is accepted for CLI compatibility and ignored for the model gate.
+    Requires mode=collect, analyze not explicitly false, and a key (or
+    --from-completion). ``policy`` then refines the choice: ``always`` calls
+    whenever possible; ``never`` never calls; ``auto`` (default) skips only when
+    the deterministic answer is trustworthy AND anchored at the failed step
+    (hard short-circuit, an anchored high-confidence signature, or an exact
+    history resolution). ``requires_analysis`` is accepted for CLI compatibility
+    and never gates the model on its own.
     """
-    _ = (summary, requires_analysis)
+    _ = requires_analysis
     if (mode or "collect") != "collect":
         return False, "mode_not_collect"
     if _as_bool(analyze_enabled, True) is False:
@@ -544,6 +666,27 @@ def decide_stgpt_call(
         key_present = bool(resolve_stgpt_api_key(api_key))
     if from_completion is None and not key_present:
         return False, "missing_stgpt_key"
+
+    mode_policy = (policy or "auto").strip().lower()
+    if mode_policy == "always":
+        return True, None
+    if mode_policy == "never":
+        return False, "policy_never"
+
+    # auto — skip only when the deterministic answer is trustworthy and anchored.
+    if from_completion is not None:
+        return True, None
+    if summary.verdict.short_circuit in _HARD_SHORT_CIRCUITS:
+        return False, "short_circuit"
+    if _deterministic_sufficient(summary):
+        return False, "deterministic_sufficient"
+    hist = summary.history
+    if (
+        hist is not None
+        and hist.match == "exact"
+        and (hist.previous_resolution or "").strip()
+    ):
+        return False, "history_resolution"
     return True, None
 
 
@@ -670,6 +813,89 @@ def ensure_display_result(
 
 
 def finalize_user_card(summary: Summary, record: AnalysisRecord) -> AnalysisRecord:
+    """Pick the user-facing card, stamp grounding, and guarantee it is never blank.
+
+    The confidence cap and ``grounded`` flag live here so they apply to the
+    final chosen result whether its source is ai, hybrid, or deterministic; the
+    never-blank guard then guarantees a non-empty root_cause + suggested_fix for
+    every status (Step 5).
+    """
+    record = _finalize_card(summary, record)
+    record = _stamp_grounding(summary, record)
+    return _ensure_nonblank(summary, record)
+
+
+def _ensure_nonblank(summary: Summary, record: AnalysisRecord) -> AnalysisRecord:
+    """Fill root_cause / suggested_fix for every status; never leave them empty."""
+    result = record.result
+    root = (result.root_cause or "").strip() if result is not None else ""
+    fix = (result.suggested_fix or "").strip() if result is not None else ""
+    if result is not None and root and fix:
+        return record
+
+    try:
+        det = analysis_result_from_summary(summary, source="deterministic")
+    except Exception:  # noqa: BLE001 — never fail the workflow while rendering
+        _LOG.exception("deterministic fallback error")
+        det = None
+
+    if result is None:
+        base = (
+            det.model_copy()
+            if det is not None
+            else AnalysisResult(
+                root_cause="",
+                suggested_fix="",
+                confidence="low",
+                source="deterministic",
+            )
+        )
+    else:
+        base = result.model_copy()
+    if not (base.root_cause or "").strip():
+        base.root_cause = (
+            (det.root_cause if det is not None else "") or _last_resort_root(summary)
+        )
+    if not (base.suggested_fix or "").strip():
+        base.suggested_fix = (
+            (det.suggested_fix if det is not None else "") or _last_resort_fix(summary)
+        )
+    if not (base.source or "").strip():
+        base.source = "deterministic"
+    return record.model_copy(update={"result": base})
+
+
+def _last_resort_root(summary: Summary) -> str:
+    diag = summary.diagnosis
+    if diag is not None and (diag.one_liner or "").strip():
+        return diag.one_liner
+    return "The collector could not determine a specific root cause from the evidence."
+
+
+def _last_resort_fix(summary: Summary) -> str:
+    from .diagnose import fix_for_rule
+
+    diag = summary.diagnosis
+    return fix_for_rule(diag.rule_id if diag is not None else None)
+
+
+def _stamp_grounding(summary: Summary, record: AnalysisRecord) -> AnalysisRecord:
+    """Record whether the final result cites the failed step; cap ungrounded high."""
+    result = record.result
+    if result is None:
+        return record
+    try:
+        grounded = is_grounded(result, failed_step_anchor_text(summary))
+    except Exception:  # noqa: BLE001 — never fail the workflow on the gate
+        _LOG.exception("grounding stamp error")
+        return record
+    updates: dict[str, Any] = {"grounded": grounded}
+    if not grounded and result.confidence == "high":
+        updates["result"] = result.model_copy(update={"confidence": "medium"})
+    return record.model_copy(update=updates)
+
+
+def _finalize_card(summary: Summary, record: AnalysisRecord) -> AnalysisRecord:
     """Model card when ok; deterministic templates when the model is unusable.
 
     Deterministic output is input + fallback, not the user-facing answer, except
@@ -692,7 +918,7 @@ def finalize_user_card(summary: Summary, record: AnalysisRecord) -> AnalysisReco
         result is not None
         and (result.root_cause or "").strip()
         and (result.suggested_fix or "").strip()
-        and (result.source or "") in {"ai", "mixed", "deterministic"}
+        and (result.source or "") in {"ai", "mixed", "deterministic", "hybrid"}
     )
     if already and result is not None:
         if (
@@ -1073,11 +1299,44 @@ def _redact_walk(value: Any) -> tuple[Any, int]:
     return value, 0
 
 
+_DIAGNOSIS_HEADER = "## AI Diagnosis"
+_DISPLAY_STATUS = {
+    "ok": "ok",
+    "cached": "cached",
+    "skipped": "deterministic",
+    "gated": "deterministic",
+}
+_REVIEW_HINT = "answer not grounded to the failed step"
+
+
+def display_status(record: AnalysisRecord) -> str:
+    """User-facing status: ok | cached | deterministic | needs-review.
+
+    Internal dead-end-looking states (skipped/failed/…) are normalized so the
+    section always reads as a diagnosis, not a gap. The machine ``status`` field
+    and the ``analysis-status`` output are unchanged.
+    """
+    return _DISPLAY_STATUS.get(record.status, "needs-review")
+
+
+def _display_source(record: AnalysisRecord, *, model_called: bool) -> str:
+    """Always one of ai | deterministic | hybrid | cached; never empty/unknown."""
+    result = record.result
+    src = ((result.source if result is not None else "") or "").strip().lower()
+    if src == "mixed":
+        return "hybrid"
+    if src in {"ai", "deterministic", "hybrid", "cached"}:
+        return src
+    if record.status == "cached":
+        return "cached"
+    return "ai" if model_called else "deterministic"
+
+
 def _upsert_diagnosis(
     markdown: str, record: AnalysisRecord, *, summary: Summary | None = None
 ) -> str:
     block = _diagnosis_markdown(record, summary=summary)
-    marker = "## AI diagnosis"
+    marker = _DIAGNOSIS_HEADER
     if marker in markdown:
         prefix = markdown[: markdown.index(marker)].rstrip()
         return prefix + "\n\n" + block
@@ -1095,10 +1354,11 @@ def _diagnosis_markdown(
         called = "yes"
     if record.status in {"skipped", "gated"}:
         called = "no"
+    disp = display_status(record)
     lines = [
-        "## AI diagnosis",
+        _DIAGNOSIS_HEADER,
         "",
-        f"**Status:** {record.status}",
+        f"**Status:** {disp}",
         f"**Model called:** {called}",
     ]
     reason = record.reason_code or (
@@ -1110,30 +1370,43 @@ def _diagnosis_markdown(
         lines.append(f"**Persona:** {record.persona}")
     if record.cache_hit:
         lines.append("**Cache:** hit")
+
     result = record.result
-    if result is not None:
-        source = result.source or (
-            "ai" if called == "yes" else "deterministic"
-        )
-        lines.append(f"**Source:** {source}")
-        if result.cannot_determine:
-            lines.append("**Cannot determine:** true")
-        lines.extend(
-            [
-                f"**Confidence:** {result.confidence}",
-                "",
-                f"**Root cause:** {result.root_cause}",
-                "",
-                f"**Suggested fix:** {result.suggested_fix}",
-            ]
-        )
-        lines.extend(["", "**Citations:**"])
-        if result.citations:
-            for cite in result.citations:
-                loc = f" ({cite.source}" + (f":{cite.line}" if cite.line else "") + ")"
-                lines.append(f"- `{cite.quote}`{loc}")
-        else:
-            lines.append("- (none)")
-    if record.notes:
-        lines.extend(["", "**Notes:** " + "; ".join(record.notes)])
+    lines.append(f"**Source:** {_display_source(record, model_called=called == 'yes')}")
+    if result is not None and result.cannot_determine:
+        lines.append("**Cannot determine:** true")
+
+    confidence = (result.confidence if result is not None else "low") or "low"
+    if disp == "needs-review" and confidence == "high":
+        confidence = "medium"
+    root_cause = (result.root_cause if result is not None else "") or (
+        "The collector could not determine a specific root cause from the evidence."
+    )
+    suggested_fix = (result.suggested_fix if result is not None else "") or (
+        "Inspect the collector evidence; compare with last green."
+    )
+    lines.extend(
+        [
+            f"**Confidence:** {confidence}",
+            "",
+            f"**Root cause:** {root_cause}",
+            "",
+            f"**Suggested fix:** {suggested_fix}",
+            "",
+            "**Citations:**",
+        ]
+    )
+    citations = result.citations if result is not None else []
+    if citations:
+        for cite in citations:
+            loc = f" ({cite.source}" + (f":{cite.line}" if cite.line else "") + ")"
+            lines.append(f"- `{cite.quote}`{loc}")
+    else:
+        lines.append("- (none)")
+
+    render_notes = list(record.notes)
+    render_notes.append(f"internal_status={record.status}")
+    if disp == "needs-review":
+        render_notes.append(f"review: {_REVIEW_HINT}")
+    lines.extend(["", "**Notes:** " + "; ".join(render_notes)])
     return "\n".join(lines) + "\n"

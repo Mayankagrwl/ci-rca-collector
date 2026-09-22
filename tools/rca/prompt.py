@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import re
 
-from .budget import token_count
-from .config import ANALYZE_EVIDENCE_CAP, PROMPT_VERSION
+from .budget import token_count, trim_middle
+from .config import (
+    ANALYZE_EVIDENCE_CAP,
+    EVIDENCE_PROFILE_DEFAULT,
+    EVIDENCE_PROFILES,
+    JUNIT_EVIDENCE_CAP,
+    PROMPT_VERSION,
+    SECTION_TOKEN_CAPS,
+)
 from .models import FailedJob, Summary
 
 SYSTEM_PROMPT = (
@@ -55,12 +62,28 @@ _PIPELINE_STEP = re.compile(
 )
 
 
-def build_evidence(summary: Summary, *, cap_tokens: int | None = None) -> str:
-    """Priority-packed evidence. failed_step_excerpt is mandatory and untrimmed."""
+def build_evidence(
+    summary: Summary,
+    *,
+    cap_tokens: int | None = None,
+    exclude: set[str] | None = None,
+) -> str:
+    """Priority-packed evidence. failed_step_excerpt is mandatory and untrimmed.
+
+    ``exclude`` drops named sections (by key) before packing; the default
+    (non-focused) ordering and output are unchanged when it is omitted.
+    """
     cap = ANALYZE_EVIDENCE_CAP if cap_tokens is None else cap_tokens
+    skip = set(exclude or set())
+    if _terminal_cause_present(summary):
+        # A terminal cause at the failed step: drop symptom-prone sections up
+        # front so the first model call can't wander to a follow-on symptom.
+        skip |= {"log_templates", "pipeline_logs"}
     packed: list[str] = []
     used = 0
-    for mandatory, lines in _priority_sections(summary):
+    for key, mandatory, lines in _priority_sections(summary):
+        if key in skip:
+            continue
         block = "\n".join(line for line in lines if line is not None and str(line) != "")
         if not block.strip():
             continue
@@ -70,6 +93,40 @@ def build_evidence(summary: Summary, *, cap_tokens: int | None = None) -> str:
         packed.append(block)
         used += tokens
     return "<EVIDENCE>\n" + "\n".join(packed) + "\n</EVIDENCE>"
+
+
+def _terminal_cause_present(summary: Summary) -> bool:
+    """Lazy bridge to the deterministic terminal-cause check; never raises."""
+    try:
+        from .diagnose import terminal_cause_present
+
+        return terminal_cause_present(summary)
+    except Exception:  # noqa: BLE001 — evidence packing must not crash
+        return False
+
+
+def focused_evidence(summary: Summary, *, cap_tokens: int | None = None) -> str:
+    """Evidence with log_templates and pipeline_logs removed (grounding re-ask)."""
+    return build_evidence(
+        summary,
+        cap_tokens=cap_tokens,
+        exclude={"log_templates", "pipeline_logs"},
+    )
+
+
+def failed_step_anchor_text(summary: Summary) -> str:
+    """Failed-step evidence a grounded answer must quote from (Step 2 gate).
+
+    primary_failure_line + failed_step_excerpt + the first_error/merged window +
+    the primary job's stack traces (Step 6: a crash/compile frame is the failed
+    step's own output). This is what the grounding check greps against.
+    """
+    parts: list[str] = []
+    parts.extend(_primary_failure_line_lines(summary))
+    parts.extend(_excerpt_lines(summary))
+    parts.extend(_job_first_error_lines(summary))
+    parts.extend(_stack_trace_lines(summary))
+    return "\n".join(part for part in parts if part)
 
 
 def build_messages(
@@ -101,16 +158,98 @@ def build_messages(
     return messages
 
 
-def _priority_sections(summary: Summary) -> list[tuple[bool, list[str]]]:
-    """(mandatory, lines) in STGPT order. Stop packing optional sections at cap."""
-    return [
-        (True, _excerpt_lines(summary)),
-        (False, _job_first_error_lines(summary)),
-        (False, _deterministic_hint_lines(summary)),
-        (False, _template_lines(summary)),
-        (False, _pipeline_window_lines(summary)),
-        (False, _change_one_liner(summary)),
-    ]
+_MANDATORY_SECTIONS = {"primary_failure_line", "failed_step_excerpt"}
+
+
+def _section_builders() -> dict[str, "callable"]:  # type: ignore[type-arg]
+    return {
+        "primary_failure_line": _primary_failure_line_lines,
+        "failed_step_excerpt": _excerpt_lines,
+        "first_error_window": _job_first_error_lines,
+        "stack_traces": _stack_trace_lines,
+        "junit": _junit_lines,
+        "code_context": _code_context_lines,
+        "deterministic_hint": _deterministic_hint_lines,
+        "log_templates": _template_lines,
+        "pipeline_logs": _pipeline_window_lines,
+        "change_context": _change_one_liner,
+    }
+
+
+def _profile_for(summary: Summary) -> list[str]:
+    category = (summary.classification.category or "").strip().lower()
+    return EVIDENCE_PROFILES.get(category, EVIDENCE_PROFILE_DEFAULT)
+
+
+def _priority_sections(summary: Summary) -> list[tuple[str, bool, list[str]]]:
+    """(key, mandatory, lines) in category-aware order. Stop optionals at cap."""
+    builders = _section_builders()
+    out: list[tuple[str, bool, list[str]]] = []
+    for key in _profile_for(summary):
+        builder = builders.get(key)
+        if builder is None:
+            continue
+        out.append((key, key in _MANDATORY_SECTIONS, builder(summary)))
+    return out
+
+
+def _capped_section(key: str, header: str, body: str) -> list[str]:
+    """A section trimmed to its SECTION_TOKEN_CAPS entry (header + body kept)."""
+    if not body.strip():
+        return []
+    text = f"{header}\n{body}"
+    cap = SECTION_TOKEN_CAPS.get(key)
+    if cap:
+        text, _trimmed, _before, _after = trim_middle(text, cap)
+    return [text]
+
+
+def _stack_trace_lines(summary: Summary) -> list[str]:
+    job = _primary_job(summary)
+    if job is None or not job.stack_traces:
+        return []
+    blocks = [trace.content for trace in job.stack_traces if (trace.content or "").strip()]
+    return _capped_section("stack_traces", "### stack_traces", "\n".join(blocks))
+
+
+def _junit_lines(summary: Summary) -> list[str]:
+    report = summary.junit
+    if report is None or not report.failures:
+        return []
+    parts: list[str] = []
+    for failure in report.failures[:JUNIT_EVIDENCE_CAP]:
+        name = (
+            f"{failure.classname}::{failure.name}"
+            if failure.classname
+            else (failure.name or "")
+        )
+        if name:
+            parts.append(name)
+        if failure.message:
+            parts.append(failure.message)
+        if failure.body:
+            parts.append(failure.body)
+    return _capped_section("junit", "### junit", "\n".join(parts))
+
+
+def _code_context_lines(summary: Summary) -> list[str]:
+    ctx = summary.code_context
+    if ctx is None or not ctx.hunks:
+        return []
+    parts: list[str] = []
+    for hunk in ctx.hunks:
+        parts.append(f"{hunk.path}:{hunk.start_line}-{hunk.end_line}")
+        if hunk.content:
+            parts.append(hunk.content)
+    return _capped_section("code_context", "### code_context", "\n".join(parts))
+
+
+def _primary_failure_line_lines(summary: Summary) -> list[str]:
+    """First cause line inside the failed step. Tiny, mandatory, never trimmed."""
+    job = _primary_job(summary)
+    if job is None or not job.primary_failure_line:
+        return []
+    return ["### primary_failure_line", job.primary_failure_line]
 
 
 def _excerpt_lines(summary: Summary) -> list[str]:
@@ -165,7 +304,12 @@ def _pipeline_window_lines(summary: Summary) -> list[str]:
         return []
     if not summary.pipeline_logs:
         return []
-    stream = summary.pipeline_logs[0]
+    # Prefer a non-teardown stream; teardown streams carry follow-on noise.
+    ordered = sorted(
+        summary.pipeline_logs,
+        key=lambda s: 1 if s.phase == "teardown" else 0,
+    )
+    stream = ordered[0]
     windows = [w for w in stream.windows if w.label in {"first_error", "merged"}]
     if not windows:
         return []

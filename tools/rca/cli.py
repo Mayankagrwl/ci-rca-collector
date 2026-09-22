@@ -94,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_refingerprint(args)
         if args.cmd == "analyze":
             return _cmd_analyze(args)
+        if args.cmd == "telemetry":
+            return _cmd_telemetry(args)
         if args.cmd == "cache-keys":
             return _cmd_cache_keys(args)
         parser.error(f"unknown command {args.cmd}")
@@ -185,6 +187,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="false when the action analyze input is off.",
     )
     analyze.add_argument(
+        "--analyze-policy",
+        default="auto",
+        help="auto (skip when deterministic is trustworthy) | always | never.",
+    )
+    analyze.add_argument(
         "--requires-analysis",
         default=None,
         help="true|false from collect output; default is summary.verdict.",
@@ -194,6 +201,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="true|false; default infers from STGPT_API / API_KEY.",
     )
+    analyze.add_argument(
+        "--history-dir",
+        default=".rca-history",
+        help="history directory; per-run telemetry is appended here (cached).",
+    )
+    analyze.add_argument(
+        "--write-telemetry",
+        default="true",
+        help="false to skip appending the per-run telemetry line.",
+    )
+
+    telemetry = sub.add_parser("telemetry", parents=[parent])
+    telemetry.add_argument(
+        "--history-dir",
+        default=".rca-history",
+        help="directory holding telemetry.jsonl.",
+    )
+    telemetry.add_argument("--out", default=None, help="optional path to write the summary")
+    telemetry.add_argument("--format", default="json", help="json | md")
 
     keys = sub.add_parser("cache-keys", parents=[parent])
     keys.add_argument("--workflow-name", default=None)
@@ -610,6 +636,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             stgpt_key_present=getattr(args, "stgpt_key_present", None),
             mode=getattr(args, "mode", "collect"),
             from_completion=args.from_completion,
+            policy=getattr(args, "analyze_policy", "auto"),
         )
         if call:
             record = analyze_summary(
@@ -621,6 +648,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             record = skipped_record(summary, reason or "analyze_disabled")
         write_analysis(record, summary_path=summary_path, out_dir=out)
         write_analysis_github_output(record, summary=summary)
+        if _as_flag(getattr(args, "write_telemetry", "true"), default=True):
+            _append_run_telemetry(args, summary, record)
     except Exception as exc:  # noqa: BLE001
         _LOG.exception("analyze error")
         record = AnalysisRecord(
@@ -640,6 +669,66 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         return 0
     if record.status == "failed" and args.strict:
         return 1
+    return 0
+
+
+def _as_flag(value: object, *, default: bool) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() not in {"false", "0", "no", "off", ""}
+
+
+def _append_run_telemetry(args: argparse.Namespace, summary: Summary, record: Any) -> None:
+    """Best-effort per-run telemetry line. Never raises into the analyze step."""
+    try:
+        from .analyze import display_status
+        from .diagnose import terminal_cause_present
+        from .outputs import analyze_decision
+        from .telemetry import append_telemetry
+
+        result = record.result
+        diag = summary.diagnosis
+        hist = summary.history
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "fingerprint": summary.fingerprint,
+            "fingerprint_coarse": summary.fingerprint_coarse,
+            "category": summary.classification.category,
+            "confidence": summary.classification.confidence,
+            "is_infra_vs_code": summary.classification.is_infra_vs_code,
+            "short_circuit": summary.verdict.short_circuit,
+            "requires_analysis": bool(summary.verdict.requires_analysis),
+            "rule_id": diag.rule_id if diag is not None else None,
+            "terminal_cause_present": bool(terminal_cause_present(summary)),
+            "suspected_stage": diag.suspected_stage if diag is not None else None,
+            "recurrence": hist.match if hist is not None else "new",
+            "seen_count": hist.seen_count if hist is not None else 0,
+            "model_called": bool(record.model_called),
+            "analyze_decision": analyze_decision(record),
+            "analysis_status": record.status,
+            "display_status": display_status(record),
+            "grounded": record.grounded,
+            "source": result.source if result is not None else None,
+            "rca_confidence": result.confidence if result is not None else None,
+            "collector_version": summary.collector_version,
+            "prompt_version": record.prompt_version,
+        }
+        append_telemetry(getattr(args, "history_dir", ".rca-history"), rec)
+    except Exception:  # noqa: BLE001 — telemetry is best-effort
+        _LOG.debug("telemetry skipped", exc_info=True)
+
+
+def _cmd_telemetry(args: argparse.Namespace) -> int:
+    from .telemetry import aggregate, format_summary, read_telemetry
+
+    records = read_telemetry(getattr(args, "history_dir", ".rca-history"))
+    text = format_summary(aggregate(records), getattr(args, "format", "json"))
+    out = getattr(args, "out", None)
+    if out:
+        dest = Path(out)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + "\n", encoding="utf-8")
+    print(text)
     return 0
 
 
@@ -1029,6 +1118,12 @@ def _collect_artifacts_live(
         return [], None, [], {}
     from .pipeline_logs import match_pipeline_artifact_name, rank_pipeline_artifacts
 
+    # TODO(7e): optional, flag-guarded (RCA_GATE_PIPELINE_DOWNLOAD, default off) —
+    # when a cheap job-log-only pre-verdict already yields a high-confidence
+    # signature WITH a terminal cause at the failed step, and the failed step is
+    # not itself a docker/pipeline step, skip downloading pipeline-log (not
+    # JUnit) zips here and record a collection_notes line. Deferred to keep the
+    # collect ordering low-risk; JUnit download and current behaviour unchanged.
     infos: list[ArtifactInfo] = []
     reports: list[JUnitReport | None] = []
     pipeline_zips: list[tuple[str, str | None, bytes]] = []
@@ -1424,6 +1519,16 @@ def _build_summary(
 
     pr_number, pr_url, is_fork, head_repo = _pr_context(run, pulls)
     history, changes = _history_and_changes(bundle, run, failed_jobs, notes)
+    # 7c: order each job's stack traces so a trace naming a changed application
+    # source path leads. Reorder only; nothing is dropped.
+    if changes is not None and changes.files:
+        from .extract import order_stack_traces_by_paths
+
+        for failed_job in failed_jobs:
+            if failed_job.stack_traces:
+                failed_job.stack_traces = order_stack_traces_by_paths(
+                    failed_job.stack_traces, changes.files
+                )
     drain_report = None
     fine = ""
     coarse = ""
@@ -1769,6 +1874,7 @@ def _failed_job_from_api(
     extracted_annotations: list[str] = []
     extracted_exit: int | None = None
     excerpt_lines: list[str] = []
+    primary_failure_line: str | None = None
     if raw_log is not None:
         cleaned = clean_log(raw_log, keep_post_cleanup=keep_post)
         extracted = extract_from_lines(
@@ -1780,6 +1886,7 @@ def _failed_job_from_api(
         extracted_errors = extracted.error_lines
         extracted_annotations = extracted.annotations
         extracted_exit = extracted.exit_code
+        primary_failure_line = extracted.primary_failure_line
         excerpt_lines = list(extracted.excerpt_lines)
         grouped = failed_step_excerpt_lines(
             raw_log.splitlines(),
@@ -1829,6 +1936,7 @@ def _failed_job_from_api(
             if excerpt_lines
             else None
         ),
+        primary_failure_line=primary_failure_line,
     )
 
 

@@ -32,6 +32,7 @@ class JUnitFailure(BaseModel):
     name: str
     message: str | None = None
     body: str | None = None  # first 20 lines of the failure body
+    count: int = 1  # collapsed near-duplicate failures sharing this message
 
 
 class JUnitReport(BaseModel):
@@ -269,6 +270,7 @@ class FailedJob(BaseModel):
     annotations: list[str] = []
     timeout_minutes: int | None = None
     failed_step_excerpt: FailedStepExcerpt | None = None
+    primary_failure_line: str | None = None
 
 
 class CommitInfo(BaseModel):
@@ -330,6 +332,8 @@ class PipelineLogStream(BaseModel):
     artifact_name: str
     stage: str | None = None
     file: str
+    phase: Literal["setup", "run", "teardown"] | None = None
+    step_name: str | None = None
     windows: list[LogWindow] = []
     error_lines: list[ErrorLine] = []
     stack_traces: list[StackTrace] = []
@@ -464,3 +468,4 @@ class AnalysisRecord(BaseModel):
     stgpt_responses: list[dict[str, Any]] = []
     reason_code: str | None = None
     model_called: bool = False
+    grounded: bool | None = None

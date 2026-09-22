@@ -37,6 +37,9 @@ ANALYSIS_OUTPUT_KEYS = (
     "analysis-status",
     "analysis-notes",
     "diagnosis-source",
+    "diagnosis-grounded",
+    "diagnosis-display-status",
+    "analyze-decision",
     "requires-analysis",
     "suspected-stage",
     "suspected-files",
@@ -122,6 +125,23 @@ def _deterministic_rule(summary: Summary) -> str:
     if rule.startswith("R") and len(rule) <= 8:
         return rule
     return ""
+
+
+def _display_status(record: AnalysisRecord) -> str:
+    """Normalized user-facing status; mirrors analyze.display_status."""
+    from .analyze import display_status
+
+    return display_status(record)
+
+
+def analyze_decision(record: AnalysisRecord) -> str:
+    """called | skipped:<reason> | cached — what the AI gate decided this run."""
+    if record.cache_hit or record.status == "cached":
+        return "cached"
+    if record.status in {"skipped", "gated"}:
+        reason = record.reason_code or (record.notes[0] if record.notes else "")
+        return f"skipped:{reason}" if reason else "skipped"
+    return "called"
 
 
 def diagnosis_source(summary: Summary, record: AnalysisRecord | None = None) -> str:
@@ -223,6 +243,9 @@ def analysis_outputs(
         "analysis-status": record.status or "",
         "analysis-notes": "; ".join(record.notes),
         "diagnosis-source": source,
+        "diagnosis-grounded": "" if record.grounded is None else _bool_str(record.grounded),
+        "diagnosis-display-status": _display_status(record),
+        "analyze-decision": analyze_decision(record),
         "requires-analysis": requires,
         "suspected-stage": stage,
         "suspected-files": files,

@@ -82,6 +82,18 @@ inputs:
     description: 'Run the ST ChatGPT analyze step after collect. Skipped when the API key is empty.'
     required: false
     default: 'true'
+  analyze-policy:
+    description: >-
+      When to call the model (analyze must also be on): auto = skip only when the
+      deterministic answer is trustworthy and anchored at the failed step;
+      always = call whenever possible; never = never call, always render the
+      deterministic card.
+    required: false
+    default: 'auto'
+  write-telemetry:
+    description: 'Append one per-run telemetry line to the cached history dir for later aggregation.'
+    required: false
+    default: 'true'
   analyze-pipeline-logs:
     description: 'Download and parse pipeline/docker log artifacts as evidence streams.'
     required: false
@@ -296,6 +308,9 @@ runs:
         REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
         RCA_MODE: ${{ inputs.mode }}
         RCA_ANALYZE_ENABLED: ${{ inputs.analyze }}
+        RCA_ANALYZE_POLICY: ${{ inputs.analyze-policy }}
+        RCA_HISTORY_DIR: ${{ inputs.history-dir }}
+        RCA_WRITE_TELEMETRY: ${{ inputs.write-telemetry }}
         RCA_REQUIRES_ANALYSIS: ${{ steps.collect.outputs.requires-analysis }}
         RCA_STGPT_KEY_PRESENT: ${{ (inputs.stgpt-api-key != '' || env.STGPT_API != '') && 'true' || 'false' }}
         STGPT_API: ${{ inputs.stgpt-api-key != '' && inputs.stgpt-api-key || env.STGPT_API }}
@@ -312,6 +327,9 @@ runs:
           --out "$RCA_OUT" \
           --mode "$RCA_MODE" \
           --analyze-enabled "$RCA_ANALYZE_ENABLED" \
+          --analyze-policy "$RCA_ANALYZE_POLICY" \
+          --history-dir "$RCA_HISTORY_DIR" \
+          --write-telemetry "$RCA_WRITE_TELEMETRY" \
           --requires-analysis "$RCA_REQUIRES_ANALYSIS" \
           --stgpt-key-present "$RCA_STGPT_KEY_PRESENT" \
           "${extra[@]}"
