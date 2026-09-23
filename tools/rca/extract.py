@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from .config import (
+    BENIGN_LINE_PATTERNS,
     FAILED_STEP_EXCERPT_LINES,
     FIRST_ERROR_CONTEXT_LINES,
     STACK_TRACE_BOTTOM_FRAMES,
@@ -14,6 +15,19 @@ from .config import (
     TAIL_WINDOW_LINES,
 )
 from .models import ErrorLine, LogWindow, StackTrace
+
+_BENIGN_RES = [re.compile(pattern, re.IGNORECASE) for pattern in BENIGN_LINE_PATTERNS]
+
+
+def is_benign_line(line: str) -> bool:
+    """True for normal/informational output that must never be a failure cause.
+
+    Docker/registry pull progress, image-up-to-date/loaded, orchestration
+    warnings/echoes, and normal completions. The timestamp prefix is stripped
+    first so line-anchored patterns match. Source-agnostic; never raises.
+    """
+    head = _strip_ts((line or "").split("\n", 1)[0])
+    return any(rx.search(head) for rx in _BENIGN_RES)
 
 _WindowLabel = Literal["first_error", "tail", "merged"]
 
@@ -202,11 +216,17 @@ def _failed_group_bounds(
 
 
 def _primary_failure_line(lines: list[str], lo: int, hi: int) -> str | None:
-    """First cause line inside [lo:hi]: semantic, then error window, then grep."""
+    """First cause line inside [lo:hi]: semantic, then error window, then grep.
+
+    Benign progress lines and bare exit-code lines are never selected.
+    """
     for pattern in (_SEMANTIC_CAUSE, _WINDOW_ERROR, ERROR_LINE):
         for index in range(lo, hi):
-            if pattern.search(lines[index]):
-                return _strip_ts(lines[index].split("\n", 1)[0]).strip() or None
+            line = lines[index]
+            if is_benign_line(line) or _EXIT_CODE.search(line):
+                continue
+            if pattern.search(line):
+                return _strip_ts(line.split("\n", 1)[0]).strip() or None
     return None
 
 
@@ -260,17 +280,19 @@ def _first_error_index(
     hi = len(lines) if hi is None else hi
     start = lo + _skip_script_preamble(lines[lo:hi])
     for index in range(start, hi):
-        if _SEMANTIC_CAUSE.search(lines[index]):
+        if _SEMANTIC_CAUSE.search(lines[index]) and not is_benign_line(lines[index]):
             return index
     for index in range(start, hi):
-        if _WINDOW_ERROR.search(lines[index]):
+        if _WINDOW_ERROR.search(lines[index]) and not is_benign_line(lines[index]):
             return index
     for index in range(start, hi):
-        if ERROR_LINE.search(lines[index]):
+        if ERROR_LINE.search(lines[index]) and not is_benign_line(lines[index]):
             return index
     for index in range(start, hi):
         if _EXIT_CODE.search(lines[index]):
             for back in range(index, start - 1, -1):
+                if is_benign_line(lines[back]):
+                    continue
                 if _SEMANTIC_CAUSE.search(lines[back]) or ERROR_LINE.search(lines[back]):
                     return back
             return index

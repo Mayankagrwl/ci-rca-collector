@@ -126,7 +126,32 @@ def failed_step_anchor_text(summary: Summary) -> str:
     parts.extend(_excerpt_lines(summary))
     parts.extend(_job_first_error_lines(summary))
     parts.extend(_stack_trace_lines(summary))
+    # Defect B (Step 9): an uninformative job's cause is in the pipeline; include
+    # its first-error window so a correct pipeline-cited answer stays grounded.
+    if _job_uninformative(summary):
+        parts.extend(_pipeline_first_error_window_lines(summary))
     return "\n".join(part for part in parts if part)
+
+
+def _job_uninformative(summary: Summary) -> bool:
+    """Lazy bridge: does the failed step's own log lack informative content?"""
+    try:
+        from .diagnose import _job_logs_are_exit_only, _pipeline_has_first_error
+
+        return _job_logs_are_exit_only(summary) and _pipeline_has_first_error(summary)
+    except Exception:  # noqa: BLE001 — anchoring must not crash
+        return False
+
+
+def _pipeline_first_error_window_lines(summary: Summary) -> list[str]:
+    """First non-teardown pipeline stream's first-error window content, for anchoring."""
+    for stream in summary.pipeline_logs:
+        if getattr(stream, "phase", None) == "teardown":
+            continue
+        for window in stream.windows:
+            if window.label in {"first_error", "merged"} and window.content.strip():
+                return ["### pipeline_first_error", window.content]
+    return []
 
 
 def build_messages(

@@ -175,11 +175,13 @@ def resolve_stgpt_client_app_name(explicit: str | None = None) -> str:
 # superset of extract._SEMANTIC_CAUSE and diagnose._SPECIFIC_CAUSE_RE markers
 # (kept working there) plus quality-gate / compile / dependency shapes.
 TERMINAL_CAUSE_PATTERNS: list[str] = [
-    r"already exists",
+    # "already exists" only in a publish/version failure context — never the
+    # bare Docker layer line "<hex> Already exists 0B".
+    r"(?:release|version|tag|artifact|image|package)\b[^\n]*already exists",
+    r"already exists[^\n]*(?:you need to update|update (?:the )?package|overwrite|on\s+\w+)",
     r"version exists",
     r"must update",
     r"you need to update",
-    r"artifactory",
     r"ERESOLVE",
     r"No matching distribution",
     r"Could not find a version",
@@ -192,6 +194,33 @@ TERMINAL_CAUSE_PATTERNS: list[str] = [
     r"ENOSPC",
     r"quality gate (?:failed|not passed)",
     r"coverage .*(?:below|threshold|did not meet)",
+]
+
+# BENIGN_LINE_PATTERNS: normal/informational output that must NEVER be treated
+# as a cause (terminal cause, primary_failure_line, first-error anchor, or
+# citation) — even when it also matches a cause pattern. Benign takes precedence.
+BENIGN_LINE_PATTERNS: list[str] = [
+    # Docker pull progress: a leading layer id, then a docker status word.
+    # Anchored so "ERROR <hex> ... downloading" (a real error) is not swallowed.
+    r"^\s*[0-9a-f]{6,}:?\s+(?:already exists|pull complete|pulling fs layer|"
+    r"waiting|downloading|download complete|verifying checksum|extracting|retrying)\b",
+    # "Already exists 0B" style progress (status followed by a byte size).
+    r"\balready exists\b[^\n]*\b\d+(?:\.\d+)?\s*[kmgt]?i?b\b",
+    # A line that is itself only a docker progress status (status + a progress
+    # bar / size / nothing) — not a sentence like "Downloading failed: ...".
+    r"^\s*(?:already exists|pull complete|pulling fs layer|downloading|"
+    r"download complete|verifying checksum|extracting|waiting|retrying)\b"
+    r"(?:\s*$|\s*\[|\s+\d)",
+    r"\bdigest:\s*sha256:",  # image digest line
+    r"\bstatus:\s*(?:image is up to date|downloaded newer image)",  # pull status
+    r"\bimage is up to date\b",  # nothing to pull
+    r"\bloaded image(?:\s+id)?:",  # docker load output
+    r"\blevel=warning\b",  # structured warning (not an error level)
+    r"\bno services to build\b",  # compose orchestration echo
+    # Setup echo "Using <name> service: …" — anchored to line start so a real
+    # error that merely contains "using … service" is not marked benign.
+    r"^\s*using\b[^\n]*\bservice\b\s*:?",
+    r"\bexited with code 0\b",  # normal container/process completion
 ]
 
 # SYMPTOM_PATTERNS: follow-on lines that must never be the root cause when a
@@ -360,6 +389,7 @@ __all__ = [
     "CODE_HUNK_MAX_FILES",
     "CODE_HUNK_MAX_LINES",
     "CODE_HUNK_RADIUS",
+    "BENIGN_LINE_PATTERNS",
     "EVIDENCE_PROFILES",
     "EVIDENCE_PROFILE_DEFAULT",
     "JUNIT_EVIDENCE_CAP",

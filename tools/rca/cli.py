@@ -1705,6 +1705,24 @@ def _build_summary(
         budget_report=BudgetReport(),
         collection_notes=notes,
     )
+    # Defect B (Step 9): when the failed step's own log is uninformative, the
+    # cause lives in the pipeline stream — seed primary_failure_line from it so
+    # anchoring/grounding use the real cause, not the job's benign output.
+    try:
+        from .diagnose import _first_pipeline_error_line, _job_logs_are_exit_only
+
+        primary = summary.failed_jobs[0] if summary.failed_jobs else None
+        if (
+            primary is not None
+            and not (primary.primary_failure_line or "").strip()
+            and _job_logs_are_exit_only(summary)
+        ):
+            pipeline_line = _first_pipeline_error_line(summary)
+            if pipeline_line:
+                primary.primary_failure_line = pipeline_line
+    except Exception as exc:  # noqa: BLE001
+        summary.collection_notes.append(f"pipeline primary line skipped: {exc}")
+
     try:
         from .diagnose import apply_verdict, diagnose
 

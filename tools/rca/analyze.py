@@ -962,7 +962,40 @@ def _finalize_card(summary: Summary, record: AnalysisRecord) -> AnalysisRecord:
     notes = list(record.notes)
     if result is not None and (result.root_cause or "").strip():
         notes.append(f"model root_cause: {result.root_cause}")
+    # Safety net (Step 9): when the model cannot determine a cause AND the
+    # deterministic card is weak (low-confidence + ungrounded, or its cause is a
+    # benign line), do not ship it as a confident answer — say so and let the
+    # section render needs-review, keeping the model's explanation in notes.
+    if _deterministic_too_weak(summary, det, result):
+        cannot = AnalysisResult(
+            root_cause="Cannot determine the root cause from the current evidence.",
+            suggested_fix="Inspect the failed step and pipeline logs; compare with last green.",
+            confidence="low",
+            source="deterministic",
+            cannot_determine=True,
+        )
+        return record.model_copy(
+            update={"result": cannot, "status": "unvalidated", "notes": notes}
+        )
     return record.model_copy(update={"result": det, "notes": notes})
+
+
+def _deterministic_too_weak(
+    summary: Summary, det: AnalysisResult, model_result: AnalysisResult | None
+) -> bool:
+    """True when a cannot-determine model result should not fall back to ``det``."""
+    if model_result is None or not model_result.cannot_determine:
+        return False
+    from .extract import is_benign_line
+
+    if is_benign_line(det.root_cause or ""):
+        return True
+    if (det.confidence or "").strip().lower() == "low":
+        try:
+            return not is_grounded(det, failed_step_anchor_text(summary))
+        except Exception:  # noqa: BLE001
+            return True
+    return False
 
 
 def _record(

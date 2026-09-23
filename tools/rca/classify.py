@@ -8,6 +8,21 @@ from typing import Any, Mapping, Sequence
 
 from .config import CLASSIFY_RULES, RUNNER_FAILURE_PATTERNS
 
+try:  # extract is source-agnostic (no GitHub imports); degrade to no-skip on error.
+    from .extract import is_benign_line as _is_benign_line
+except Exception:  # pragma: no cover - defensive: never fail classification
+
+    def _is_benign_line(_line: str) -> bool:
+        return False
+
+
+def _benign(line: str) -> bool:
+    """Benign-line check that never raises (fall back to not-benign)."""
+    try:
+        return _is_benign_line(line)
+    except Exception:  # noqa: BLE001 — classification must not crash
+        return False
+
 _INFRA_CATEGORIES = frozenset(
     {
         "infra_runner",
@@ -165,6 +180,8 @@ def classify_union(
     for category, compiled, confidence in _RULE_RES:
         for stream_id, lines in streams:
             for index, line in enumerate(lines, start=1):
+                if _benign(line):
+                    continue
                 if not compiled.search(line):
                     continue
                 hit = ClassificationHit(
@@ -203,6 +220,8 @@ def classify_lines(lines: Sequence[str]) -> ClassificationHit:
     others: list[str] = []
     seen_categories: set[str] = set()
     for index, line in enumerate(lines, start=1):
+        if _benign(line):
+            continue
         for category, compiled, confidence in _RULE_RES:
             if not compiled.search(line):
                 continue

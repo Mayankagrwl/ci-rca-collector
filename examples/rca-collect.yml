@@ -84,7 +84,7 @@ jobs:
 
       - name: Collect failure context
         id: rca
-        uses: acme/ci-rca-collector@v1
+        uses: mayankagrwl/ci-rca-collector@master
         env:
           STGPT_API: ${{ secrets.STGPT_API }}
         with:

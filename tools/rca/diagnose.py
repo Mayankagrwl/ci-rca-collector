@@ -20,7 +20,7 @@ from .config import (
     SYMPTOM_PATTERNS,
     TERMINAL_CAUSE_PATTERNS,
 )
-from .extract import extract_source_paths
+from .extract import extract_source_paths, is_benign_line
 from .models import (
     ChangeContext,
     DeterministicDiagnosis,
@@ -373,12 +373,24 @@ def terminal_cause_present(summary: Summary) -> bool:
     from .prompt import failed_step_anchor_text
 
     try:
+        # When the failed step's own log is uninformative, the cause lives in the
+        # pipeline stream, not the step — so there is no terminal cause AT the
+        # step and pipeline_logs must not be excluded (defect B).
+        if _job_logs_are_exit_only(summary) and _pipeline_has_first_error(summary):
+            return False
         anchor = failed_step_anchor_text(summary)
     except Exception:  # noqa: BLE001 — cause selection must not crash
         return False
     if not anchor:
         return False
-    return any(rx.search(anchor) for rx in _TERMINAL_CAUSE_RES)
+    # Evaluate terminal patterns only over non-benign lines: a normal Docker
+    # "Already exists" layer line must not be read as a terminal cause.
+    for line in anchor.splitlines():
+        if is_benign_line(line):
+            continue
+        if any(rx.search(line) for rx in _TERMINAL_CAUSE_RES):
+            return True
+    return False
 
 
 def _line_is_symptom(line: str) -> bool:
@@ -437,6 +449,8 @@ def specific_log_cause(summary: Summary) -> str | None:
     for raw in candidates:
         line = (raw or "").strip()
         if not line:
+            continue
+        if is_benign_line(line):
             continue
         if terminal and _line_is_symptom(line) and not _line_is_terminal(line):
             continue
@@ -627,6 +641,8 @@ def display_citation_quotes(summary: Summary, *, extra: str | None = None) -> li
     def _add(text: str | None) -> None:
         item = (text or "").strip()
         if not item or item in quotes:
+            return
+        if is_benign_line(item):
             return
         if terminal and _line_is_symptom(item) and not _line_is_terminal(item):
             return
@@ -1349,21 +1365,45 @@ def _rule_pipeline_over_job(
 ) -> DeterministicVerdict | None:
     if not ignore_job:
         return None
+    pipeline_line = _first_pipeline_error_line(summary)
     if hit.category == "unknown" or hit.confidence == "low":
-        return None
+        # Uninformative job (setup/warning/pull-progress + exit only): take the
+        # cause from the pipeline's first error even when classification is weak.
+        if not pipeline_line:
+            return None
+        one = pipeline_line
+    else:
+        one = _one_liner_from_hit(
+            hit,
+            pipeline_line or "job log is only exit code 1; diagnosing from pipeline stream",
+        )
     stream = hit.matched_stream or _first_pipeline_stream_id(summary)
     return _from_hit(
         "R17",
-        _one_liner_from_hit(
-            hit,
-            "job log is only exit code 1; diagnosing from pipeline stream",
-        ),
+        one,
         hit,
         requires_analysis=False,
         suspected_stage=stage or _suspected_stage(summary, hit),
         matched_stream=stream,
         winning_stream_id=stream,
     )
+
+
+def _first_pipeline_error_line(summary: Summary) -> str | None:
+    """First non-benign first-error line of the top non-teardown pipeline stream."""
+    for stream in _sorted_pipeline_streams(summary):
+        if _stream_is_teardown(stream):
+            continue
+        for window in stream.windows:
+            if window.label in {"first_error", "merged"} and window.content:
+                for raw in window.content.splitlines():
+                    line = raw.strip()
+                    if line and not is_benign_line(line):
+                        return line[:240]
+        for err in stream.error_lines:
+            if err.text and not is_benign_line(err.text):
+                return err.text.strip()[:240]
+    return None
 
 
 _SIGNATURE_RULE = {
@@ -1542,6 +1582,12 @@ def _all_text(summary: Summary, ignore_job: bool) -> str:
 
 
 def _job_logs_are_exit_only(summary: Summary) -> bool:
+    """True when no failed job has informative content beyond exit/noise/benign.
+
+    Benign progress/warning/echo lines (Step 9) count as uninformative, so a job
+    whose only output is setup/pull-progress + an exit code is uninformative and
+    the cause must be taken from the pipeline (R17).
+    """
     if not summary.failed_jobs:
         return False
     for job in summary.failed_jobs:
@@ -1551,7 +1597,9 @@ def _job_logs_are_exit_only(summary: Summary) -> bool:
         informative = [
             ln
             for ln in lines
-            if not _EXIT_ONLY_RE.match(ln) and not _NOISE_LINE_RE.match(ln)
+            if not _EXIT_ONLY_RE.match(ln)
+            and not _NOISE_LINE_RE.match(ln)
+            and not is_benign_line(ln)
         ]
         if informative:
             return False
