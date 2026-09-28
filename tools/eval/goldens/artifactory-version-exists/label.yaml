@@ -1,0 +1,16 @@
+schema_version: '1.0'
+slug: artifactory-version-exists
+source: synthetic
+captured_from_run: null
+captured_at: '2026-09-01'
+labelled_by: seed
+labelled_at: '2026-09-01'
+notes: null
+true_category: dependency
+is_infra_vs_code: code
+is_flaky: false
+expect_short_circuit: null
+root_cause: The package version already exists in the registry; the publish step refuses
+  to overwrite.
+acceptable_fixes:
+- Bump the package version and republish.

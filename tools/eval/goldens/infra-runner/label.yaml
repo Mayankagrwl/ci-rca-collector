@@ -1,0 +1,15 @@
+schema_version: '1.0'
+slug: infra-runner
+source: synthetic
+captured_from_run: null
+captured_at: '2026-09-01'
+labelled_by: seed
+labelled_at: '2026-09-01'
+notes: null
+true_category: infra_runner
+is_infra_vs_code: infra
+is_flaky: false
+expect_short_circuit: infra_runner
+root_cause: The runner died mid-job (received a shutdown signal).
+acceptable_fixes:
+- Re-run the job; check runner/GitHub health if widespread.

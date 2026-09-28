@@ -1,0 +1,15 @@
+schema_version: '1.0'
+slug: flake-same-sha
+source: synthetic
+captured_from_run: null
+captured_at: '2026-09-01'
+labelled_by: seed
+labelled_at: '2026-09-01'
+notes: null
+true_category: test_failure
+is_infra_vs_code: code
+is_flaky: true
+expect_short_circuit: flake_same_sha_passed
+root_cause: The same SHA previously passed; the failure is flaky.
+acceptable_fixes:
+- Re-run; treat as flaky until it repeats on a clean SHA.

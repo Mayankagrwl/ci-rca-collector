@@ -146,6 +146,7 @@ def analyze_summary(
         record = _apply_grounding_gate(summary, record, evidence, caller)
         redacted = redact_record(record)
         redacted = finalize_user_card(summary, redacted)
+        redacted = _attach_validation(summary, redacted, evidence)
         if redacted.status == "ok":
             _cache_put(cache_dir, key, redacted)
         return redacted
@@ -893,6 +894,116 @@ def _stamp_grounding(summary: Summary, record: AnalysisRecord) -> AnalysisRecord
     if not grounded and result.confidence == "high":
         updates["result"] = result.model_copy(update={"confidence": "medium"})
     return record.model_copy(update=updates)
+
+
+def _attach_validation(
+    summary: Summary, record: AnalysisRecord, evidence: str
+) -> AnalysisRecord:
+    """Post-hoc grounding (eval-spec §4) + validation/cost telemetry, then §4.4
+    display policy. No model call. Never crashes: on error, grounding=None +
+    caveat and the RCA is still published (a broken validator suppresses nothing).
+    """
+    try:
+        from . import validate
+        from .models import AnalysisResult
+
+        result = record.result
+        scored = result if result is not None else AnalysisResult(
+            root_cause="", suggested_fix="", confidence="low"
+        )
+        grounding = validate.check_grounding(scored, evidence, summary)
+        telemetry = _validation_telemetry(record)
+        call = _call_telemetry(record, evidence)
+        notes = list(record.notes)
+
+        is_model = (
+            result is not None
+            and record.model_called
+            and (result.source or "") in {"ai", "hybrid", "mixed"}
+        )
+        updates: dict[str, Any] = {
+            "grounding": grounding,
+            "validation_telemetry": telemetry,
+            "call_telemetry": call,
+        }
+        if is_model and result is not None:
+            action = validate.display_action(grounding)
+            rate = grounding.grounding_rate
+            if action == "strip":
+                dropped = set(grounding.ungrounded_citations)
+                kept = [c for c in result.citations if c.quote not in dropped]
+                notes.append(
+                    f"grounding: stripped {len(dropped)} ungrounded citation(s) "
+                    f"(evidence rate {rate:.2f})"
+                )
+                summary.collection_notes.append(notes[-1])
+                updates["result"] = result.model_copy(update={"citations": kept})
+                updates["notes"] = notes
+            elif action == "fallback":
+                det = analysis_result_from_summary(summary, source="deterministic")
+                if (result.root_cause or "").strip():
+                    notes.append(f"model root_cause: {result.root_cause}")
+                notes.append(
+                    f"grounding: model answer not grounded in evidence "
+                    f"(rate {rate:.2f}); using deterministic card"
+                )
+                summary.collection_notes.append(notes[-1])
+                updates["result"] = det
+                updates["status"] = "unvalidated"  # → needs-review (Step 5)
+                updates["notes"] = notes
+        record = record.model_copy(update=updates)
+        return redact_record(record)
+    except Exception as exc:  # noqa: BLE001 — a broken validator must not suppress
+        _LOG.exception("grounding validation error")
+        note = f"grounding validation skipped: {exc}"
+        try:
+            summary.collection_notes.append(note)
+        except Exception:  # noqa: BLE001
+            pass
+        return record.model_copy(
+            update={"grounding": None, "notes": list(record.notes) + [note]}
+        )
+
+
+def _validation_telemetry(record: AnalysisRecord) -> Any:
+    from .models import ValidationTelemetry
+
+    notes = list(record.notes)
+    repair_attempted = any("repair" in note.lower() for note in notes)
+    parse_error: str | None = None
+    for note in notes:
+        if "parse_error" in note.lower():
+            parse_error = note[:200]
+            break
+    valid_first_try = (
+        record.status in {"ok", "cached"} and not repair_attempted and parse_error is None
+    )
+    return ValidationTelemetry(
+        schema_valid_first_try=valid_first_try,
+        repair_attempted=repair_attempted,
+        repair_succeeded=repair_attempted and record.status in {"ok", "cached"},
+        parse_error=parse_error,
+        fallback_used=bool(record.fallback_used),
+    )
+
+
+def _call_telemetry(record: AnalysisRecord, evidence: str) -> Any:
+    from .models import CallTelemetry
+
+    latency: int | None = None
+    for resp in record.stgpt_responses or []:
+        duration = resp.get("duration_ms") if isinstance(resp, dict) else None
+        if isinstance(duration, (int, float)):
+            latency = (latency or 0) + int(duration)
+    completion = record.raw_completion if isinstance(record.raw_completion, str) else ""
+    return CallTelemetry(
+        prompt_tokens_est=len(evidence) // 4,
+        completion_tokens_est=len(completion) // 4,
+        latency_ms=latency,
+        total_pipeline_ms=latency,
+        short_circuited=not record.model_called,
+        cache_hit=bool(record.cache_hit),
+    )
 
 
 def _finalize_card(summary: Summary, record: AnalysisRecord) -> AnalysisRecord:

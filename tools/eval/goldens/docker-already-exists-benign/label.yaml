@@ -1,0 +1,16 @@
+schema_version: '1.0'
+slug: docker-already-exists-benign
+source: synthetic
+captured_from_run: null
+captured_at: '2026-09-01'
+labelled_by: seed
+labelled_at: '2026-09-01'
+notes: null
+true_category: test_failure
+is_infra_vs_code: code
+is_flaky: false
+expect_short_circuit: null
+root_cause: An integration test assertion failed; the docker pull output is benign
+  noise.
+acceptable_fixes:
+- Fix the failing integration assertion.

@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: check-goldens-redacted
+        name: eval goldens are redacted
+        entry: python -m tools.eval.check_goldens_redacted --goldens tools/eval/goldens
+        language: system
+        pass_filenames: false
+        files: ^tools/eval/goldens/

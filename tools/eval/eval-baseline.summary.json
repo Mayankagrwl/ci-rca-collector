@@ -1,0 +1,75 @@
+{
+  "headline": {
+    "category_accuracy": 0.9,
+    "infra_vs_code_accuracy": 0.9,
+    "short_circuit_accuracy": 1.0,
+    "grounding_rate": 0.0,
+    "fully_grounded_share": 0.0,
+    "schema_first_try_rate": 0.0,
+    "repair_success_rate": 0.0,
+    "fallback_rate": 0.0,
+    "mean_prompt_tokens": 0.0,
+    "mean_latency_ms": 0.0,
+    "short_circuit_share": 0.0,
+    "flake_precision": 1.0,
+    "flake_recall": 1.0,
+    "flake_f1": 1.0
+  },
+  "deltas": {
+    "category_accuracy": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "infra_vs_code_accuracy": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "short_circuit_accuracy": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "grounding_rate": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "fully_grounded_share": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "schema_first_try_rate": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "fallback_rate": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "mean_prompt_tokens": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "mean_latency_ms": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    },
+    "short_circuit_share": {
+      "delta": 0.0,
+      "noise_band": 0.0
+    }
+  },
+  "within_variance": [],
+  "changed_goldens": [],
+  "fail_under": {
+    "category_accuracy": {
+      "threshold": 0.7,
+      "value": 0.9,
+      "passed": true
+    },
+    "grounding_rate": {
+      "threshold": 0.0,
+      "value": 0.0,
+      "passed": true
+    }
+  },
+  "gate_passed": true
+}

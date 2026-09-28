@@ -1,0 +1,75 @@
+name: RCA eval
+
+on:
+  pull_request:
+    paths:
+      - tools/rca/prompt.py
+      - tools/rca/config.py
+      - tools/rca/analyze.py
+      - tools/rca/validate.py
+      - tools/eval/**
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Number of analyze runs per golden (variance)
+        required: false
+        default: '3'
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      # Map the workflow's LLM secrets to the env names the analyze path reads
+      # (config.resolve_stgpt_api_key / resolve_stgpt_api_url).
+      STGPT_API: ${{ secrets.LLM_KEY }}
+      STGPT_API_URL: ${{ secrets.LLM_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: pip install --disable-pip-version-check -r requirements.txt pytest
+
+      - name: Check goldens are redacted
+        run: python -m tools.eval.check_goldens_redacted --goldens tools/eval/goldens
+
+      - name: Run eval
+        run: |
+          set -euo pipefail
+          RUNS="${{ github.event.inputs.runs || '3' }}"
+          EXTRA=()
+          if [ -z "${STGPT_API:-}" ]; then
+            # No LLM creds available → deterministic-only run (network-free).
+            EXTRA+=(--no-llm)
+            RUNS=1
+          fi
+          python -m tools.eval.run_eval \
+            --goldens tools/eval/goldens \
+            --runs "$RUNS" \
+            --out eval-results.json \
+            "${EXTRA[@]}"
+
+      - name: Report + gate
+        run: |
+          set -euo pipefail
+          python -m tools.eval.report \
+            --results eval-results.json \
+            --baseline tools/eval/eval-baseline.json \
+            --fail-under grounding_rate=0.95,category_accuracy=0.70 \
+            --format markdown | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval-results.json

@@ -452,6 +452,40 @@ class AnalysisResult(BaseModel):
     source: str | None = None
 
 
+class GroundingResult(BaseModel):
+    """Prompt-evidence grounding score (eval-spec §4.1, mapped to real fields).
+
+    Distinct from ``AnalysisRecord.grounded`` (the failed-step anchor check that
+    drives the Step 5 confidence cap): this is the anti-fabrication rate — every
+    citation quote must appear in the sent evidence after §4.2 normalisation.
+    """
+
+    grounded: bool = False
+    citation_count: int = 0
+    ungrounded_citations: list[str] = []
+    grounding_rate: float = 0.0
+    component_grounded: bool | None = None
+    shas_grounded: bool | None = None
+    checks_run: list[str] = []
+
+
+class ValidationTelemetry(BaseModel):
+    schema_valid_first_try: bool | None = None
+    repair_attempted: bool = False
+    repair_succeeded: bool = False
+    parse_error: str | None = None  # capped at 200 chars
+    fallback_used: bool = False
+
+
+class CallTelemetry(BaseModel):
+    prompt_tokens_est: int = 0
+    completion_tokens_est: int = 0
+    latency_ms: int | None = None
+    total_pipeline_ms: int | None = None
+    short_circuited: bool = False
+    cache_hit: bool = False
+
+
 class AnalysisRecord(BaseModel):
     status: AnalysisStatus
     prompt_version: str = "p2.4"
@@ -469,3 +503,6 @@ class AnalysisRecord(BaseModel):
     reason_code: str | None = None
     model_called: bool = False
     grounded: bool | None = None
+    grounding: GroundingResult | None = None
+    validation_telemetry: ValidationTelemetry | None = None
+    call_telemetry: CallTelemetry | None = None

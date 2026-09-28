@@ -1,0 +1,140 @@
+{
+  "schema_version": "1.0",
+  "collector_version": "0.1.0",
+  "collected_at": "2026-09-01T00:00:00Z",
+  "run": {
+    "run_id": 1,
+    "run_attempt": 1,
+    "workflow_name": "CI",
+    "html_url": "https://ci.example.invalid/runs/1",
+    "event": "push",
+    "actor": "bot",
+    "head_sha": "0000000000000000000000000000000000000000",
+    "head_branch": "main",
+    "pr_number": null,
+    "pr_url": null,
+    "is_fork": false,
+    "head_repo": null,
+    "concurrent_failures": 0,
+    "concurrent_workflows": [],
+    "concurrent_branches": [],
+    "failed_job_total": 1,
+    "failed_jobs_analysed": 1,
+    "matrix_legs_identical": false
+  },
+  "verdict": {
+    "short_circuit": null,
+    "requires_analysis": true,
+    "reason": null
+  },
+  "classification": {
+    "category": "unknown",
+    "confidence": "low",
+    "matched_pattern": null,
+    "matched_line": null,
+    "other_matches": [],
+    "is_infra_vs_code": "unknown",
+    "is_flaky": false,
+    "matched_stream": null
+  },
+  "failed_jobs": [
+    {
+      "job_id": 1,
+      "name": "ci",
+      "failed_step_name": "Run unit tests",
+      "failed_step_number": 3,
+      "exit_code": 1,
+      "duration_seconds": 20,
+      "log_unavailable": false,
+      "queue_seconds": null,
+      "runner": null,
+      "steps": [],
+      "log_lines_raw": 0,
+      "log_lines_clean": 0,
+      "log_bytes": 0,
+      "windows": [
+        {
+          "label": "first_error",
+          "start_line": 1,
+          "end_line": 3,
+          "total_lines": 3,
+          "content": "Using unit test service: maven_unit_test\ntime=\"t\" level=warning msg=\"No services to build\"\n##[error]Process completed with exit code 1.",
+          "truncated": false
+        }
+      ],
+      "stack_traces": [],
+      "error_lines": [
+        {
+          "line_number": 1,
+          "text": "Using unit test service: maven_unit_test"
+        },
+        {
+          "line_number": 2,
+          "text": "time=\"t\" level=warning msg=\"No services to build\""
+        },
+        {
+          "line_number": 3,
+          "text": "##[error]Process completed with exit code 1."
+        }
+      ],
+      "annotations": [],
+      "timeout_minutes": null,
+      "failed_step_excerpt": {
+        "name": "Run unit tests",
+        "lines": [
+          "Using unit test service: maven_unit_test",
+          "time=\"t\" level=warning msg=\"No services to build\"",
+          "##[error]Process completed with exit code 1."
+        ]
+      },
+      "primary_failure_line": "[ERROR] /work/src/test/TestConfig.java:[19,40] cannot find symbol"
+    }
+  ],
+  "junit": null,
+  "artifacts": [],
+  "pipeline_logs": [
+    {
+      "artifact_name": "pipeline-logs-test",
+      "stage": "test",
+      "file": "mvn.log",
+      "phase": "run",
+      "step_name": null,
+      "windows": [
+        {
+          "label": "first_error",
+          "start_line": 1,
+          "end_line": 3,
+          "total_lines": 3,
+          "content": "[ERROR] COMPILATION ERROR :\n[ERROR] /work/src/test/TestConfig.java:[19,40] cannot find symbol\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.11:testCompile",
+          "truncated": false
+        }
+      ],
+      "error_lines": [
+        {
+          "line_number": 1,
+          "text": "[ERROR] COMPILATION ERROR :"
+        }
+      ],
+      "stack_traces": [],
+      "templates": []
+    }
+  ],
+  "last_green_compare": null,
+  "code_context": null,
+  "diagnosis": null,
+  "drain": null,
+  "changes": null,
+  "history": null,
+  "fingerprint": "ffffffffffffffff",
+  "fingerprint_coarse": "cccccccccccccccc",
+  "kubernetes": null,
+  "budget_report": {
+    "total_cap_tokens": 6000,
+    "total_used_tokens": 0,
+    "section_used": {},
+    "trimmed": [],
+    "t1_overrun": false,
+    "t1_raised_to": null
+  },
+  "collection_notes": []
+}

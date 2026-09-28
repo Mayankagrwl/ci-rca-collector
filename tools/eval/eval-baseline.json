@@ -1,0 +1,227 @@
+{
+  "metrics": {
+    "n_goldens": 10,
+    "n_runs": 1,
+    "category_accuracy": {
+      "mean": 0.9,
+      "stdev": 0.0,
+      "min": 0.9,
+      "max": 0.9
+    },
+    "category_confusion": {
+      "dependency": {
+        "unknown": 1,
+        "dependency": 1
+      },
+      "test_failure": {
+        "test_failure": 3
+      },
+      "image_pull": {
+        "image_pull": 1
+      },
+      "infra_runner": {
+        "infra_runner": 1
+      },
+      "compile": {
+        "compile": 1
+      },
+      "oom": {
+        "oom": 1
+      },
+      "timeout": {
+        "timeout": 1
+      }
+    },
+    "infra_vs_code_accuracy": {
+      "mean": 0.9,
+      "stdev": 0.0,
+      "min": 0.9,
+      "max": 0.9
+    },
+    "flake_detection": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    "short_circuit_accuracy": {
+      "mean": 1.0,
+      "stdev": 0.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "grounding_rate": {
+      "mean": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "fully_grounded_share": {
+      "mean": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "schema_first_try_rate": {
+      "mean": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "repair_success_rate": {
+      "mean": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "fallback_rate": {
+      "mean": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "mean_prompt_tokens": {
+      "mean": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "mean_latency_ms": {
+      "mean": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "short_circuit_share": {
+      "mean": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "median_golden_age_days": 27,
+    "stale_goldens": []
+  },
+  "per_golden": [
+    {
+      "slug": "artifactory-version-exists",
+      "category": "unknown",
+      "infra_vs_code": "unknown",
+      "is_flaky": false,
+      "short_circuit": null,
+      "category_correct": false,
+      "infra_vs_code_correct": false,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "docker-already-exists-benign",
+      "category": "test_failure",
+      "infra_vs_code": "code",
+      "is_flaky": false,
+      "short_circuit": null,
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "flake-same-sha",
+      "category": "test_failure",
+      "infra_vs_code": "code",
+      "is_flaky": true,
+      "short_circuit": "flake_same_sha_passed",
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "image-pull",
+      "category": "image_pull",
+      "infra_vs_code": "infra",
+      "is_flaky": false,
+      "short_circuit": null,
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "infra-runner",
+      "category": "infra_runner",
+      "infra_vs_code": "infra",
+      "is_flaky": false,
+      "short_circuit": "infra_runner",
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "java-compile-in-pipeline",
+      "category": "compile",
+      "infra_vs_code": "code",
+      "is_flaky": false,
+      "short_circuit": null,
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "npm-eresolve",
+      "category": "dependency",
+      "infra_vs_code": "code",
+      "is_flaky": false,
+      "short_circuit": null,
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "oom",
+      "category": "oom",
+      "infra_vs_code": "code",
+      "is_flaky": false,
+      "short_circuit": null,
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "test-failure-junit",
+      "category": "test_failure",
+      "infra_vs_code": "code",
+      "is_flaky": false,
+      "short_circuit": null,
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    },
+    {
+      "slug": "timeout",
+      "category": "timeout",
+      "infra_vs_code": "infra",
+      "is_flaky": false,
+      "short_circuit": null,
+      "category_correct": true,
+      "infra_vs_code_correct": true,
+      "is_flaky_correct": true,
+      "short_circuit_correct": true
+    }
+  ],
+  "provenance": {
+    "model": "trinity_for_api,alfred_for_api",
+    "endpoint": "https://api-ai-bridge-dev.st.com/chatgpt/api/client-apps",
+    "prompt_version": "p2.4",
+    "prompt_hash": "c523049962df1f75",
+    "collector_version": "0.1.0",
+    "git_sha": "b4805d85a5c5e8a605b79aa332bbf9adf8328c97",
+    "runs": 3,
+    "seed": null
+  },
+  "filters": {},
+  "no_llm": true
+}

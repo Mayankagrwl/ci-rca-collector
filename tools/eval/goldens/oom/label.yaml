@@ -1,0 +1,16 @@
+schema_version: '1.0'
+slug: oom
+source: synthetic
+captured_from_run: null
+captured_at: '2026-09-01'
+labelled_by: seed
+labelled_at: '2026-09-01'
+notes: null
+true_category: oom
+is_infra_vs_code: code
+is_flaky: false
+expect_short_circuit: null
+root_cause: "The process ran out of memory (V8 heap exhaustion) \u2014 an application/config\
+  \ limit, not runner infra."
+acceptable_fixes:
+- Raise the memory limit or reduce peak allocation.

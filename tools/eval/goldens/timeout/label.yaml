@@ -1,0 +1,15 @@
+schema_version: '1.0'
+slug: timeout
+source: synthetic
+captured_from_run: null
+captured_at: '2026-09-01'
+labelled_by: seed
+labelled_at: '2026-09-01'
+notes: null
+true_category: timeout
+is_infra_vs_code: infra
+is_flaky: false
+expect_short_circuit: null
+root_cause: The step exceeded its deadline (context deadline exceeded).
+acceptable_fixes:
+- Raise the timeout or fix the hang.

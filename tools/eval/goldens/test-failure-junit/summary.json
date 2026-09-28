@@ -1,0 +1,122 @@
+{
+  "schema_version": "1.0",
+  "collector_version": "0.1.0",
+  "collected_at": "2026-09-01T00:00:00Z",
+  "run": {
+    "run_id": 1,
+    "run_attempt": 1,
+    "workflow_name": "CI",
+    "html_url": "https://ci.example.invalid/runs/1",
+    "event": "push",
+    "actor": "bot",
+    "head_sha": "0000000000000000000000000000000000000000",
+    "head_branch": "main",
+    "pr_number": null,
+    "pr_url": null,
+    "is_fork": false,
+    "head_repo": null,
+    "concurrent_failures": 0,
+    "concurrent_workflows": [],
+    "concurrent_branches": [],
+    "failed_job_total": 1,
+    "failed_jobs_analysed": 1,
+    "matrix_legs_identical": false
+  },
+  "verdict": {
+    "short_circuit": null,
+    "requires_analysis": true,
+    "reason": null
+  },
+  "classification": {
+    "category": "unknown",
+    "confidence": "low",
+    "matched_pattern": null,
+    "matched_line": null,
+    "other_matches": [],
+    "is_infra_vs_code": "unknown",
+    "is_flaky": false,
+    "matched_stream": null
+  },
+  "failed_jobs": [
+    {
+      "job_id": 1,
+      "name": "ci",
+      "failed_step_name": "Run tests",
+      "failed_step_number": 3,
+      "exit_code": 1,
+      "duration_seconds": 20,
+      "log_unavailable": false,
+      "queue_seconds": null,
+      "runner": null,
+      "steps": [],
+      "log_lines_raw": 0,
+      "log_lines_clean": 0,
+      "log_bytes": 0,
+      "windows": [
+        {
+          "label": "first_error",
+          "start_line": 1,
+          "end_line": 2,
+          "total_lines": 2,
+          "content": "E   AssertionError: expected 1 to equal 2\n##[error]Process completed with exit code 1.",
+          "truncated": false
+        }
+      ],
+      "stack_traces": [],
+      "error_lines": [
+        {
+          "line_number": 1,
+          "text": "E   AssertionError: expected 1 to equal 2"
+        },
+        {
+          "line_number": 2,
+          "text": "##[error]Process completed with exit code 1."
+        }
+      ],
+      "annotations": [],
+      "timeout_minutes": null,
+      "failed_step_excerpt": {
+        "name": "Run tests",
+        "lines": [
+          "E   AssertionError: expected 1 to equal 2",
+          "##[error]Process completed with exit code 1."
+        ]
+      },
+      "primary_failure_line": "E   AssertionError: expected 1 to equal 2"
+    }
+  ],
+  "junit": {
+    "total_failures": 1,
+    "total_tests": 42,
+    "failures": [
+      {
+        "classname": "tests.test_math",
+        "name": "test_add",
+        "message": "expected 1 to equal 2",
+        "body": "E   assert 1 == 2",
+        "count": 1
+      }
+    ],
+    "source_artifact": null
+  },
+  "artifacts": [],
+  "pipeline_logs": [],
+  "last_green_compare": null,
+  "code_context": null,
+  "diagnosis": null,
+  "drain": null,
+  "changes": null,
+  "history": null,
+  "fingerprint": "ffffffffffffffff",
+  "fingerprint_coarse": "cccccccccccccccc",
+  "kubernetes": null,
+  "budget_report": {
+    "total_cap_tokens": 6000,
+    "total_used_tokens": 0,
+    "section_used": {},
+    "trimmed": [],
+    "t1_overrun": false,
+    "t1_raised_to": null
+  },
+  "collection_notes": []
+}
