@@ -26,6 +26,12 @@ _ACCEPT = "application/vnd.github+json"
 _DEFAULT_TIMEOUT = 30.0
 _MAX_ATTEMPTS = 3
 _JOBS_PER_PAGE = 100
+_LIST_PER_PAGE = 100
+_MAX_LIST_PAGES = 10
+# Reactions graduated from preview, but older GHES still requires the preview media type.
+_REACTIONS_ACCEPT = (
+    "application/vnd.github.squirrel-girl-preview+json, application/vnd.github+json"
+)
 
 
 class GitHubAPIError(Exception):
@@ -149,20 +155,30 @@ class GitHubClient:
         *,
         follow_redirects: bool = False,
         headers: dict[str, str] | None = None,
+        json: Any | None = None,
+        idempotent: bool = True,
     ) -> httpx.Response:
+        # idempotent=False is for requests that *create* something (comments, issues,
+        # reactions). A timeout or a dropped connection after the request was sent is an
+        # ambiguous outcome: GitHub may already have created the resource, so a blind retry
+        # would post duplicates. Those requests therefore fail fast on timeout / protocol
+        # errors. ConnectError (nothing was sent), 5xx and retry-after are still retried.
+        # Do not "simplify" this back to always-retry.
         last_error: Exception | None = None
         secondary_slept = False
+        request_kwargs: dict[str, Any] = {
+            "follow_redirects": follow_redirects,
+            "headers": headers,
+        }
+        if json is not None:
+            # Omitted entirely when absent so GET requests stay byte-identical.
+            request_kwargs["json"] = json
         for attempt in range(_MAX_ATTEMPTS):
             try:
-                response = self._client.request(
-                    method,
-                    url,
-                    follow_redirects=follow_redirects,
-                    headers=headers,
-                )
+                response = self._client.request(method, url, **request_kwargs)
             except httpx.TimeoutException as exc:
                 last_error = GitHubAPIError(f"timeout talking to GitHub API ({method} {url})")
-                if attempt == _MAX_ATTEMPTS - 1:
+                if not idempotent or attempt == _MAX_ATTEMPTS - 1:
                     raise last_error from exc
                 self._sleep(2**attempt)
                 continue
@@ -172,7 +188,8 @@ class GitHubClient:
                 last_error = GitHubAPIError(
                     f"connection error talking to GitHub API ({method} {url}): {exc}"
                 )
-                if attempt == _MAX_ATTEMPTS - 1:
+                ambiguous = not isinstance(exc, httpx.ConnectError)
+                if (ambiguous and not idempotent) or attempt == _MAX_ATTEMPTS - 1:
                     raise last_error from exc
                 self._sleep(2**attempt)
                 continue
@@ -432,6 +449,160 @@ class GitHubClient:
         if response.status_code >= 400:
             return None
         return response.text
+
+    # ---- Delivery (Phase 3) read / write methods. Capability only; no callers in collect.
+
+    def _json_object(self, response: httpx.Response, what: str) -> dict[str, Any]:
+        if response.status_code >= 400:
+            raise GitHubAPIError(
+                f"failed to {what} ({response.status_code})",
+                status_code=response.status_code,
+            )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise GitHubAPIError(f"{what}: payload was not an object")
+        return payload
+
+    def _paginate(self, url: str, what: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        next_url: str | None = url
+        pages = 0
+        while next_url and pages < _MAX_LIST_PAGES:
+            response = self._request("GET", next_url)
+            if response.status_code >= 400:
+                raise GitHubAPIError(
+                    f"failed to {what} ({response.status_code})",
+                    status_code=response.status_code,
+                )
+            page = response.json()
+            if not isinstance(page, list):
+                raise GitHubAPIError(f"{what}: payload was not a list")
+            items.extend(page)
+            pages += 1
+            next_url = _next_link(response.headers.get("link") or response.headers.get("Link"))
+        return items
+
+    def get_repo(self, repo: str) -> dict[str, Any]:
+        response = self._request("GET", f"repos/{repo}")
+        return self._json_object(response, f"fetch repo {repo}")
+
+    def list_issue_comments(self, repo: str, issue_number: int) -> list[dict[str, Any]]:
+        return self._paginate(
+            f"repos/{repo}/issues/{issue_number}/comments?per_page={_LIST_PER_PAGE}",
+            f"list comments on #{issue_number}",
+        )
+
+    def create_issue_comment(self, repo: str, issue_number: int, body: str) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            f"repos/{repo}/issues/{issue_number}/comments",
+            json={"body": body},
+            idempotent=False,
+        )
+        return self._json_object(response, f"create comment on #{issue_number}")
+
+    def update_issue_comment(self, repo: str, comment_id: int, body: str) -> dict[str, Any]:
+        response = self._request(
+            "PATCH",
+            f"repos/{repo}/issues/comments/{comment_id}",
+            json={"body": body},
+        )
+        return self._json_object(response, f"update issue comment {comment_id}")
+
+    def list_commit_comments(self, repo: str, sha: str) -> list[dict[str, Any]]:
+        return self._paginate(
+            f"repos/{repo}/commits/{quote(str(sha), safe='')}/comments"
+            f"?per_page={_LIST_PER_PAGE}",
+            f"list comments on commit {sha}",
+        )
+
+    def create_commit_comment(self, repo: str, sha: str, body: str) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            f"repos/{repo}/commits/{quote(str(sha), safe='')}/comments",
+            json={"body": body},
+            idempotent=False,
+        )
+        return self._json_object(response, f"create comment on commit {sha}")
+
+    def update_commit_comment(self, repo: str, comment_id: int, body: str) -> dict[str, Any]:
+        response = self._request(
+            "PATCH",
+            f"repos/{repo}/comments/{comment_id}",
+            json={"body": body},
+        )
+        return self._json_object(response, f"update commit comment {comment_id}")
+
+    def list_issues(
+        self,
+        repo: str,
+        labels: list[str] | None = None,
+        state: str = "open",
+    ) -> list[dict[str, Any]]:
+        query = [f"state={quote(state, safe='')}", f"per_page={_LIST_PER_PAGE}"]
+        if labels:
+            query.append(f"labels={quote(','.join(labels), safe=',')}")
+        return self._paginate(f"repos/{repo}/issues?{'&'.join(query)}", "list issues")
+
+    def create_issue(
+        self,
+        repo: str,
+        title: str,
+        body: str,
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"title": title, "body": body}
+        if labels:
+            payload["labels"] = list(labels)
+        if assignees:
+            payload["assignees"] = list(assignees)
+        response = self._request(
+            "POST", f"repos/{repo}/issues", json=payload, idempotent=False
+        )
+        return self._json_object(response, "create issue")
+
+    def update_issue(self, repo: str, number: int, **fields: Any) -> dict[str, Any]:
+        payload = {key: value for key, value in fields.items() if value is not None}
+        response = self._request("PATCH", f"repos/{repo}/issues/{number}", json=payload)
+        return self._json_object(response, f"update issue #{number}")
+
+    def add_labels(self, repo: str, issue_number: int, labels: list[str]) -> dict[str, Any]:
+        """Add labels. GitHub returns a list; it is wrapped as {"labels": [...]}."""
+        response = self._request(
+            "POST",
+            f"repos/{repo}/issues/{issue_number}/labels",
+            json={"labels": list(labels)},
+        )
+        if response.status_code >= 400:
+            raise GitHubAPIError(
+                f"failed to add labels to #{issue_number} ({response.status_code})",
+                status_code=response.status_code,
+            )
+        payload = response.json()
+        return {"labels": payload if isinstance(payload, list) else []}
+
+    def create_reaction(self, repo: str, comment_id: int, content: str) -> dict[str, Any]:
+        """React to an issue comment. Best-effort: any failure returns {} and never raises."""
+        try:
+            response = self._request(
+                "POST",
+                f"repos/{repo}/issues/comments/{comment_id}/reactions",
+                json={"content": content},
+                headers={"Accept": _REACTIONS_ACCEPT},
+                idempotent=False,
+            )
+        except GitHubAPIError as exc:
+            _LOG.info("reaction on comment %s skipped: %s", comment_id, exc)
+            return {}
+        if not 200 <= response.status_code < 300:
+            _LOG.info("reaction on comment %s skipped (%s)", comment_id, response.status_code)
+            return {}
+        try:
+            payload = response.json()
+        except ValueError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     def _fetch_redirect_body(self, location: str) -> str | None:
         # Signed blob URLs must not inherit the GitHub Authorization header.
