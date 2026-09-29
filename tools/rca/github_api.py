@@ -376,8 +376,13 @@ class GitHubClient:
             return None
         return response.content
 
-    def get_file(self, repo: str, path: str, ref: str) -> str | None:
-        """Fetch a file at *ref*. 404/403 return None; never raises for those."""
+    def get_file(
+        self, repo: str, path: str, ref: str, *, allow_empty: bool = False
+    ) -> str | None:
+        """Fetch a file at *ref*. 404/403 return None; never raises for those.
+
+        An existing empty file is ``None`` too unless ``allow_empty`` (then ``""``).
+        """
         quoted = quote(path.lstrip("/"), safe="/")
         url = f"repos/{repo}/contents/{quoted}?ref={quote(str(ref), safe='')}"
         try:
@@ -400,6 +405,8 @@ class GitHubClient:
         if payload.get("type") and payload.get("type") != "file":
             return None
         content = payload.get("content")
+        if allow_empty and content == "":
+            return ""
         if not isinstance(content, str) or not content.strip():
             return None
         try:
@@ -584,6 +591,15 @@ class GitHubClient:
         if response.status_code == 404:
             return None
         return self._json_object(response, f"fetch issue #{number}")
+
+    def add_assignees(self, repo: str, number: int, assignees: list[str]) -> dict[str, Any]:
+        """Add assignees to an issue (additive; never removes existing ones)."""
+        response = self._request(
+            "POST",
+            f"repos/{repo}/issues/{int(number)}/assignees",
+            json={"assignees": list(assignees)},
+        )
+        return self._json_object(response, f"assign issue #{number}")
 
     def update_issue(self, repo: str, number: int, **fields: Any) -> dict[str, Any]:
         payload = {key: value for key, value in fields.items() if value is not None}

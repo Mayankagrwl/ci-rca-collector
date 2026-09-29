@@ -7,6 +7,7 @@ Every request is recorded; ``transcript()`` renders them one per line.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from dataclasses import dataclass, field
@@ -72,6 +73,8 @@ class FakeGitHub:
     commit_comments: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     labels: dict[int, list[str]] = field(default_factory=dict)
     issues: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Repo files served by the contents API: {(path, ref): text}; ref None = any ref.
+    files: dict[tuple[str, str | None], str] = field(default_factory=dict)
     requests: list[Recorded] = field(default_factory=list)
     faults: list[Fault] = field(default_factory=list)
     # Called after each request is served (e.g. to simulate a concurrent run).
@@ -124,6 +127,7 @@ class FakeGitHub:
             "body": body,
             "state": state,
             "labels": [{"name": name} for name in labels],
+            "assignees": [],
             "html_url": f"{WEB}/acme/widgets/issues/{number}",
             "created_at": stamp,
             "updated_at": stamp,
@@ -190,6 +194,21 @@ class FakeGitHub:
                 comment = self._new_comment(body["body"], f"{WEB}/acme/widgets/pull/{m[1]}", "bot")
                 items.append(comment)
                 return httpx.Response(201, json=comment)
+        if method == "GET" and (m := re.fullmatch(r"/contents/(.+)", rest)):
+            ref = parse_qs(request.url.query.decode()).get("ref", [None])[0]
+            text = self.files.get((m[1], ref), self.files.get((m[1], None)))
+            if text is None:
+                return _not_found()
+            encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            return httpx.Response(200, json={"type": "file", "encoding": "base64", "content": encoded})
+        if method == "POST" and (m := re.fullmatch(r"/issues/(\d+)/assignees", rest)):
+            issue = self.issues.get(int(m[1]))
+            if issue is None:
+                return _not_found()
+            for login in body.get("assignees", []):
+                if login not in [a["login"] for a in issue["assignees"]]:
+                    issue["assignees"].append({"login": login})
+            return httpx.Response(201, json=dict(issue))
         if rest == "/issues":
             if method == "GET":
                 return self._list_issues(request)

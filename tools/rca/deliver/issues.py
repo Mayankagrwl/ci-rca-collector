@@ -27,6 +27,7 @@ from ..drain_index import template_hash
 from ..github_api import GitHubAPIError
 from ..models import FailureRecord, Summary
 from ..redact import redact_text
+from .owners import assignable_logins
 from .render_comment import category_words, fence_for, safe_text
 from .sticky import BUDGET_EXCEEDED, DeliveryBudget
 
@@ -160,20 +161,38 @@ def issue_title(record: FailureRecord, *, fork: bool = False) -> str:
     return title if len(title) <= TITLE_CAP else title[: TITLE_CAP - 1].rstrip() + "…"
 
 
-def _prose(record: FailureRecord, *, fix: str | None, run_url: str | None, fork: bool) -> str:
-    parts: list[str] = []
+def _paragraphs(
+    record: FailureRecord,
+    *,
+    fix: str | None,
+    run_url: str | None,
+    fork: bool,
+    owners: list[str] | None,
+) -> list[str]:
+    """Body prose: the fix on its own paragraph, then history, then the owner line."""
+    paragraphs: list[str] = []
     if fix:
-        parts.append(f"**Suggested fix** — {safe_text(fix, HEADLINE_CAP, fork=fork).rstrip('.')}.")
-    parts.append(
+        paragraphs.append(f"**Suggested fix** — {safe_text(fix, HEADLINE_CAP, fork=fork).rstrip('.')}.")
+    history = [
         f"First seen {_day(record.first_seen)}, last seen {_day(record.last_seen)}; "
         f"seen {record.count}× on {', '.join(f'`{b}`' for b in record.branches) or 'unknown branches'}."
-    )
+    ]
     latest = record.run_ids[-1] if record.run_ids else None
     if latest is not None:
-        parts.append(f"Latest run: [run {latest}]({run_url})." if run_url else f"Latest run: run {latest}.")
+        history.append(f"Latest run: [run {latest}]({run_url})." if run_url else f"Latest run: run {latest}.")
     if record.resolution:
-        parts.append(f"Resolution: {safe_text(record.resolution, HEADLINE_CAP, fork=fork)}")
-    return " ".join(parts)
+        history.append(f"Resolution: {safe_text(record.resolution, HEADLINE_CAP, fork=fork)}")
+    paragraphs.append(" ".join(history))
+    line = owner_line(owners)
+    if line:
+        paragraphs.append(line)
+    return paragraphs
+
+
+def owner_line(owners: list[str] | None) -> str | None:
+    """``Owner: `@org/team`, `@user``` — code spans, so nobody is pinged (pings are Step 18)."""
+    shown = [safe_text(o, 100).replace("`", "") for o in (owners or []) if o]
+    return "Owner: " + ", ".join(f"`{o}`" for o in shown) if shown else None
 
 
 def render_issue_body(
@@ -182,11 +201,12 @@ def render_issue_body(
     fix: str | None = None,
     run_url: str | None = None,
     fork: bool = False,
+    owners: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     """(body, notes). Shrinks prose → templates → last_summary until ≤ BODY_CAP (JSON stays valid)."""
     notes: list[str] = []
     record = sanitize_record(record)
-    prose = _prose(record, fix=fix, run_url=run_url, fork=fork)
+    prose = "\n\n".join(_paragraphs(record, fix=fix, run_url=run_url, fork=fork, owners=owners))
 
     # Sanitized once: redaction is the expensive step, and a rebuild must not repeat it.
     words = category_words(record.category)
@@ -194,7 +214,7 @@ def render_issue_body(
 
     def build(rec: FailureRecord, prose_text: str, head: str) -> str:
         heading = f"### {words}: {head}" if head else f"### {words}"
-        lines = [issue_marker(rec.fingerprint), heading, prose_text, MAINTAINED_NOTE, ""]
+        lines = [issue_marker(rec.fingerprint), heading, "", prose_text, "", MAINTAINED_NOTE, ""]
         lines += _record_block(json.loads(rec.model_dump_json()))
         return "\n".join(lines) + "\n"
 
@@ -256,6 +276,16 @@ class IssueResult:
     count_after: int | None = None
     delivered: list[str] = field(default_factory=list)
     error: str | None = None
+
+
+@dataclass
+class _WriteArgs:
+    labels: list[str] | None
+    fix: str | None
+    run_url: str | None
+    recurrence: str | None
+    fork: bool
+    owners: list[str]
 
 
 def _issue_is_ours(issue: dict[str, Any]) -> bool:
@@ -324,10 +354,17 @@ class IssuesHistoryStore:
         run_url: str | None = None,
         recurrence: str | None = None,
         fork: bool = False,
+        owners: list[str] | None = None,
     ) -> IssueResult:
-        """Create or maintain the issue for ``record.fingerprint``. Never raises."""
+        """Create or maintain the issue for ``record.fingerprint``. Never raises.
+
+        ``owners`` adds the body's owner line; ``@user`` owners are assigned best-effort.
+        """
         try:
-            return self._sync(record, labels, fix, run_url, recurrence, fork)
+            return self._sync(
+                record,
+                _WriteArgs(labels, fix, run_url, recurrence, fork, list(owners or [])),
+            )
         except Exception as exc:  # noqa: BLE001
             self._error("issue sync", exc)
             return IssueResult("failed", error=self.errors[-1])
@@ -471,15 +508,7 @@ class IssuesHistoryStore:
 
     # -- internals: write --
 
-    def _sync(
-        self,
-        record: FailureRecord,
-        labels: list[str] | None,
-        fix: str | None,
-        run_url: str | None,
-        recurrence: str | None,
-        fork: bool,
-    ) -> IssueResult:
+    def _sync(self, record: FailureRecord, args: "_WriteArgs") -> IssueResult:
         record = sanitize_record(record)
         issue = self._find(record.fingerprint)
         if issue is None and self._scan_failed:
@@ -488,8 +517,10 @@ class IssuesHistoryStore:
             self.write_failed = True
             return IssueResult("skipped", error=self.errors[-1])
         if issue is None:
-            return self._create(record, labels, fix, run_url, fork)
+            return self._create(record, args)
+        return self._update(issue, record, args)
 
+    def _update(self, issue: dict[str, Any], record: FailureRecord, args: "_WriteArgs") -> IssueResult:
         number = int(issue["number"])
         url = issue.get("html_url")
         prior = parse_record(issue.get("body"))
@@ -499,12 +530,15 @@ class IssuesHistoryStore:
         else:
             merged, before = prior.absorb(record), prior.count
         bumped = before is None or merged.count != before
-        body, notes = render_issue_body(merged, fix=fix, run_url=run_url, fork=fork)
+        body, notes = render_issue_body(
+            merged, fix=args.fix, run_url=args.run_url, fork=args.fork, owners=args.owners
+        )
         self.notes.extend(notes)
-        title = issue_title(merged, fork=fork)
+        title = issue_title(merged, fork=args.fork)
         closed = issue.get("state") == "closed"
         result = IssueResult("unchanged", number, url, before, merged.count)
         if not closed and body == issue.get("body") and title == issue.get("title"):
+            self._assign(issue, args.owners, result)
             return result
         if self.dry_run:
             result.action = f"would reopen #{number}" if closed else (
@@ -522,31 +556,28 @@ class IssuesHistoryStore:
         issue.update(body=body, title=title, state="open")
         result.action = "reopened" if closed else "updated"
         result.delivered.append("issue:reopened" if closed else "issue:updated")
-        if bumped and recurrence and self._budget_ok(f"issue #{number} recurrence comment"):
+        if bumped and args.recurrence and self._budget_ok(f"issue #{number} recurrence comment"):
             try:
-                self.client.create_issue_comment(self.repo, number, recurrence)
+                self.client.create_issue_comment(self.repo, number, args.recurrence)
             except Exception as exc:  # noqa: BLE001 — the issue itself is up to date
                 self._error(f"issue #{number} recurrence comment", exc)
         self._set_index(record.fingerprint, number)
+        self._assign(issue, args.owners, result)
         return result
 
-    def _create(
-        self,
-        record: FailureRecord,
-        labels: list[str] | None,
-        fix: str | None,
-        run_url: str | None,
-        fork: bool,
-    ) -> IssueResult:
-        body, notes = render_issue_body(record, fix=fix, run_url=run_url, fork=fork)
+    def _create(self, record: FailureRecord, args: "_WriteArgs") -> IssueResult:
+        body, notes = render_issue_body(
+            record, fix=args.fix, run_url=args.run_url, fork=args.fork, owners=args.owners
+        )
         self.notes.extend(notes)
-        title = issue_title(record, fork=fork)
-        labels = labels or default_labels(record.category)
+        title = issue_title(record, fork=args.fork)
+        labels = args.labels or default_labels(record.category)
         if self.dry_run:
             return IssueResult("would create issue", count_after=record.count)
         if not self._budget_ok("issue create"):
             return IssueResult("skipped", error=BUDGET_EXCEEDED)
         try:
+            # Never pass assignees here: an unassignable login must not fail the create.
             created = self.client.create_issue(self.repo, title, body, labels=labels)
         except GitHubAPIError as exc:
             if exc.status_code is None:
@@ -564,17 +595,30 @@ class IssuesHistoryStore:
         result = IssueResult("created", number, created.get("html_url"), None, record.count)
         result.delivered.append("issue:created")
         self._set_index(record.fingerprint, number)
-        self._self_heal(record.fingerprint, number, result)
+        kept = self._self_heal(record.fingerprint, number, result)
+        if kept is not None:
+            # Ours was closed as a duplicate: record this occurrence on the kept issue.
+            update = self._update(kept, record, args)
+            result.delivered.extend(update.delivered)
+            result.count_before, result.count_after = update.count_before, update.count_after
+            result.url = update.url or result.url
+            if update.error:
+                result.error = update.error
+        else:
+            self._assign(created, args.owners, result)
         return result
 
-    def _self_heal(self, fingerprint: str, number: int, result: IssueResult) -> None:
-        """Two concurrent runs may both create: keep the lowest, close the rest as duplicates."""
+    def _self_heal(self, fingerprint: str, number: int, result: IssueResult) -> dict[str, Any] | None:
+        """Two concurrent runs may both create: keep the lowest, close the rest as duplicates.
+
+        Returns the kept issue when it is not the one just created (else None).
+        """
         open_matches = self._scan_matches(fingerprint, refresh=True, open_only=True)
         numbers = [int(i["number"]) for i in open_matches]
         if number not in numbers:
             numbers.append(number)
         if len(numbers) < 2:
-            return
+            return None
         keep = min(numbers)
         for dup in sorted(n for n in numbers if n != keep):
             if not self._budget_ok(f"duplicate close #{dup}"):
@@ -591,6 +635,27 @@ class IssuesHistoryStore:
         result.number = keep
         if kept is not None:
             result.url = kept.get("html_url")
+        return kept if keep != number else None
+
+    def _assign(self, issue: dict[str, Any], owners: list[str], result: IssueResult) -> None:
+        """Best-effort: assign ``@user`` owners when the issue has nobody assigned yet."""
+        logins = assignable_logins(owners)
+        if not logins or self.dry_run:
+            return
+        number = int(issue["number"])
+        if issue.get("assignees"):
+            self.notes.append(f"#{number} already has assignees; left as is")
+            return
+        if self.budget.exceeded(self.clock()):
+            self.notes.append(f"could not assign #{number}: {BUDGET_EXCEEDED}")
+            return
+        try:
+            self.client.add_assignees(self.repo, number, logins)
+        except Exception as exc:  # noqa: BLE001 — a note, never a delivery error
+            self.notes.append(f"could not assign #{number} to {', '.join(logins)}: {_describe(exc)}")
+            return
+        issue["assignees"] = [{"login": login} for login in logins]
+        result.delivered.append("issue:assigned")
 
     # -- internals: bookkeeping --
 
@@ -656,6 +721,7 @@ __all__ = [
     "issue_marker",
     "issue_title",
     "marker_fingerprint",
+    "owner_line",
     "parse_record",
     "parse_record_block",
     "record_from_summary",

@@ -389,6 +389,7 @@ class DeliveryReport(BaseModel):
     errors: list[str] = []
     dry_run: bool = False
     notes: list[str] = []
+    owners: list[str] = []
 
 
 class Summary(BaseModel):

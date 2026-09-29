@@ -727,7 +727,6 @@ COMMENT_BEGIN = "<!-- BEGIN RCA COMMENT BODY (posted verbatim) -->"
 COMMENT_END = "<!-- END RCA COMMENT BODY -->"
 _DRY_RUN_NOTE = "dry run: nothing posted (pass --live to post)"
 _FLAKY_LABEL = "ci:flaky"
-_OWNER_PENDING = "assignees: none (owner resolution is Step 17)"
 _MIGRATE_PACE_S = 1.0  # GitHub secondary rate limit on content creation
 _MIGRATION_REPORT_FILE = "history-migration.md"
 _DELIVERY_TIMEOUT_S = 15
@@ -881,6 +880,8 @@ def _cmd_deliver(args: argparse.Namespace) -> int:
         delivered_to=list(outcome.get("delivered_to", [])),
         comment_url=outcome.get("comment_url"),
         issue_url=outcome.get("issue_url"),
+        owner_resolved_by=outcome.get("owner_resolved_by"),
+        owners=list(outcome.get("owners", [])),
         dry_run=not live,
         errors=errors,
         notes=notes,
@@ -976,6 +977,17 @@ def _plan_delivery(
             "live": live,
             "delivered_to": [],
         }
+        _resolve_ownership(
+            outcome,
+            summary=summary,
+            record=record,
+            inputs=inputs,
+            client=client,
+            repo=repo or "",
+            online=not isinstance(client, _OfflineClient),
+            budget=budget,
+            notes=notes,
+        )
         # The issue goes first so the comment footer can say "tracked in #N".
         _deliver_issue(
             outcome,
@@ -990,23 +1002,68 @@ def _plan_delivery(
             notes=notes,
             errors=errors,
         )
-        _deliver_comment(
-            outcome,
-            summary=summary,
-            record=record,
-            inputs=inputs,
-            client=client,
-            repo=repo or "",
-            online=not isinstance(client, _OfflineClient),
-            now=now,
-            budget=budget,
-            notes=notes,
-            errors=errors,
-        )
+        try:
+            _deliver_comment(
+                outcome,
+                summary=summary,
+                record=record,
+                inputs=inputs,
+                client=client,
+                repo=repo or "",
+                online=not isinstance(client, _OfflineClient),
+                now=now,
+                budget=budget,
+                notes=notes,
+                errors=errors,
+            )
+        finally:
+            # Housekeeping only after the comment, so it can never starve it (F1).
+            _finish_issue(outcome, now=now, notes=notes, errors=errors)
     finally:
         if closer is not None:
             closer.close()
     return outcome
+
+
+def _resolve_ownership(
+    outcome: dict[str, Any],
+    *,
+    summary: Summary,
+    record: Any,
+    inputs: Any,
+    client: Any,
+    repo: str,
+    online: bool,
+    budget: Any,
+    notes: list[str],
+) -> None:
+    """Who owns this failure (v1.3 §9). CODEOWNERS is read at the default branch."""
+    from .deliver.owners import parse_codeowners, resolve_owner
+    from .deliver.owners_io import load_codeowners, resolve_workspace
+
+    context = outcome["context"]
+    rules = None
+    try:
+        if online:
+            text, load_notes = load_codeowners(
+                client, repo, context.default_branch, budget=budget, clock=_delivery_clock
+            )
+            notes.extend(load_notes)
+            if text is not None:
+                rules, parse_notes = parse_codeowners(text)
+                notes.extend(parse_notes)
+        else:
+            notes.append("CODEOWNERS not read (no API access)")
+        resolution = resolve_owner(
+            summary, record, context, inputs, rules, workspace=resolve_workspace(os.environ)
+        )
+    except Exception as exc:  # noqa: BLE001 — ownership never blocks delivery
+        _LOG.exception("owner resolution failed")
+        notes.append(f"owner resolution failed: {_first_line(exc)}")
+        outcome.update(owners=[], owner_resolved_by="none")
+        return
+    notes.extend(resolution.notes)
+    outcome.update(owners=resolution.owners, owner_resolved_by=resolution.resolved_by)
 
 
 def _deliver_issue(
@@ -1062,16 +1119,14 @@ def _deliver_issue(
             run_url=summary.run.html_url,
             recurrence=recurrence_comment(summary, fork=context.is_fork),
             fork=context.is_fork,
+            owners=list(outcome.get("owners", [])),
         )
         outcome["issue_action"] = result.action
         if result.number is not None and result.action not in {"failed", "skipped"}:
             outcome["issue_ref"] = result.number
             outcome["issue_url"] = result.url
-        if result.action in {"created", "would create issue"}:
-            notes.append(_OWNER_PENDING)
         if live:
             outcome["delivered_to"].extend(result.delivered)
-            store.sweep_stale(now, exclude={result.number} if result.number else set())
     except Exception as exc:  # noqa: BLE001 — an issue failure never blocks the comment
         _LOG.exception("issue delivery failed")
         errors.append(f"issue delivery failed: {_first_line(exc)}")
@@ -1079,10 +1134,28 @@ def _deliver_issue(
         outcome["issue_write_failed"] = True
     finally:
         if store is not None:
-            store.close()
-            notes.extend(store.notes)
-            errors.extend(store.errors)
+            outcome["_issue_store"] = store  # swept + flushed after the comment (F1)
             outcome["issue_write_failed"] = outcome.get("issue_write_failed") or store.write_failed
+
+
+def _finish_issue(
+    outcome: dict[str, Any], *, now: datetime, notes: list[str], errors: list[str]
+) -> None:
+    """Stale sweep + index flush, after the comment and inside the budget. Never raises."""
+    store = outcome.pop("_issue_store", None)
+    if store is None:
+        return
+    try:
+        if outcome.get("live"):
+            ref = outcome.get("issue_ref")
+            store.sweep_stale(now, exclude={ref} if ref else set())
+    except Exception as exc:  # noqa: BLE001
+        _LOG.exception("stale sweep failed")
+        errors.append(f"stale sweep failed: {_first_line(exc)}")
+    finally:
+        store.close()
+        notes.extend(store.notes)
+        errors.extend(store.errors)
 
 
 def _issue_line(outcome: dict[str, Any]) -> str:
@@ -1354,6 +1427,8 @@ def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
             f"- comment: {comment}",
             f"- issue policy: {plan.issue or 'none'} · would open an issue: {issue}",
             f"- issue: {_issue_line(outcome)}",
+            f"- owner: {', '.join(outcome.get('owners') or []) or 'none'} "
+            f"(resolved by {outcome.get('owner_resolved_by') or 'none'})",
             f"- notify intent: {', '.join(plan.notify) or 'none'} "
             "(channels are decided in Step 18)",
         ]

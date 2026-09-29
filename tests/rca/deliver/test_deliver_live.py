@@ -130,7 +130,9 @@ def test_push_default_commit_comment_and_edit(tmp_path, fake) -> None:  # AC #3
     # so only the commit-comment writes are asserted here; issues are in test_deliver_issues.
     summary = _stage(tmp_path, event="push", branch="main", pr=None)
     assert _run(summary, "--live") == 0
-    assert _delivery(summary)["delivered_to"] == ["issue:created", "commit_comment"]
+    # Step 17 may add "issue:assigned" (the actor owns it); this test is about the comment.
+    delivered = _delivery(summary)["delivered_to"]
+    assert delivered[0] == "issue:created" and delivered[-1] == "commit_comment"
     assert len(fake.commit_comments[SHA]) == 1
     assert "would open an issue: yes" in _preview(summary)
     summary = _stage(tmp_path, event="push", branch="main", pr=None, seen=3)

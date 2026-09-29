@@ -107,7 +107,9 @@ def test_write_back_sets_only_delivery_and_keeps_analysis(tmp_path) -> None:  # 
     assert delivery["delivered_to"] == []
     assert delivery["trigger"] == "push_default"
     assert delivery["severity"] == "high"
-    assert delivery["owner_resolved_by"] is None
+    # Step 17: set on every run that reaches routing (offline, no CODEOWNERS → the actor).
+    assert delivery["owner_resolved_by"] == "actor"
+    assert delivery["owners"] == ["@bot"]
     assert any("offline" in note for note in delivery["notes"])
 
 

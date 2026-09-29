@@ -155,7 +155,8 @@ def test_first_push_default_failure_opens_one_issue(tmp_path, fake) -> None:  # 
     delivery = _delivery(summary)
     assert delivery["issue_url"] == issue["html_url"]
     assert delivery["delivered_to"] == ["issue:created", "commit_comment"]
-    assert "owner resolution is Step 17" in _preview(summary)
+    # Step 17 replaced the "owner resolution is Step 17" note with the owner line.
+    assert "- owner: " in _preview(summary)
     assert fake.search_calls() == []
 
 
