@@ -486,6 +486,22 @@ class GitHubClient:
         response = self._request("GET", f"repos/{repo}")
         return self._json_object(response, f"fetch repo {repo}")
 
+    def ref_is_tag(self, repo: str, name: str) -> bool:
+        """True when ``name`` is a tag. 200 → True, 404 → False, anything else raises.
+
+        ``/`` is kept literal: nested ref names (``release/1.0``) are path segments.
+        """
+        url = f"repos/{repo}/git/ref/tags/{quote(name, safe='/')}"
+        response = self._request("GET", url)
+        if response.status_code == 200:
+            return True
+        if response.status_code == 404:
+            return False
+        raise GitHubAPIError(
+            f"failed to look up tag {name} ({response.status_code})",
+            status_code=response.status_code,
+        )
+
     def list_issue_comments(self, repo: str, issue_number: int) -> list[dict[str, Any]]:
         return self._paginate(
             f"repos/{repo}/issues/{issue_number}/comments?per_page={_LIST_PER_PAGE}",
