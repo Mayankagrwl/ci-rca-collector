@@ -77,6 +77,7 @@ class FakeGitHub:
     commit_comments: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     labels: dict[int, list[str]] = field(default_factory=dict)
     issues: dict[int, dict[str, Any]] = field(default_factory=dict)
+    reactions: list[tuple[int, str]] = field(default_factory=list)  # (comment_id, content)
     # Repo files served by the contents API: {(path, ref): text}; ref None = any ref.
     files: dict[tuple[str, str | None], str] = field(default_factory=dict)
     # Paths the contents API reports as over 1 MB (content "", encoding "none").
@@ -200,6 +201,8 @@ class FakeGitHub:
                 return self._page(request, items)
             if method == "POST":
                 comment = self._new_comment(body["body"], f"{WEB}/acme/widgets/pull/{m[1]}", "bot")
+                if int(m[1]) in self.issues:  # a comment bumps the issue's updated_at
+                    self.issues[int(m[1])]["updated_at"] = comment["created_at"]
                 items.append(comment)
                 return httpx.Response(201, json=comment)
         if method == "GET" and (m := re.fullmatch(r"/contents/(.+)", rest)):
@@ -236,13 +239,23 @@ class FakeGitHub:
             if method == "GET":
                 return httpx.Response(200, json=dict(issue))
             if method == "PATCH":
-                for key in ("title", "body", "state"):
+                for key in ("title", "body", "state", "state_reason"):
                     if key in body:
                         issue[key] = body[key]
                 if "labels" in body:
                     issue["labels"] = [{"name": n} for n in body["labels"]]
                 issue["updated_at"] = self._stamp()
                 return httpx.Response(200, json=dict(issue))
+        if method == "POST" and (m := re.fullmatch(r"/issues/comments/(\d+)/reactions", rest)):
+            for items in self.issue_comments.values():
+                for comment in items:
+                    if comment["id"] == int(m[1]):
+                        content = body.get("content")
+                        self.reactions.append((int(m[1]), content))
+                        rollup = comment.setdefault("reactions", {})
+                        rollup[content] = rollup.get(content, 0) + 1
+                        return httpx.Response(201, json={"id": len(self.reactions), "content": content})
+            return _not_found()
         if method == "PATCH" and (m := re.fullmatch(r"/issues/comments/(\d+)", rest)):
             return self._patch(self.issue_comments, int(m[1]), body)
         if m := re.fullmatch(r"/commits/([^/]+)/comments", rest):
@@ -303,6 +316,8 @@ class FakeGitHub:
             "body": body,
             "html_url": f"{parent_url}#comment-{self._next_id}",
             "user": {"login": login},
+            "author_association": "OWNER",
+            "reactions": {"+1": 0, "-1": 0, "total_count": 0},
             "created_at": stamp,
             "updated_at": stamp,
         }

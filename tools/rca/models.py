@@ -390,6 +390,7 @@ class DeliveryReport(BaseModel):
     dry_run: bool = False
     notes: list[str] = []
     owners: list[str] = []
+    feedback: dict[str, int] = {}  # reactions on the sticky RCA comment, e.g. {"up": 3, "down": 1}
 
 
 class Summary(BaseModel):

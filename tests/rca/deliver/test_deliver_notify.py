@@ -27,11 +27,11 @@ from tools.rca.cli import CHAT_BEGIN, CHAT_END, main
 from tools.rca.deliver import DeliveryContext, DeliveryInputs, SuppressionDecision
 from tools.rca.deliver.notify import (
     Scrubber,
-    elect_leader,
     header_text,
     in_quiet_window,
     notify_config,
     plan_notification,
+    summarize_burst,
 )
 from tools.rca.deliver.owners import parse_codeowners, resolve_path_owners
 from tools.rca.models import HistoryContext, Summary
@@ -242,7 +242,8 @@ def test_update_quiet_dedupe_is_quiet() -> None:
     assert not in_quiet_window(SuppressionDecision(), NOW - timedelta(minutes=61), NOW, 60)
 
 
-# ---- AC5: widespread leader election ---------------------------------------------------------------
+# ---- AC5: widespread bursts (coordinated via a platform-incident issue; Step 18b F1) -------------------
+# Step 18b replaced run-list leader election; the incident scenarios live in test_deliver_incidents.
 
 
 def _burst(fake: FakeGitHub, ids: list[int]) -> None:
@@ -259,6 +260,7 @@ def _burst(fake: FakeGitHub, ids: list[int]) -> None:
 
 def test_five_widespread_runs_send_exactly_one(tmp_path, fake, channels) -> None:  # AC #9
     hook, _smtp = channels
+    fake.start = NOW - timedelta(minutes=1)
     ids = [505, 502, 504, 501, 503]
     _burst(fake, ids)
     previews = {}
@@ -271,19 +273,21 @@ def test_five_widespread_runs_send_exactly_one(tmp_path, fake, channels) -> None
     text = hook.posts[0]["text"]
     assert "widespread CI failures (5 runs)" in text
     assert "Workflows: CI, Deploy, Lint" in text and "release/2.0" in text and "Old" not in text
-    assert fake.issue_comments == {}  # zero PR comments
-    assert "platform notified by run 501" in previews[505]
-    assert "- chat: skipped (platform notified by run 501)" in previews[503]
+    assert all(not fake.issue_comments.get(rid) for rid in ids)  # zero PR comments
+    incident = [i for i in fake.issues.values() if i["title"].startswith("[RCA] platform incident")]
+    assert len(incident) == 1
+    assert "platform notified via #" in previews[503]
+    assert "- chat: skipped (platform notified via #" in previews[503]
 
 
-def test_leader_lookup_failure_sends_anyway(tmp_path, fake, channels) -> None:
+def test_incident_lookup_failure_sends_anyway(tmp_path, fake, channels) -> None:
     hook, _smtp = channels
-    fake.faults.append(Fault("GET", r"/actions/runs$", status=500, times=3))
+    fake.faults.append(Fault("GET", r"/issues$", status=500, times=3))
     summary = _stage(tmp_path, event="pull_request", branch="feature", pr=9, run_id=900,
                      short_circuit="infra_widespread")
     assert _run(summary, "--live") == 0
     assert len(hook.posts) == 1
-    assert "leader lookup failed" in _preview(summary)
+    assert "burst dedupe unavailable" in _preview(summary)
 
 
 # ---- AC6 / AC7 / AC8 -------------------------------------------------------------------------
@@ -291,6 +295,7 @@ def test_leader_lookup_failure_sends_anyway(tmp_path, fake, channels) -> None:
 
 def test_infra_runner_goes_to_platform_only_and_bursts_once(tmp_path, fake, channels) -> None:
     hook, smtp = channels
+    fake.start = NOW - timedelta(minutes=1)
     _burst(fake, [301, 302])
     for rid in (302, 301):
         summary = _stage(tmp_path, run_id=rid, short_circuit="infra_runner", infra=True, name=f"r{rid}")
@@ -483,13 +488,13 @@ def test_offline_zero_network(tmp_path, fake, channels) -> None:
 # ---- pure helpers -------------------------------------------------------------------------------------------
 
 
-def test_elect_leader() -> None:
+def test_summarize_burst() -> None:
     runs = [{"id": 7, "created_at": (NOW - timedelta(minutes=5)).isoformat(), "name": "A", "head_branch": "m"},
             {"id": 3, "created_at": (NOW - timedelta(hours=2)).isoformat(), "name": "Old", "head_branch": "x"}]
-    lead = elect_leader(runs, run_id=9, workflow="B", branch="n", now=NOW, window_minutes=60)
-    assert (lead.is_leader, lead.leader_id, lead.workflows, lead.branches) == (False, 7, ["A", "B"], ["m", "n"])
-    solo = elect_leader([], run_id=9, workflow="B", branch="n", now=NOW, window_minutes=60)
-    assert solo.is_leader and solo.run_ids == [9]
+    burst = summarize_burst(runs, run_id=9, workflow="B", branch="n", now=NOW, window_minutes=60)
+    assert (burst.run_count, burst.workflows, burst.branches) == (2, ["A", "B"], ["m", "n"])
+    solo = summarize_burst([], run_id=9, workflow="B", branch="n", now=NOW, window_minutes=60)
+    assert solo.run_count == 1
 
 
 def test_scrubber() -> None:

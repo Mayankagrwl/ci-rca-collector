@@ -145,7 +145,15 @@ def _existing(comment: dict[str, Any], fingerprint_coarse: str, branch: str) -> 
         comment_id=comment_id if isinstance(comment_id, int) else None,
         html_url=comment.get("html_url"),
         body=comment.get("body") or "",
+        reactions=_reaction_rollup(comment.get("reactions")),
     )
+
+
+def _reaction_rollup(raw: Any) -> dict[str, int] | None:
+    if not isinstance(raw, dict):
+        return None
+    up, down = raw.get("+1"), raw.get("-1")
+    return {"up": up if isinstance(up, int) else 0, "down": down if isinstance(down, int) else 0}
 
 
 def _updated_key(comment: dict[str, Any]) -> datetime:

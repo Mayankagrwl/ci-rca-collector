@@ -110,6 +110,8 @@ class ExistingComment(NamedTuple):
     comment_id: int | None = None
     html_url: str | None = None
     body: str = ""
+    # Reaction rollup from the list payload (no extra call): {"up": n, "down": n}.
+    reactions: dict[str, int] | None = None
 
 
 __all__ = [

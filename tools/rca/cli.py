@@ -99,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_telemetry(args)
         if args.cmd == "cache-keys":
             return _cmd_cache_keys(args)
+        if args.cmd == "feedback":
+            return _cmd_feedback(args)
         if args.cmd == "deliver":
             if getattr(args, "migrate_history", False):
                 return _cmd_migrate_history(args)
@@ -107,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_deliver(args)
         parser.error(f"unknown command {args.cmd}")
     except Exception as exc:  # noqa: BLE001 — collector must not fail the workflow
+        if getattr(args, "cmd", None) == "feedback":
+            _LOG.error("feedback error: %s", type(exc).__name__)
+            return 1 if getattr(args, "strict", False) else 0
         if getattr(args, "cmd", None) == "deliver":
             # Never regenerate summary.json from a stub: it holds collect + analysis.
             _LOG.exception("deliver error")
@@ -272,6 +277,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="one-shot: create issues for cache-history fingerprints not yet tracked",
     )
     deliver.add_argument("--history-dir", default=".rca-history", help="cache history directory")
+
+    feedback = sub.add_parser("feedback", parents=[parent])
+    feedback.add_argument(
+        "--event", required=True, help="issue_comment event JSON file ($GITHUB_EVENT_PATH)"
+    )
+    feedback.add_argument("--repo", default=None, help="owner/repo (default: from the event)")
+    feedback.add_argument("--out", default="rca", help="directory for feedback-report.md")
+    feedback.add_argument("--live", action="store_true", help="apply the resolution on GitHub")
+    feedback.add_argument("--dry-run", action="store_true", help="read only (the default)")
+    feedback.add_argument("--offline", action="store_true", help="no GitHub API calls at all")
     deliver.add_argument("--migrate-limit", type=int, default=50, help="max issues created per run")
     return parser
 
@@ -889,6 +904,7 @@ def _cmd_deliver(args: argparse.Namespace) -> int:
         issue_url=outcome.get("issue_url"),
         owner_resolved_by=outcome.get("owner_resolved_by"),
         owners=list(outcome.get("owners", [])),
+        feedback=dict(outcome.get("feedback") or {}),
         dry_run=not live,
         errors=errors,
         notes=notes,
@@ -1175,13 +1191,14 @@ def _deliver_notifications(
     errors: list[str],
 ) -> None:
     """Email + chat (v1.3 §10). Never raises; never blocks the issue or the comment."""
+    from .deliver.incidents import coordinate_incident
     from .deliver.notify import (
         ChatSender,
         SmtpSender,
-        elect_leader,
         notify_config,
         plan_notification,
         platform_path,
+        summarize_burst,
     )
     from .deliver.sticky import BUDGET_EXCEEDED
     from .deliver.suppress import evaluate
@@ -1196,24 +1213,21 @@ def _deliver_notifications(
         decision = outcome.get("decision") or evaluate(
             summary, record, context, inputs, existing=None, now=now
         )
-        leader = None
-        leader_note = None
-        if config.configured and platform_path(decision) is not None:
-            if not online:
-                leader_note = "platform leader not determined (no API access)"
-            else:
-                try:
-                    runs = client.list_runs(repo, status="failure", per_page=100)
-                    leader = elect_leader(
-                        runs,
-                        run_id=summary.run.run_id,
-                        workflow=summary.run.workflow_name,
-                        branch=summary.run.head_branch,
-                        now=now,
-                        window_minutes=inputs.quiet_window_minutes,
-                    )
-                except Exception as exc:  # noqa: BLE001 — a duplicate beats a missed outage
-                    leader_note = f"platform leader lookup failed ({type(exc).__name__}); sending anyway"
+        platform = platform_path(decision)
+        burst = None
+        if config.configured and platform is not None and online:
+            try:  # informational only: names the workflows / branches in the burst
+                runs = client.list_runs(repo, status="failure", per_page=100)
+                burst = summarize_burst(
+                    runs,
+                    run_id=summary.run.run_id,
+                    workflow=summary.run.workflow_name,
+                    branch=summary.run.head_branch,
+                    now=now,
+                    window_minutes=inputs.quiet_window_minutes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"burst summary unavailable ({type(exc).__name__})")
         plan = plan_notification(
             config,
             summary=summary,
@@ -1228,11 +1242,37 @@ def _deliver_notifications(
             issue_url=outcome.get("issue_url"),
             previous_updated_at=outcome.get("issue_previous_updated_at"),
             now=now,
-            leader=leader,
-            leader_note=leader_note,
+            burst=burst,
         )
         outcome["notify_plan"] = plan
         notes.extend(scrub(n) for n in plan.notes)
+        if plan.send and plan.platform is not None:
+            # One message per burst: coordinated through a platform-incident issue.
+            if not online:
+                outcome["incident_line"] = "not checked (no API access)"
+            else:
+                incident = coordinate_incident(
+                    client,
+                    repo,
+                    kind="infra_widespread" if plan.platform == "A2" else "infra_runner",
+                    summary=summary,
+                    workflows=burst.workflows if burst else [summary.run.workflow_name],
+                    branches=burst.branches if burst else [summary.run.head_branch],
+                    now=now,
+                    window_minutes=inputs.quiet_window_minutes,
+                    live=live,
+                    enabled=bool(inputs.create_issues),
+                    budget=budget,
+                    clock=_delivery_clock,
+                )
+                notes.extend(incident.notes)
+                errors.extend(incident.errors)
+                outcome["incident_line"] = (
+                    f"#{incident.number}" if incident.number is not None else "none"
+                ) + f" ({incident.reason})"
+                if not incident.send:
+                    plan.send = False
+                    plan.reason = incident.reason
         if not plan.send:
             for channel, url in (("chat", config.chat_url), ("email", config.smtp_url)):
                 if url:
@@ -1328,6 +1368,8 @@ def _notification_lines(outcome: dict[str, Any]) -> list[str]:
     lines.append(f"- decision: {'send' if plan.send else 'skip'} ({plan.reason})")
     if plan.platform:
         lines.append(f"- platform path: {plan.platform}")
+    if outcome.get("incident_line"):
+        lines.append(f"- platform incident: {outcome['incident_line']}")
     for channel in ("chat", "email"):
         if channel in status:
             lines.append(f"- {channel}: {status[channel]}")
@@ -1364,6 +1406,143 @@ def _issue_line(outcome: dict[str, Any]) -> str:
         return action
     url = outcome.get("issue_url")
     return f"{action} — #{ref}" + (f" ({url})" if url else "")
+
+
+_FEEDBACK_REPORT_FILE = "feedback-report.md"
+
+
+def _cmd_feedback(args: argparse.Namespace) -> int:
+    """``/resolved`` handler (v1.3 §12). Reads the comment from the event file only."""
+    from .deliver.feedback import allowed_associations, is_bot, parse_resolved, why_not_resolved
+    from .deliver.issues import IssuesHistoryStore, marker_fingerprint
+    from .deliver.render_comment import safe_text
+    from .deliver.sticky import DeliveryBudget, fingerprint_of
+
+    live = bool(args.live) and not args.offline and not args.dry_run
+    notes: list[str] = []
+    errors: list[str] = []
+    actions: list[str] = []
+    facts: dict[str, str] = {"mode": "LIVE" if live else ("offline" if args.offline else "dry run")}
+    client = None
+    try:
+        event = json.loads(Path(args.event).read_text(encoding="utf-8"))
+        comment = event.get("comment") or {}
+        issue = event.get("issue") or {}
+        user = comment.get("user") or {}
+        login = str(user.get("login") or "")
+        association = str(comment.get("author_association") or "NONE").upper()
+        facts.update(
+            author=safe_text(f"@{login}", 100),
+            association=association,
+            issue=f"#{issue.get('number')}" + (" (pull request)" if "pull_request" in issue else ""),
+        )
+        command = parse_resolved(comment.get("body"))
+        if event.get("action") != "created":
+            notes.append(f"skipped: action is {event.get('action')!r}, not 'created'")
+        elif is_bot(user):
+            notes.append("skipped: comment author is a bot")
+        elif command is None:
+            notes.append(f"skipped: {why_not_resolved(comment.get('body'))}")
+        elif association not in allowed_associations(os.environ):
+            notes.append(f"skipped: author association {association} may not resolve failures")
+        else:
+            facts["text"] = command.text
+            facts["target"] = f"#{command.target_issue}" if command.target_issue else "(from context)"
+            repo = (
+                args.repo
+                or str((event.get("repository") or {}).get("full_name") or "")
+                or (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+            )
+            if args.offline:
+                notes.append("offline: target not looked up; nothing applied")
+            elif not repo:
+                errors.append("no repository (--repo / event / GITHUB_REPOSITORY)")
+            else:
+                client = _delivery_client(args)
+                store = IssuesHistoryStore(
+                    client,
+                    repo,
+                    budget=DeliveryBudget(started_at=_delivery_clock()),
+                    clock=_delivery_clock,
+                    dry_run=not live,
+                )
+                targets = _feedback_targets(
+                    client, repo, issue, command, store, notes, marker_fingerprint, fingerprint_of
+                )
+                handled = False
+                for target in targets:
+                    result = store.resolve_issue(target, text=command.text, author=login)
+                    actions.append(f"#{result.number}: {result.action}")
+                    handled = handled or result.action in {"resolved", "unchanged"}
+                notes.extend(store.notes)
+                errors.extend(store.errors)
+                if handled and live and comment.get("id") is not None:
+                    reacted = client.create_reaction(repo, int(comment["id"]), "+1")
+                    actions.append("reaction +1: " + ("added" if reacted else "not added (best-effort)"))
+                elif targets and not live:
+                    actions.append("reaction +1: would add")
+    except Exception as exc:  # noqa: BLE001 — never fail the workflow
+        _LOG.error("feedback failed: %s", type(exc).__name__)
+        errors.append(f"feedback failed: {_first_line(exc)}")
+    finally:
+        if client is not None:
+            client.close()
+    _write_feedback_report(Path(args.out), facts, actions, notes, errors)
+    return 1 if (args.strict and errors) else 0
+
+
+def _feedback_targets(client, repo, issue, command, store, notes, marker_fingerprint, fingerprint_of):
+    """Which fingerprint issue(s) a /resolved comment applies to."""
+    from .deliver.sticky import _updated_key
+
+    number = issue.get("number")
+    if marker_fingerprint(issue.get("body")):
+        if command.target_issue is not None:
+            notes.append(f"#{command.target_issue} ignored: the comment is on fingerprint issue #{number}")
+        fresh = client.get_issue(repo, int(number))
+        return [fresh] if fresh else []
+    if "pull_request" not in issue:
+        notes.append(f"skipped: #{number} is neither an RCA fingerprint issue nor a pull request")
+        return []
+    if command.target_issue is not None:
+        target = client.get_issue(repo, command.target_issue)
+        if target is None or "pull_request" in target or not marker_fingerprint(target.get("body")):
+            notes.append(f"skipped: #{command.target_issue} is not an RCA fingerprint issue")
+            return []
+        return [target]
+    ours = [c for c in client.list_issue_comments(repo, int(number)) if fingerprint_of(c.get("body"))]
+    if not ours:
+        notes.append(f"skipped: no RCA comment on pull request #{number}")
+        return []
+    chosen = max(ours, key=_updated_key)
+    if len(ours) > 1:
+        notes.append(f"{len(ours)} RCA comments on #{number}; used the most recently updated ({chosen.get('id')})")
+    coarse = fingerprint_of(chosen.get("body"))
+    targets = store.open_issues_for_coarse(coarse)
+    if not targets:
+        notes.append(f"no open fingerprint issue for the RCA comment on #{number}")
+    return targets
+
+
+def _write_feedback_report(
+    out: Path, facts: dict[str, str], actions: list[str], notes: list[str], errors: list[str]
+) -> None:
+    from .redact import redact_text
+
+    lines = [f"# RCA feedback ({facts.get('mode', 'dry run')})", ""]
+    for key in ("issue", "author", "association", "target", "text"):
+        if key in facts:
+            lines.append(f"- {key}: {facts[key]}")
+    lines += ["", "## Actions", ""] + ([f"- {a}" for a in actions] or ["- none"])
+    if notes or errors:
+        lines += ["", "## Notes", ""] + [f"- {n}" for n in notes] + [f"- error: {e}" for e in errors]
+    text = redact_text("\n".join(lines) + "\n")[0]
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / _FEEDBACK_REPORT_FILE).write_text(text, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        _LOG.exception("failed to write feedback report")
+    sys.stdout.write(text)
 
 
 def _cmd_migrate_history(args: argparse.Namespace) -> int:
@@ -1505,6 +1684,8 @@ def _deliver_comment(
                 branch=context.branch,
             )
             notes.extend(found_notes)
+            if existing is not None and existing.reactions is not None:
+                outcome["feedback"] = dict(existing.reactions)
             lookup_failed = any(n.startswith(LOOKUP_FAILED) for n in found_notes)
         else:
             notes.append("existing comments not looked up (no API access)")
@@ -1630,6 +1811,9 @@ def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
             f"(resolved by {outcome.get('owner_resolved_by') or 'none'})",
             f"- notify intent: {', '.join(plan.notify) or 'none'}",
         ]
+        if outcome.get("feedback") is not None:
+            fb = outcome["feedback"]
+            lines.append(f"- feedback: 👍 {fb.get('up', 0)} · 👎 {fb.get('down', 0)}")
         if outcome.get("label_action"):
             lines.append(f"- label: {outcome['label_action']}")
     if decision is not None:

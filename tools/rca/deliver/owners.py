@@ -191,11 +191,17 @@ def resolve_path_owners(
     """
     candidates = repo_relative_candidates(path, workspace=workspace)
     known = [k.strip("/") for k in (known_files or []) if k]
+    original = _original_relative(path, workspace)
     for cand in candidates:
-        hits = [k for k in known if cand == k or cand.endswith("/" + k)]
+        hits = [
+            k
+            for k in known
+            # A one-segment known file (a root pom.xml) is only *that* file: it maps
+            # when the given path is exactly it, never as a suffix of a deeper path.
+            if (original == k if "/" not in k else (cand == k or cand.endswith("/" + k)))
+        ]
         if hits:
             return owners_for(max(hits, key=len), rules)
-    original = _original_relative(path, workspace)
     if original and original.count("/") >= 1:
         reverse = [k for k in known if k.endswith("/" + original)]
         if len(reverse) == 1:

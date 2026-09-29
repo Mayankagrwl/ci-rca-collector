@@ -168,6 +168,7 @@ def _paragraphs(
     run_url: str | None,
     fork: bool,
     owners: list[str] | None,
+    recurred: bool = False,
 ) -> list[str]:
     """Body prose: the fix on its own paragraph, then history, then the owner line."""
     paragraphs: list[str] = []
@@ -180,13 +181,40 @@ def _paragraphs(
     latest = record.run_ids[-1] if record.run_ids else None
     if latest is not None:
         history.append(f"Latest run: [run {latest}]({run_url})." if run_url else f"Latest run: run {latest}.")
-    if record.resolution:
-        history.append(f"Resolution: {safe_text(record.resolution, HEADLINE_CAP, fork=fork)}")
     paragraphs.append(" ".join(history))
+    if record.resolution:
+        text = safe_text(record.resolution, HEADLINE_CAP, fork=fork).rstrip(".")
+        who = _author_span(record.resolution_author)
+        if recurred:
+            # The resolution stays as history; the issue is open again because it recurred.
+            paragraphs.append(f"Previously resolved by {who}: {text} — recurred since.")
+        else:
+            paragraphs.append(f"Resolved by {who}: {text}.")
     line = owner_line(owners)
     if line:
         paragraphs.append(line)
     return paragraphs
+
+
+def _author_span(author: str | None) -> str:
+    """``@login`` in a code span, defused — a resolution author is never pinged."""
+    login = (author or "unknown").lstrip("@")
+    return f"`{safe_text('@' + login, 100).replace('`', '')}`"
+
+
+_FIX_RE = re.compile(r"^\*\*Suggested fix\*\* — (.*?)\.?$", re.M)
+_RUN_LINK_RE = re.compile(r"Latest run: \[run \d+\]\(([^)\s]+)\)")
+_OWNER_SPAN_RE = re.compile(r"`([^`]+)`")
+
+
+def carry_over(body: str | None) -> tuple[str | None, str | None, list[str]]:
+    """(fix, run_url, owners) from an existing bot body, so a rewrite keeps them."""
+    text = body or ""
+    fix = _FIX_RE.search(text)
+    run = _RUN_LINK_RE.search(text)
+    owner = next((ln for ln in text.splitlines() if ln.startswith("Owner: ")), "")
+    owners = [o.replace("\u200b", "") for o in _OWNER_SPAN_RE.findall(owner)]
+    return (fix.group(1) if fix else None, run.group(1) if run else None, owners)
 
 
 def owner_line(owners: list[str] | None) -> str | None:
@@ -202,11 +230,17 @@ def render_issue_body(
     run_url: str | None = None,
     fork: bool = False,
     owners: list[str] | None = None,
+    recurred: bool = False,
 ) -> tuple[str, list[str]]:
-    """(body, notes). Shrinks prose → templates → last_summary until ≤ BODY_CAP (JSON stays valid)."""
+    """(body, notes). Shrinks prose → templates → last_summary until ≤ BODY_CAP (JSON stays valid).
+
+    ``recurred``: the record carries a resolution but failed again since.
+    """
     notes: list[str] = []
     record = sanitize_record(record)
-    prose = "\n\n".join(_paragraphs(record, fix=fix, run_url=run_url, fork=fork, owners=owners))
+    prose = "\n\n".join(
+        _paragraphs(record, fix=fix, run_url=run_url, fork=fork, owners=owners, recurred=recurred)
+    )
 
     # Sanitized once: redaction is the expensive step, and a rebuild must not repeat it.
     words = category_words(record.category)
@@ -372,6 +406,60 @@ class IssuesHistoryStore:
             self._error("issue sync", exc)
             return IssueResult("failed", error=self.errors[-1])
 
+    def open_issues_for_coarse(self, coarse: str) -> list[dict[str, Any]]:
+        """Open fingerprint issues whose record has this coarse fingerprint (label scan)."""
+        found = []
+        for issue in self._scan_issues():
+            record = parse_record(issue.get("body"))
+            if issue.get("state") == "open" and record is not None and record.fingerprint_coarse == coarse:
+                found.append(issue)
+        return sorted(found, key=lambda i: int(i.get("number") or 0))
+
+    def resolve_issue(self, issue: dict[str, Any], *, text: str, author: str) -> IssueResult:
+        """Record a human resolution, rewrite the body, close as completed. Never raises.
+
+        Idempotent: the same text by the same author on a closed issue makes no write.
+        """
+        number = int(issue["number"])
+        url = issue.get("html_url")
+        record = parse_record(issue.get("body"))
+        if record is None:
+            self.notes.append(f"#{number} has no readable record; not resolved")
+            return IssueResult("skipped", number, url)
+        login = author.lstrip("@")
+        clean_text = _clean(text) or ""
+        already = (
+            record.resolution == clean_text
+            and record.resolution_author == login
+            and record.human_verified
+            and issue.get("state") == "closed"
+        )
+        if already:
+            return IssueResult("unchanged", number, url, record.count, record.count)
+        resolved = record.model_copy(
+            update={
+                "resolution": clean_text,
+                "resolution_author": login,
+                "resolution_run_id": None,
+                "human_verified": True,
+            }
+        )
+        fix, run_url, owners = carry_over(issue.get("body"))
+        body, notes = render_issue_body(resolved, fix=fix, run_url=run_url, owners=owners)
+        self.notes.extend(notes)
+        if self.dry_run:
+            return IssueResult(f"would resolve and close #{number}", number, url)
+        try:
+            self.client.update_issue(
+                self.repo, number, body=body, state="closed", state_reason="completed"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._failed(f"issue #{number} resolve", exc, number, url)
+        issue.update(body=body, state="closed")
+        result = IssueResult("resolved", number, url, record.count, record.count)
+        result.delivered.append("issue:resolved")
+        return result
+
     def sweep_stale(self, now: datetime, *, exclude: set[int] | None = None) -> list[int]:
         """Close ≤ STALE_SWEEP_MAX open issues with no recurrence in STALE_DAYS (live only)."""
         closed: list[int] = []
@@ -385,7 +473,7 @@ class IssuesHistoryStore:
             if issue.get("state") != "open" or number in (exclude or set()):
                 continue
             record = parse_record(issue.get("body"))
-            if record is None or record.resolution or _aware(record.last_seen) >= cutoff:
+            if record is None or _aware(record.last_seen) >= cutoff:
                 continue
             if not self._budget_ok(f"stale close #{number}"):
                 break
@@ -534,7 +622,12 @@ class IssuesHistoryStore:
             merged, before = prior.absorb(record), prior.count
         bumped = before is None or merged.count != before
         body, notes = render_issue_body(
-            merged, fix=args.fix, run_url=args.run_url, fork=args.fork, owners=args.owners
+            merged,
+            fix=args.fix,
+            run_url=args.run_url,
+            fork=args.fork,
+            owners=args.owners,
+            recurred=bool(merged.resolution),
         )
         self.notes.extend(notes)
         title = issue_title(merged, fork=args.fork)

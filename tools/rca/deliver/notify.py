@@ -1,6 +1,6 @@
 """Email + chat notifications (delivery spec v1.3 §10).
 
-Gating (``plan_notification``), leader election (``elect_leader``) and message
+Gating (``plan_notification``), burst summaries (``summarize_burst``) and message
 building are pure. Only ``ChatSender`` and ``SmtpSender`` do I/O, and both take
 an injectable transport / SMTP factory. Neither ever sees the GitHub token.
 
@@ -102,19 +102,19 @@ class Scrubber:
         return redact_text(text)[0]
 
 
-# ---- leader election (A2 / A3 bursts) --------------------------------------------------------
+# ---- burst summary (A2 message content; informational only) ------------------------------------
+# Who sends for a burst is decided by the platform-incident issue (deliver.incidents),
+# never by guessing from the run list.
 
 
 @dataclass
-class Leader:
-    is_leader: bool
-    leader_id: int
-    run_ids: list[int]
+class Burst:
+    run_count: int
     workflows: list[str]
     branches: list[str]
 
 
-def elect_leader(
+def summarize_burst(
     runs: list[dict[str, Any]],
     *,
     run_id: int,
@@ -122,8 +122,8 @@ def elect_leader(
     branch: str,
     now: datetime,
     window_minutes: int,
-) -> Leader:
-    """Stateless: among failed runs created in the window (this one included), lowest id sends."""
+) -> Burst:
+    """Failed runs created in the window (this one included): count, workflows, branches."""
     cutoff = now - timedelta(minutes=window_minutes)
     burst: dict[int, dict[str, Any]] = {}
     for run in runs:
@@ -132,10 +132,9 @@ def elect_leader(
         if isinstance(rid, int) and created is not None and cutoff <= created <= now + timedelta(minutes=5):
             burst[rid] = run
     burst.setdefault(run_id, {"id": run_id, "name": workflow, "head_branch": branch})
-    ids = sorted(burst)
     workflows = sorted({str(r.get("name") or "") for r in burst.values()} - {""})
     branches = sorted({str(r.get("head_branch") or "") for r in burst.values()} - {""})
-    return Leader(ids[0] == run_id, ids[0], ids, workflows, branches)
+    return Burst(len(burst), workflows, branches)
 
 
 # ---- gating + content (pure) -------------------------------------------------------------------
@@ -188,16 +187,17 @@ def plan_notification(
     issue_url: str | None,
     previous_updated_at: datetime | None,
     now: datetime,
-    leader: Leader | None = None,
-    leader_note: str | None = None,
+    burst: Burst | None = None,
 ) -> NotifyPlan:
-    """Whether to notify, whom, and the exact texts. Pure; the caller sends."""
+    """Whether to notify, whom, and the exact texts. Pure; the caller sends.
+
+    For the platform paths the caller then coordinates through a platform-incident
+    issue (``deliver.incidents``), which may turn ``send`` off for this run.
+    """
     if not config.configured:
         return NotifyPlan(False, "none configured")
     platform = platform_path(decision)
     notes: list[str] = []
-    if leader_note:
-        notes.append(leader_note)
     if decision.suppressed_by in NEVER_NOTIFY:
         return NotifyPlan(False, f"never notifies ({decision.suppressed_by})", platform, notes=notes)
     if decision.suppressed_by is not None and platform is None:
@@ -208,9 +208,6 @@ def plan_notification(
     if in_quiet_window(decision, previous_updated_at, now, inputs.quiet_window_minutes):
         notes.append(f"inside the {inputs.quiet_window_minutes}m quiet window for this fingerprint")
         return NotifyPlan(False, "quiet window", platform, notes=notes)
-    if platform is not None and leader is not None and not leader.is_leader:
-        notes.append(f"platform notified by run {leader.leader_id}")
-        return NotifyPlan(False, f"platform notified by run {leader.leader_id}", platform, notes=notes)
 
     audience = _audience(platform, route_notify, context, inputs, owners)
     emails = [a for a in audience if _EMAIL_RE.match(a)]
@@ -221,7 +218,7 @@ def plan_notification(
         notes.append("no email recipients; email not sent")
 
     facts = _facts(
-        summary, record, decision, severity, platform, leader, audience, owner_resolved_by, issue_url
+        summary, record, decision, severity, platform, burst, audience, owner_resolved_by, issue_url
     )
     return NotifyPlan(
         True,
@@ -252,14 +249,14 @@ def _audience(platform, route_notify, context, inputs, owners) -> list[str]:
     return _dedupe(audience)
 
 
-def _facts(summary, record, decision, severity, platform, leader, audience, resolved_by, issue_url):
+def _facts(summary, record, decision, severity, platform, burst, audience, resolved_by, issue_url):
     run = summary.run
     workflow = header_text(safe_text(run.workflow_name or "workflow", 80))
     branch = header_text(safe_text(run.head_branch or "unknown branch", 80))
     if platform == "A2":
-        runs = len(leader.run_ids) if leader is not None else 1
-        workflows = ", ".join(leader.workflows) if leader is not None else run.workflow_name
-        branches = ", ".join(leader.branches) if leader is not None else run.head_branch
+        runs = burst.run_count if burst is not None else 1
+        workflows = ", ".join(burst.workflows) if burst is not None else run.workflow_name
+        branches = ", ".join(burst.branches) if burst is not None else run.head_branch
         subject = f"[CI] {severity}: widespread CI failures ({runs} runs)"
         cause = f"Widespread infrastructure failure: {runs} failed run(s) in the quiet window."
         extra = [
@@ -474,17 +471,17 @@ def _parse_time(value: Any) -> datetime | None:
 
 __all__ = [
     "ChatSender",
-    "Leader",
+    "Burst",
     "NotifyConfig",
     "NotifyPlan",
     "Scrubber",
     "SendResult",
     "SmtpSender",
     "chat_escape",
-    "elect_leader",
     "header_text",
     "in_quiet_window",
     "notify_config",
     "plan_notification",
     "platform_path",
+    "summarize_burst",
 ]
