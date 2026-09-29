@@ -67,8 +67,13 @@ def category_words(category: str | None) -> str:
     return CATEGORY_WORDS.get((category or "").strip(), _GENERIC_CATEGORY)
 
 
+def marker_line(fingerprint_coarse: str) -> str:
+    """The sticky key: the exact first line of every RCA comment (v1.3 §7.3)."""
+    return f"{MARKER_PREFIX}{fingerprint_coarse} -->"
+
+
 def marker(summary: Summary) -> str:
-    return f"{MARKER_PREFIX}{summary.fingerprint_coarse} -->"
+    return marker_line(summary.fingerprint_coarse)
 
 
 def render_comment(
@@ -293,5 +298,6 @@ __all__ = [
     "category_words",
     "evidence_lines",
     "marker",
+    "marker_line",
     "render_comment",
 ]

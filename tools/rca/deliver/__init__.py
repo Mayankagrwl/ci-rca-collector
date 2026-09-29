@@ -102,11 +102,14 @@ class SuppressionDecision(BaseModel):
 
 
 class ExistingComment(NamedTuple):
-    """A previously posted delivery comment. Finding it is Step 15."""
+    """A previously posted delivery comment, found by its marker (``deliver.sticky``)."""
 
     fingerprint_coarse: str
     branch: str
     updated_at: datetime
+    comment_id: int | None = None
+    html_url: str | None = None
+    body: str = ""
 
 
 __all__ = [

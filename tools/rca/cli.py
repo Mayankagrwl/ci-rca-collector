@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -236,7 +237,14 @@ def _build_parser() -> argparse.ArgumentParser:
     deliver.add_argument("--summary", required=True, help="path to summary.json")
     deliver.add_argument("--analysis", default=None, help="path to analysis.json")
     deliver.add_argument("--out", default="rca", help="directory for delivery-preview.md")
-    deliver.add_argument("--dry-run", action="store_true", help="render only; never post")
+    deliver.add_argument(
+        "--dry-run", action="store_true", help="render only; never post (the default)"
+    )
+    deliver.add_argument(
+        "--live",
+        action="store_true",
+        help="post / edit comments and labels on GitHub (never with --offline or --dry-run)",
+    )
     deliver.add_argument(
         "--offline", action="store_true", help="skip every GitHub API call (read-only lookups)"
     )
@@ -701,12 +709,14 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---- deliver (Phase 3, Step 14: dry-run only — zero GitHub writes) ----------------
+# ---- deliver (Phase 3: dry-run by default; sticky comments only with --live) -------
 
 DELIVERY_PREVIEW_FILE = "delivery-preview.md"
 COMMENT_BEGIN = "<!-- BEGIN RCA COMMENT BODY (posted verbatim) -->"
 COMMENT_END = "<!-- END RCA COMMENT BODY -->"
-_LIVE_DELIVERY_NOTE = "live delivery is enabled in Step 15; ran as dry-run"
+_DRY_RUN_NOTE = "dry run: nothing posted (pass --live to post)"
+_FLAKY_LABEL = "ci:flaky"
+_ISSUES_PENDING = "pending Step 16"
 _DELIVERY_TIMEOUT_S = 15
 _DELIVERY_INPUT_FLAGS = (
     "comment_on_pr",
@@ -743,8 +753,13 @@ class _OfflineClient:
         raise OfflineMode()
 
 
+def _delivery_clock() -> float:
+    """Wall-clock for the 30s delivery budget. Test hook: monkeypatch to a fake clock."""
+    return time.monotonic()
+
+
 def _delivery_client(args: argparse.Namespace) -> GitHubClient:
-    """Read-only lookups only in this step. Test hook: monkeypatch to inject a transport."""
+    """The delivery job's client (15s per call). Test hook: monkeypatch to inject a transport."""
     return GitHubClient(api_url=args.api_url, token=args.token, timeout=_DELIVERY_TIMEOUT_S)
 
 
@@ -805,15 +820,22 @@ def _first_line(exc: BaseException) -> str:
 
 
 def _cmd_deliver(args: argparse.Namespace) -> int:
-    """Decide + render delivery; write only local files. Never posts (Step 14)."""
+    """Decide, render and (only with --live) post sticky comments. Never fails the workflow."""
+    from .deliver.sticky import DeliveryBudget
     from .models import DeliveryReport
 
+    budget = DeliveryBudget(started_at=_delivery_clock())
     out = Path(args.out)
     summary_path = Path(args.summary)
     notes: list[str] = []
     errors: list[str] = []
-    if not args.dry_run:
-        notes.append(_LIVE_DELIVERY_NOTE)
+    live = bool(args.live) and not args.offline and not args.dry_run
+    if args.live and args.offline:
+        notes.append("--live ignored: --offline makes no GitHub API calls")
+    elif args.live and args.dry_run:
+        notes.append("--live ignored: --dry-run was also given")
+    if not live:
+        notes.append(_DRY_RUN_NOTE)
 
     raw_summary: dict[str, Any] | None = None
     summary: Summary | None = None
@@ -824,10 +846,12 @@ def _cmd_deliver(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         errors.append(f"summary unreadable: {_first_line(exc)}")
 
-    outcome: dict[str, Any] = {"trigger": "unknown", "severity": "low"}
+    outcome: dict[str, Any] = {"trigger": "unknown", "severity": "low", "live": live}
     if summary is not None:
         try:
-            outcome = _plan_delivery(args, summary, raw_summary, notes, errors)
+            outcome = _plan_delivery(
+                args, summary, raw_summary, notes, errors, live=live, budget=budget
+            )
         except Exception as exc:  # noqa: BLE001 — still write whatever we can
             _LOG.exception("deliver planning error")
             errors.append(f"delivery planning failed: {_first_line(exc)}")
@@ -836,8 +860,9 @@ def _cmd_deliver(args: argparse.Namespace) -> int:
         trigger=outcome.get("trigger", "unknown"),
         severity=outcome.get("severity", "low"),
         suppressed_by=outcome.get("suppressed_by"),
-        delivered_to=[],
-        dry_run=True,
+        delivered_to=list(outcome.get("delivered_to", [])),
+        comment_url=outcome.get("comment_url"),
+        dry_run=not live,
         errors=errors,
         notes=notes,
     )
@@ -869,8 +894,10 @@ def _plan_delivery(
     raw_summary: dict[str, Any] | None,
     notes: list[str],
     errors: list[str],
+    *,
+    live: bool,
+    budget: Any,
 ) -> dict[str, Any]:
-    from .deliver.render_comment import render_comment
     from .deliver.severity import severity
     from .deliver.suppress import evaluate
     from .deliver.targets import (
@@ -919,11 +946,73 @@ def _plan_delivery(
             )
             if state.source != "run_list":
                 notes.append(f"default-branch state from {state.source}")
+        sev = severity(context, state, summary)
+        outcome: dict[str, Any] = {
+            "trigger": context.trigger,
+            "severity": sev,
+            "context": context,
+            "plan": plan,
+            "open_issue": open_issue,
+            "state": state,
+            "live": live,
+            "delivered_to": [],
+        }
+        _deliver_comment(
+            outcome,
+            summary=summary,
+            record=record,
+            inputs=inputs,
+            client=client,
+            repo=repo or "",
+            online=not isinstance(client, _OfflineClient),
+            now=now,
+            budget=budget,
+            notes=notes,
+            errors=errors,
+        )
     finally:
         if closer is not None:
             closer.close()
-    sev = severity(context, state, summary)
+    return outcome
+
+
+def _deliver_comment(
+    outcome: dict[str, Any],
+    *,
+    summary: Summary,
+    record: Any,
+    inputs: Any,
+    client: Any,
+    repo: str,
+    online: bool,
+    now: datetime,
+    budget: Any,
+    notes: list[str],
+    errors: list[str],
+) -> None:
+    """Stage A → find existing → Stage B/C → render → post (live) or describe (dry run)."""
+    from .deliver.render_comment import render_comment
+    from .deliver.sticky import (
+        BUDGET_EXCEEDED,
+        CHANNELS,
+        LOOKUP_FAILED,
+        find_existing,
+        post_or_update,
+    )
+    from .deliver.suppress import SUPPRESSED_DELIVERY_ERROR, evaluate
+
+    context = outcome["context"]
+    plan = outcome["plan"]
+    live = outcome["live"]
+    delivered: list[str] = outcome["delivered_to"]
+    write_failed = False
+
     decision = evaluate(summary, record, context, inputs, existing=None, now=now)
+    target: int | str | None = None
+    if plan.comment == "pr":
+        target = context.pr_number
+    elif plan.comment == "commit":
+        target = context.commit_sha or None
 
     body: str | None = None
     why_not: str | None = None
@@ -931,43 +1020,117 @@ def _plan_delivery(
         why_not = f"suppressed by {decision.suppressed_by}"
     elif plan.comment is None:
         why_not = f"the routing plan has no comment channel ({'; '.join(plan.notes)})"
+    elif target is None:
+        why_not = f"no {plan.comment} comment target"
     else:
+        channel = CHANNELS[plan.comment]
+        existing = None
+        lookup_failed = False
+        if online:
+            existing, found_notes = find_existing(
+                client,
+                repo,
+                target_kind=plan.comment,
+                target=target,
+                fingerprint_coarse=summary.fingerprint_coarse,
+                branch=context.branch,
+            )
+            notes.extend(found_notes)
+            lookup_failed = any(n.startswith(LOOKUP_FAILED) for n in found_notes)
+        else:
+            notes.append("existing comments not looked up (no API access)")
+        decision = evaluate(summary, record, context, inputs, existing=existing, now=now)
         try:
             body = render_comment(summary, record, context, decision)
         except Exception as exc:  # noqa: BLE001 — the preview/report still get written
             _LOG.exception("comment rendering failed")
             errors.append(f"comment rendering failed: {_first_line(exc)}")
             why_not = "comment rendering failed"
-    return {
-        "trigger": context.trigger,
-        "severity": sev,
-        "suppressed_by": decision.suppressed_by,
-        "context": context,
-        "plan": plan,
-        "open_issue": open_issue,
-        "state": state,
-        "decision": decision,
-        "body": body,
-        "why_not": why_not,
-    }
+        if body is not None:
+            outcome["comment_target"] = f"{channel.label} on {target}"
+            if live and lookup_failed:
+                # Never create blind: an existing comment we could not see would be duplicated.
+                outcome["comment_action"] = "skipped"
+                errors.append(f"{channel.label} skipped: existing comments could not be listed")
+                write_failed = True
+            elif live:
+                result = post_or_update(
+                    client,
+                    repo,
+                    target,
+                    body,
+                    existing,
+                    target_kind=plan.comment,
+                    clock=_delivery_clock,
+                    budget=budget,
+                )
+                outcome["comment_action"] = result.action
+                if result.action in {"created", "updated", "unchanged"}:
+                    delivered.append(channel.delivered_as)
+                    outcome["comment_url"] = result.url
+                else:
+                    errors.append(result.error or f"{channel.label} not delivered")
+                    write_failed = write_failed or result.action == "failed"
+            elif existing is None:
+                outcome["comment_action"] = "would create" + ("" if online else " (not looked up)")
+            elif existing.body == body:
+                outcome["comment_action"] = "unchanged"
+                outcome["comment_url"] = existing.html_url
+            else:
+                outcome["comment_action"] = "would edit"
+                outcome["comment_url"] = existing.html_url
+
+    if decision.add_flaky_label and context.pr_number is not None:
+        if not live:
+            outcome["label_action"] = f"would add `{_FLAKY_LABEL}`"
+        elif budget.exceeded(_delivery_clock()):
+            outcome["label_action"] = "skipped"
+            errors.append(f"label {_FLAKY_LABEL} skipped: {BUDGET_EXCEEDED}")
+        else:
+            try:
+                client.add_labels(repo, context.pr_number, [_FLAKY_LABEL])
+                delivered.append(f"label:{_FLAKY_LABEL}")
+                outcome["label_action"] = f"added `{_FLAKY_LABEL}`"
+            except Exception as exc:  # noqa: BLE001 — best-effort, recorded
+                outcome["label_action"] = "failed"
+                scope = " (the token needs `pull-requests: write`)" if getattr(
+                    exc, "status_code", None
+                ) == 403 else ""
+                errors.append(f"label {_FLAKY_LABEL} failed: {_first_line(exc)}{scope}")
+                write_failed = True
+
+    suppressed_by = decision.suppressed_by
+    if suppressed_by is None and live and write_failed and not delivered:
+        suppressed_by = SUPPRESSED_DELIVERY_ERROR  # A5: a write was attempted, nothing landed
+    outcome.update(
+        suppressed_by=suppressed_by, decision=decision, body=body, why_not=why_not
+    )
 
 
 def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
-    """Header (redacted) + the comment body verbatim between markers."""
+    """Header (redacted) + the comment body verbatim between markers.
+
+    Written in both modes: a preview in a dry run, an audit trail when live. The
+    body between the markers is byte-identical to what is (or would be) posted.
+    """
     from .redact import redact_text
 
+    live = bool(outcome.get("live"))
     plan = outcome.get("plan")
     decision = outcome.get("decision")
     context = outcome.get("context")
     state = outcome.get("state")
     lines = [
-        "# RCA delivery preview (dry run)",
+        "# RCA delivery report (LIVE)" if live else "# RCA delivery preview (dry run)",
         "",
-        "No GitHub writes were made. This is what delivery would do for this run.",
+        "Live delivery: the GitHub writes below were made."
+        if live
+        else "No GitHub writes were made. This is what delivery would do for this run.",
         "",
         f"- trigger: `{report.trigger}`",
         f"- severity: `{report.severity}`",
         f"- suppressed_by: `{report.suppressed_by or 'none'}`",
+        f"- delivered_to: {', '.join(report.delivered_to) or 'none'}",
     ]
     if context is not None:
         pr = f"#{context.pr_number}" if context.pr_number is not None else "none"
@@ -976,24 +1139,32 @@ def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
             f" · fork: {str(context.is_fork).lower()} · draft: {str(context.pr_is_draft).lower()}"
         )
     if plan is not None:
+        if outcome.get("body") is not None:
+            comment = f"{outcome.get('comment_target')} → {outcome.get('comment_action')}"
+            if outcome.get("comment_url"):
+                comment += f" ({outcome['comment_url']})"
+        else:
+            comment = f"{plan.comment or 'none'} — not posted: {outcome.get('why_not')}"
+        issue = "yes" if outcome.get("open_issue") else "no"
         lines += [
             "",
             "## Route plan",
             "",
             "- job summary: yes (written by collect)",
-            f"- comment: {plan.comment or 'none'}"
-            + ("" if outcome.get("body") else f" — not posted: {outcome.get('why_not')}"),
-            f"- issue policy: {plan.issue or 'none'} · would open an issue: "
-            f"{'yes' if outcome.get('open_issue') else 'no'}",
+            f"- comment: {comment}",
+            f"- issue policy: {plan.issue or 'none'} · would open an issue: {issue}"
+            + (f" ({_ISSUES_PENDING})" if outcome.get("open_issue") else ""),
             f"- notify intent: {', '.join(plan.notify) or 'none'} "
             "(channels are decided in Step 18)",
         ]
+        if outcome.get("label_action"):
+            lines.append(f"- label: {outcome['label_action']}")
     if decision is not None:
         lines += [
             "",
             "## Modifiers",
             "",
-            f"- dedupe: {decision.dedupe or 'none'} (existing comments are looked up in Step 15)",
+            f"- dedupe: {decision.dedupe or 'none'}",
             f"- unverified banner: {str(decision.unverified_banner).lower()}",
             f"- omit root cause: {str(decision.omit_root_cause).lower()}",
             f"- ci:flaky label: {str(decision.add_flaky_label).lower()}",
@@ -1017,9 +1188,10 @@ def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
 
     body = outcome.get("body")
     if body is None:
+        verb = "No comment was posted" if live else "No comment would be posted"
         tail = (
             "\n## Comment body\n\n"
-            f"No comment would be posted: {outcome.get('why_not') or 'delivery could not be planned'}.\n"
+            f"{verb}: {outcome.get('why_not') or 'delivery could not be planned'}.\n"
         )
         return header + redact_text(tail)[0]
     return header + "\n## Comment body\n\n" + f"{COMMENT_BEGIN}\n{body}{COMMENT_END}\n"

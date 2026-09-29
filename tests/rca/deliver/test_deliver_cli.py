@@ -151,7 +151,8 @@ def test_live_lookups_are_get_only(tmp_path, monkeypatch) -> None:
     assert "trigger: `push_default`" in _preview(summary.parent)
 
 
-def test_without_dry_run_still_writes_nothing(tmp_path, monkeypatch) -> None:
+def test_without_live_flag_is_a_dry_run(tmp_path, monkeypatch) -> None:
+    # Step 15: posting needs an explicit --live; no flag is a dry run (not "live pending").
     def refuse(_args):
         raise AssertionError("no client may be built offline")
 
@@ -161,7 +162,7 @@ def test_without_dry_run_still_writes_nothing(tmp_path, monkeypatch) -> None:
     delivery = json.loads(summary.read_text(encoding="utf-8"))["delivery"]
     assert delivery["dry_run"] is True
     assert delivery["delivered_to"] == []
-    assert any("Step 15" in note for note in delivery["notes"])
+    assert any("pass --live to post" in note for note in delivery["notes"])
 
 
 def test_github_output_keys(tmp_path, monkeypatch) -> None:
