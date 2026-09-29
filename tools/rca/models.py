@@ -376,6 +376,21 @@ class DeterministicDiagnosis(BaseModel):
     fix_one_liner: str | None = None
 
 
+class DeliveryReport(BaseModel):
+    """Phase 3 delivery outcome (delivery spec v1.3 §15). Written back by ``deliver``."""
+
+    trigger: str
+    severity: str
+    suppressed_by: str | None = None
+    delivered_to: list[str] = []
+    comment_url: str | None = None
+    issue_url: str | None = None
+    owner_resolved_by: str | None = None
+    errors: list[str] = []
+    dry_run: bool = False
+    notes: list[str] = []
+
+
 class Summary(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     collector_version: str
@@ -398,6 +413,7 @@ class Summary(BaseModel):
     kubernetes: None = None
     budget_report: BudgetReport
     collection_notes: list[str] = []
+    delivery: DeliveryReport | None = None
 
 
 # --- Phase 2 analysis (§16). Not attached to Summary in Slice H. ---

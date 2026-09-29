@@ -98,8 +98,14 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_telemetry(args)
         if args.cmd == "cache-keys":
             return _cmd_cache_keys(args)
+        if args.cmd == "deliver":
+            return _cmd_deliver(args)
         parser.error(f"unknown command {args.cmd}")
     except Exception as exc:  # noqa: BLE001 — collector must not fail the workflow
+        if getattr(args, "cmd", None) == "deliver":
+            # Never regenerate summary.json from a stub: it holds collect + analysis.
+            _LOG.exception("deliver error")
+            return 1 if getattr(args, "strict", False) else 0
         if getattr(args, "cmd", None) == "analyze":
             _LOG.exception("analyze error")
             _emit_failed_analysis(args, f"analyze error: {exc}")
@@ -225,6 +231,29 @@ def _build_parser() -> argparse.ArgumentParser:
     keys.add_argument("--workflow-name", default=None)
     keys.add_argument("--job-name", default=None)
     keys.add_argument("--repository", default=None, help="owner/repo")
+
+    deliver = sub.add_parser("deliver", parents=[parent])
+    deliver.add_argument("--summary", required=True, help="path to summary.json")
+    deliver.add_argument("--analysis", default=None, help="path to analysis.json")
+    deliver.add_argument("--out", default="rca", help="directory for delivery-preview.md")
+    deliver.add_argument("--dry-run", action="store_true", help="render only; never post")
+    deliver.add_argument(
+        "--offline", action="store_true", help="skip every GitHub API call (read-only lookups)"
+    )
+    deliver.add_argument("--repo", default=None, help="owner/repo (default: from the run URL)")
+    for flag in (
+        "--comment-on-pr",
+        "--comment-on-commit",
+        "--comment-on-branch-push",
+        "--create-issues",
+        "--allow-fork-issues",
+    ):
+        deliver.add_argument(flag, default=None, help="true | false")
+    deliver.add_argument("--issue-threshold", type=int, default=None)
+    deliver.add_argument("--confidence-threshold", default=None, help="low | medium | high")
+    deliver.add_argument("--quiet-window-minutes", type=int, default=None)
+    deliver.add_argument("--platform-team", default=None)
+    deliver.add_argument("--default-notify", default=None)
     return parser
 
 
@@ -670,6 +699,351 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     if record.status == "failed" and args.strict:
         return 1
     return 0
+
+
+# ---- deliver (Phase 3, Step 14: dry-run only — zero GitHub writes) ----------------
+
+DELIVERY_PREVIEW_FILE = "delivery-preview.md"
+COMMENT_BEGIN = "<!-- BEGIN RCA COMMENT BODY (posted verbatim) -->"
+COMMENT_END = "<!-- END RCA COMMENT BODY -->"
+_LIVE_DELIVERY_NOTE = "live delivery is enabled in Step 15; ran as dry-run"
+_DELIVERY_TIMEOUT_S = 15
+_DELIVERY_INPUT_FLAGS = (
+    "comment_on_pr",
+    "comment_on_commit",
+    "comment_on_branch_push",
+    "create_issues",
+    "allow_fork_issues",
+)
+_DELIVERY_INPUT_VALUES = (
+    "issue_threshold",
+    "confidence_threshold",
+    "quiet_window_minutes",
+    "platform_team",
+    "default_notify",
+)
+_RUN_URL_REPO_RE = re.compile(r"^https?://[^/]+/([^/]+/[^/]+)/actions/runs/\d+")
+
+
+class OfflineMode(Exception):
+    """Raised by the offline client: every lookup falls back (Step 13 fallbacks)."""
+
+
+class _OfflineClient:
+    def get_repo(self, repo: str) -> dict[str, Any]:
+        raise OfflineMode()
+
+    def get_run(self, repo: str, run_id: int) -> dict[str, Any]:
+        raise OfflineMode()
+
+    def list_runs(self, repo: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        raise OfflineMode()
+
+    def ref_is_tag(self, repo: str, name: str) -> bool:
+        raise OfflineMode()
+
+
+def _delivery_client(args: argparse.Namespace) -> GitHubClient:
+    """Read-only lookups only in this step. Test hook: monkeypatch to inject a transport."""
+    return GitHubClient(api_url=args.api_url, token=args.token, timeout=_DELIVERY_TIMEOUT_S)
+
+
+def _delivery_inputs(args: argparse.Namespace, errors: list[str]) -> Any:
+    from .deliver import DeliveryInputs
+
+    values: dict[str, Any] = {}
+    for name in _DELIVERY_INPUT_FLAGS:
+        raw = getattr(args, name, None)
+        if raw is not None:
+            values[name] = _as_flag(raw, default=False)
+    for name in _DELIVERY_INPUT_VALUES:
+        raw = getattr(args, name, None)
+        if raw is not None:
+            values[name] = raw
+    try:
+        return DeliveryInputs(**values)
+    except Exception as exc:  # noqa: BLE001 — bad input → defaults, recorded
+        errors.append(f"invalid delivery inputs; using defaults: {_first_line(exc)}")
+        return DeliveryInputs()
+
+
+def _load_delivery_analysis(
+    args: argparse.Namespace, raw_summary: dict[str, Any] | None, notes: list[str]
+) -> Any:
+    from .models import AnalysisRecord
+
+    if getattr(args, "analysis", None):
+        path = Path(args.analysis)
+        try:
+            return AnalysisRecord.model_validate_json(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            notes.append(f"analysis file not found: {path.name}")
+        except Exception as exc:  # noqa: BLE001 — corrupt analysis → deterministic card
+            notes.append(f"analysis file unreadable ({type(exc).__name__}); ignored")
+    embedded = (raw_summary or {}).get("analysis")
+    if isinstance(embedded, dict):
+        try:
+            return AnalysisRecord.model_validate(embedded)
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"embedded analysis unreadable ({type(exc).__name__}); ignored")
+    return None
+
+
+def _delivery_repo(args: argparse.Namespace, summary: Summary) -> str | None:
+    if getattr(args, "repo", None):
+        return str(args.repo)
+    env_repo = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    if env_repo:
+        return env_repo
+    match = _RUN_URL_REPO_RE.match(summary.run.html_url or "")
+    return match.group(1) if match else None
+
+
+def _first_line(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()
+    return f"{type(exc).__name__}: {text[0]}" if text else type(exc).__name__
+
+
+def _cmd_deliver(args: argparse.Namespace) -> int:
+    """Decide + render delivery; write only local files. Never posts (Step 14)."""
+    from .models import DeliveryReport
+
+    out = Path(args.out)
+    summary_path = Path(args.summary)
+    notes: list[str] = []
+    errors: list[str] = []
+    if not args.dry_run:
+        notes.append(_LIVE_DELIVERY_NOTE)
+
+    raw_summary: dict[str, Any] | None = None
+    summary: Summary | None = None
+    try:
+        loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+        raw_summary = loaded if isinstance(loaded, dict) else None
+        summary = Summary.model_validate(raw_summary)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"summary unreadable: {_first_line(exc)}")
+
+    outcome: dict[str, Any] = {"trigger": "unknown", "severity": "low"}
+    if summary is not None:
+        try:
+            outcome = _plan_delivery(args, summary, raw_summary, notes, errors)
+        except Exception as exc:  # noqa: BLE001 — still write whatever we can
+            _LOG.exception("deliver planning error")
+            errors.append(f"delivery planning failed: {_first_line(exc)}")
+
+    report = DeliveryReport(
+        trigger=outcome.get("trigger", "unknown"),
+        severity=outcome.get("severity", "low"),
+        suppressed_by=outcome.get("suppressed_by"),
+        delivered_to=[],
+        dry_run=True,
+        errors=errors,
+        notes=notes,
+    )
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / DELIVERY_PREVIEW_FILE).write_text(
+            _delivery_preview(report, outcome), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001
+        _LOG.exception("failed to write delivery preview")
+    if raw_summary is not None:
+        try:
+            _write_back_delivery(summary_path, out, report)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.exception("failed to write delivery into summary.json")
+            report.errors.append(f"summary.json write-back failed: {_first_line(exc)}")
+    try:
+        from .outputs import write_delivery_github_output
+
+        write_delivery_github_output(report)
+    except Exception:  # noqa: BLE001
+        _LOG.exception("failed to write delivery outputs")
+    return 1 if (args.strict and report.errors) else 0
+
+
+def _plan_delivery(
+    args: argparse.Namespace,
+    summary: Summary,
+    raw_summary: dict[str, Any] | None,
+    notes: list[str],
+    errors: list[str],
+) -> dict[str, Any]:
+    from .deliver.render_comment import render_comment
+    from .deliver.severity import severity
+    from .deliver.suppress import evaluate
+    from .deliver.targets import (
+        default_branch_state,
+        resolve_context,
+        route,
+        should_open_issue,
+    )
+
+    now = datetime.now(timezone.utc)
+    inputs = _delivery_inputs(args, errors)
+    record = _load_delivery_analysis(args, raw_summary, notes)
+    if summary.diagnosis is None:
+        # Older / captured summaries carry no deterministic card; re-derive it in
+        # memory (never written back) so the preview matches what collect produces.
+        from .diagnose import apply_verdict, diagnose
+
+        summary = apply_verdict(summary, diagnose(summary.model_copy(deep=True)))
+        notes.append("summary had no diagnosis; deterministic verdict re-derived in memory")
+
+    repo = _delivery_repo(args, summary)
+    client: Any
+    closer: Any = None
+    if args.offline:
+        client = _OfflineClient()
+        notes.append("offline: no GitHub API calls; lookups use fallbacks")
+    elif not repo:
+        client = _OfflineClient()
+        notes.append("no repository known (--repo / GITHUB_REPOSITORY); lookups skipped")
+    else:
+        client = closer = _delivery_client(args)
+    try:
+        context, ctx_notes = resolve_context(summary, client=client, repo=repo or "", now=now)
+        notes.extend(ctx_notes)
+        plan = route(context, inputs)
+        notes.extend(plan.notes)
+        open_issue = should_open_issue(context, summary, inputs)
+        state = None
+        if context.trigger in {"push_default", "tag"}:
+            state = default_branch_state(
+                summary,
+                client=client,
+                repo=repo or "",
+                default_branch=context.default_branch,
+                now=now,
+            )
+            if state.source != "run_list":
+                notes.append(f"default-branch state from {state.source}")
+    finally:
+        if closer is not None:
+            closer.close()
+    sev = severity(context, state, summary)
+    decision = evaluate(summary, record, context, inputs, existing=None, now=now)
+
+    body: str | None = None
+    why_not: str | None = None
+    if decision.suppressed_by is not None:
+        why_not = f"suppressed by {decision.suppressed_by}"
+    elif plan.comment is None:
+        why_not = f"the routing plan has no comment channel ({'; '.join(plan.notes)})"
+    else:
+        try:
+            body = render_comment(summary, record, context, decision)
+        except Exception as exc:  # noqa: BLE001 — the preview/report still get written
+            _LOG.exception("comment rendering failed")
+            errors.append(f"comment rendering failed: {_first_line(exc)}")
+            why_not = "comment rendering failed"
+    return {
+        "trigger": context.trigger,
+        "severity": sev,
+        "suppressed_by": decision.suppressed_by,
+        "context": context,
+        "plan": plan,
+        "open_issue": open_issue,
+        "state": state,
+        "decision": decision,
+        "body": body,
+        "why_not": why_not,
+    }
+
+
+def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
+    """Header (redacted) + the comment body verbatim between markers."""
+    from .redact import redact_text
+
+    plan = outcome.get("plan")
+    decision = outcome.get("decision")
+    context = outcome.get("context")
+    state = outcome.get("state")
+    lines = [
+        "# RCA delivery preview (dry run)",
+        "",
+        "No GitHub writes were made. This is what delivery would do for this run.",
+        "",
+        f"- trigger: `{report.trigger}`",
+        f"- severity: `{report.severity}`",
+        f"- suppressed_by: `{report.suppressed_by or 'none'}`",
+    ]
+    if context is not None:
+        pr = f"#{context.pr_number}" if context.pr_number is not None else "none"
+        lines.append(
+            f"- branch: `{context.branch}` (default `{context.default_branch}`) · PR: {pr}"
+            f" · fork: {str(context.is_fork).lower()} · draft: {str(context.pr_is_draft).lower()}"
+        )
+    if plan is not None:
+        lines += [
+            "",
+            "## Route plan",
+            "",
+            "- job summary: yes (written by collect)",
+            f"- comment: {plan.comment or 'none'}"
+            + ("" if outcome.get("body") else f" — not posted: {outcome.get('why_not')}"),
+            f"- issue policy: {plan.issue or 'none'} · would open an issue: "
+            f"{'yes' if outcome.get('open_issue') else 'no'}",
+            f"- notify intent: {', '.join(plan.notify) or 'none'} "
+            "(channels are decided in Step 18)",
+        ]
+    if decision is not None:
+        lines += [
+            "",
+            "## Modifiers",
+            "",
+            f"- dedupe: {decision.dedupe or 'none'} (existing comments are looked up in Step 15)",
+            f"- unverified banner: {str(decision.unverified_banner).lower()}",
+            f"- omit root cause: {str(decision.omit_root_cause).lower()}",
+            f"- ci:flaky label: {str(decision.add_flaky_label).lower()}",
+            f"- platform notification once: {str(decision.notify_platform_once).lower()}",
+        ]
+        lines += [f"- {reason}" for reason in decision.reasons]
+    if state is not None:
+        lines += [
+            "",
+            "## Default-branch state",
+            "",
+            f"- source: {state.source} · consecutive failures: {state.consecutive_failures}"
+            f" · red for: {_hours(state.red_duration_hours)} · last green: {state.last_green_sha}",
+        ]
+    if report.notes or report.errors:
+        lines += ["", "## Notes", ""]
+        lines += [f"- {note}" for note in report.notes]
+        lines += [f"- error: {err}" for err in report.errors]
+    header = "\n".join(lines) + "\n"
+    header, _ = redact_text(header)
+
+    body = outcome.get("body")
+    if body is None:
+        tail = (
+            "\n## Comment body\n\n"
+            f"No comment would be posted: {outcome.get('why_not') or 'delivery could not be planned'}.\n"
+        )
+        return header + redact_text(tail)[0]
+    return header + "\n## Comment body\n\n" + f"{COMMENT_BEGIN}\n{body}{COMMENT_END}\n"
+
+
+def _hours(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.1f}h"
+
+
+def _write_back_delivery(summary_path: Path, out: Path, report: Any) -> None:
+    """Set only the ``delivery`` key (v1.3 §15). Never regenerate, never drop ``analysis``.
+
+    Like ``analyze``: when --out is elsewhere, the input is copied to
+    <out>/summary.json first and only that copy is updated.
+    """
+    dest = out / "summary.json"
+    src = Path(summary_path)
+    if src.resolve() != dest.resolve():
+        dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    payload = json.loads(dest.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("summary.json is not an object")
+    payload["delivery"] = report.model_dump(mode="json")
+    dest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _as_flag(value: object, *, default: bool) -> bool:

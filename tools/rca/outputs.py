@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .models import AnalysisRecord, Summary
+from .models import AnalysisRecord, DeliveryReport, Summary
 
 OUTPUT_KEYS = (
     "summary-path",
@@ -312,3 +312,43 @@ def _append_output_file(path: str | Path, values: dict[str, str]) -> None:
     with dest.open("a", encoding="utf-8") as handle:
         for key in OUTPUT_KEYS:
             handle.write(f"{key}={values.get(key, '')}\n")
+
+
+DELIVERY_OUTPUT_KEYS = (
+    "severity",
+    "suppressed-by",
+    "delivered-to",
+    "comment-url",
+    "issue-url",
+)
+
+
+def delivery_outputs(report: DeliveryReport | None) -> dict[str, str]:
+    """Map a DeliveryReport to GITHUB_OUTPUT keys. Single-line; empty when unknown."""
+    if report is None:
+        return {key: "" for key in DELIVERY_OUTPUT_KEYS}
+    raw = {
+        "severity": report.severity or "",
+        "suppressed-by": report.suppressed_by or "",
+        "delivered-to": ",".join(report.delivered_to),
+        "comment-url": report.comment_url or "",
+        "issue-url": report.issue_url or "",
+    }
+    return {key: _one_line(raw[key]) for key in DELIVERY_OUTPUT_KEYS}
+
+
+def write_delivery_github_output(
+    report: DeliveryReport | None,
+    *,
+    output_file: str | Path | None = None,
+) -> None:
+    """Append delivery key=value lines to GITHUB_OUTPUT. No-op when the file is unset."""
+    path = output_file if output_file is not None else os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    values = delivery_outputs(report)
+    with dest.open("a", encoding="utf-8") as handle:
+        for key in DELIVERY_OUTPUT_KEYS:
+            handle.write(f"{key}={values[key]}\n")
