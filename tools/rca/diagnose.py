@@ -16,12 +16,14 @@ from .classify import (
 )
 from .config import (
     CLASSIFY_RULES,
+    HEADLINE_CAUSE_MAX_CHARS,
+    HEADLINE_PREFIX_STRIP_PATTERNS,
     RUNNER_FAILURE_PATTERNS,
     SYMPTOM_PATTERNS,
     TERMINAL_CAUSE_PATTERNS,
     TERMINAL_CAUSE_RULES,
 )
-from .extract import extract_source_paths, is_benign_line
+from .extract import extract_source_paths, is_benign_line, is_exit_code_line
 from .models import (
     ChangeContext,
     DeterministicDiagnosis,
@@ -170,6 +172,7 @@ _IMAGE_OR_WORKFLOW_RE = re.compile(
 )
 _RUNNER_RES = [re.compile(p, re.IGNORECASE) for p in RUNNER_FAILURE_PATTERNS]
 _TERMINAL_CAUSE_RES = [re.compile(p, re.IGNORECASE) for p in TERMINAL_CAUSE_PATTERNS]
+_HEADLINE_PREFIX_RES = [re.compile(p) for p in HEADLINE_PREFIX_STRIP_PATTERNS]
 # (terminal regex, category regex, category or None) — drives the R19 gap-fill.
 _TERMINAL_RULE_RES = [
     (
@@ -562,9 +565,10 @@ def user_facing(verdict: DeterministicVerdict, summary: Summary):
                 f"(or could not be resolved)."
             )
         else:
-            root = (
+            root = _with_cause_line(
                 "Package install failed: a package was not found "
-                "(or could not be resolved)."
+                "(or could not be resolved).",
+                summary,
             )
         fix = (
             "Use a published package name and version; update the manifest/lockfile; "
@@ -590,14 +594,14 @@ def user_facing(verdict: DeterministicVerdict, summary: Summary):
         if test_name:
             root = f'Test failed: {test_name}.'
         else:
-            root = "A test assertion failed."
+            root = _with_cause_line("A test assertion failed.", summary)
         fix = "Fix the failing assertion in that test."
     elif cat == "compile":
         files = verdict.suspected_files
         if files:
             root = f"Compilation failed in {files[0]}."
         else:
-            root = "Compilation failed."
+            root = _with_cause_line("Compilation failed.", summary)
         fix = "Fix the compile error in the suspected source file(s)."
     elif cat == "disk_space":
         root = "The job ran out of disk space (ENOSPC)."
@@ -676,6 +680,56 @@ def user_facing(verdict: DeterministicVerdict, summary: Summary):
         used_deterministic_rule=verdict.rule_id,
         source="deterministic",
     )
+
+
+def headline_cause_line(summary: Summary) -> str | None:
+    """The failed step's own cause line, cleaned for use in a headline.
+
+    ``primary_failure_line``; when the job log is uninformative (Step 9: exit
+    code / benign only) the pipeline first-error line instead, since that is the
+    failed step's anchor. Never a benign line, an exit-code line, or a line
+    carrying a rule id. Never raises.
+    """
+    try:
+        candidates: list[str | None] = []
+        if summary.failed_jobs:
+            candidates.append(summary.failed_jobs[0].primary_failure_line)
+        if _job_logs_are_exit_only(summary) and _pipeline_has_first_error(summary):
+            candidates.append(_first_pipeline_error_line(summary))
+        for raw in candidates:
+            line = (raw or "").strip()
+            if not line or is_benign_line(line) or is_exit_code_line(line):
+                continue
+            # Strip prefixes before collapsing whitespace: pytest's "E   " needs its run.
+            cleaned = " ".join(_strip_headline_prefixes(line).split())
+            if cleaned and not _contains_rule_id(cleaned):
+                return cleaned
+    except Exception:  # noqa: BLE001 — headline copy must never crash diagnosis
+        return None
+    return None
+
+
+def _strip_headline_prefixes(line: str) -> str:
+    text = line.strip()
+    changed = True
+    while changed and text:
+        changed = False
+        for rx in _HEADLINE_PREFIX_RES:
+            stripped = rx.sub("", text, count=1).strip()
+            if stripped != text:
+                text, changed = stripped, True
+    return text
+
+
+def _with_cause_line(sentence: str, summary: Summary) -> str:
+    """ "<generic sentence> — <cause line>", or the sentence when no usable line exists."""
+    cause = headline_cause_line(summary)
+    if not cause or cause.lower() in sentence.lower():
+        return sentence
+    text = f"{sentence.rstrip().rstrip('.')} — {cause}"
+    if len(text) > HEADLINE_CAUSE_MAX_CHARS:
+        text = text[: HEADLINE_CAUSE_MAX_CHARS - 1].rstrip() + "…"
+    return text
 
 
 def enrich_display(summary: Summary, verdict: DeterministicVerdict) -> DeterministicVerdict:

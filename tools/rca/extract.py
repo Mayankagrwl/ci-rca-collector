@@ -95,7 +95,21 @@ _SOURCE_PATHS = (
         r"(?:^|[\s'`\"(])([A-Za-z0-9_./\\-]+\.[A-Za-z][A-Za-z0-9]*):(\d+)(?::\d+)?"
     ),
     re.compile(r"\(([^():]+):(\d+)(?::\d+)?\)"),
+    # Maven / javac: "/work/src/Foo.java:[19,40]".
+    re.compile(
+        r"(?:^|[\s'`\"(])([A-Za-z0-9_./\\-]+\.[A-Za-z][A-Za-z0-9]*):\[(\d+)(?:,\d+)?\]"
+    ),
+    # Kotlin / Gradle: "e: file:///work/src/Foo.kt:12:5" — the path without the scheme.
+    re.compile(r"\bfile://([A-Za-z0-9_./\\-]*/[A-Za-z0-9_.\\-]+\.[A-Za-z][A-Za-z0-9]*):(\d+)"),
 )
+
+
+def is_exit_code_line(line: str) -> bool:
+    """True for a bare "Process completed with exit code N" line (any prefix).
+
+    Such lines never explain a failure; the same rule _primary_failure_line applies.
+    """
+    return bool(_EXIT_CODE.search(line or ""))
 
 
 def extract_source_paths(text: str) -> list[tuple[str, int | None]]:
@@ -223,7 +237,7 @@ def _primary_failure_line(lines: list[str], lo: int, hi: int) -> str | None:
     for pattern in (_SEMANTIC_CAUSE, _WINDOW_ERROR, ERROR_LINE):
         for index in range(lo, hi):
             line = lines[index]
-            if is_benign_line(line) or _EXIT_CODE.search(line):
+            if is_benign_line(line) or is_exit_code_line(line):
                 continue
             if pattern.search(line):
                 return _strip_ts(line.split("\n", 1)[0]).strip() or None

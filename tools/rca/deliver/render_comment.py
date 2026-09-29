@@ -16,7 +16,7 @@ import html
 import re
 from collections.abc import Iterable
 
-from ..extract import is_benign_line
+from ..extract import is_benign_line, is_exit_code_line
 from ..models import AnalysisRecord, Summary
 from ..prompt import failed_step_anchor_text
 from ..redact import redact_text
@@ -167,7 +167,10 @@ def _headline(
 
 
 def evidence_lines(summary: Summary, record: AnalysisRecord | None) -> list[str]:
-    """primary_failure_line, then non-benign excerpt lines, then anchored citations."""
+    """primary_failure_line, then non-benign excerpt lines, then anchored citations.
+
+    Benign and exit-code lines are never evidence: neither explains a failure.
+    """
     job = summary.failed_jobs[0] if summary.failed_jobs else None
     ordered: list[str] = []
     if job is not None and job.primary_failure_line:
@@ -182,7 +185,7 @@ def evidence_lines(summary: Summary, record: AnalysisRecord | None) -> list[str]
     out: list[str] = []
     for raw in ordered:
         line = (raw or "").rstrip()
-        if not line.strip() or is_benign_line(line) or line in out:
+        if not line.strip() or is_benign_line(line) or is_exit_code_line(line) or line in out:
             continue
         out.append(line)
         if len(out) >= MAX_EVIDENCE_LINES:

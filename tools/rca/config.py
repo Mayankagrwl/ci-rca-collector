@@ -234,6 +234,18 @@ TERMINAL_CAUSE_CATEGORIES: frozenset[str] = frozenset(
     rule["category"] for rule in TERMINAL_CAUSE_RULES if rule["category"] is not None
 )
 
+# HEADLINE_PREFIX_STRIP_PATTERNS: log-level / annotation prefixes removed (repeatedly,
+# case-sensitive, anchored at the start) before a log line is appended to a
+# generic deterministic headline ("Compilation failed — <cause line>").
+HEADLINE_PREFIX_STRIP_PATTERNS: list[str] = [
+    r"^##\[error\]\s*",  # GitHub Actions error annotation
+    r"^\[ERROR\]\s*",  # Maven / Gradle log level
+    r"^ERROR:\s*",
+    r"^Error:\s*",
+    r"^E\s{2,}",  # pytest assertion-detail prefix "E   "
+]
+HEADLINE_CAUSE_MAX_CHARS = 300
+
 # BENIGN_LINE_PATTERNS: normal/informational output that must NEVER be treated
 # as a cause (terminal cause, primary_failure_line, first-error anchor, or
 # citation) — even when it also matches a cause pattern. Benign takes precedence.
@@ -430,6 +442,8 @@ __all__ = [
     "CODE_HUNK_MAX_LINES",
     "CODE_HUNK_RADIUS",
     "BENIGN_LINE_PATTERNS",
+    "HEADLINE_CAUSE_MAX_CHARS",
+    "HEADLINE_PREFIX_STRIP_PATTERNS",
     "EVIDENCE_PROFILES",
     "EVIDENCE_PROFILE_DEFAULT",
     "JUNIT_EVIDENCE_CAP",
