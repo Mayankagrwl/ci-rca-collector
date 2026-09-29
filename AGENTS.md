@@ -29,6 +29,14 @@
 8. Nothing is hardcoded to a project, message, or vendor — rules are table- or structure-driven (`config.py`).
 9. Dependencies: `pydantic>=2`, `httpx`, `drain3`, `python-dateutil`, `pyyaml`. No PyGithub.
 
+## Phase 3 packaging (action.yml / rca.yml)
+
+- **Collect stays read-only** (AC #28): the collect job and `mode: collect | train` run with `actions: read`, `contents: read` only.
+- **Write scopes exist only** on the separate `deliver` job in `.github/workflows/rca.yml` and in the consumer feedback / migrate workflows (`docs/examples/`).
+- **`deliver: false` (the default) is a dry run**: zero GitHub writes; `rca/delivery-preview.md` shows exactly what would be posted.
+- **Secrets arrive via env only**: `smtp-url` / `chat-webhook-url` → `RCA_SMTP_URL` / `RCA_CHAT_WEBHOOK_URL`, masked; never CLI arguments.
+- **Every value reaches `run:` through `env:`** — never `${{ }}` inside a `run:` body (injection guard, AC #18).
+
 ## GitHub.com vs GitHub Enterprise
 
 Resolve API base in this order:

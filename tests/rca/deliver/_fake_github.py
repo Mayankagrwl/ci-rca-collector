@@ -82,6 +82,8 @@ class FakeGitHub:
     files: dict[tuple[str, str | None], str] = field(default_factory=dict)
     # Paths the contents API reports as over 1 MB (content "", encoding "none").
     large_files: set[str] = field(default_factory=set)
+    # Repo roles for GET .../collaborators/{login}/permission; missing login → 404.
+    permissions: dict[str, str] = field(default_factory=dict)
     # When set, POST .../assignees silently drops logins outside it (like GitHub).
     assignable: set[str] | None = None
     requests: list[Recorded] = field(default_factory=list)
@@ -205,6 +207,12 @@ class FakeGitHub:
                     self.issues[int(m[1])]["updated_at"] = comment["created_at"]
                 items.append(comment)
                 return httpx.Response(201, json=comment)
+        if method == "GET" and (m := re.fullmatch(r"/collaborators/([^/]+)/permission", rest)):
+            role = self.permissions.get(m[1])
+            if role is None:
+                return _not_found()
+            legacy = {"maintain": "write", "triage": "read"}.get(role, role)
+            return httpx.Response(200, json={"permission": legacy, "role_name": role})
         if method == "GET" and (m := re.fullmatch(r"/contents/(.+)", rest)):
             ref = parse_qs(request.url.query.decode()).get("ref", [None])[0]
             if m[1] in self.large_files:

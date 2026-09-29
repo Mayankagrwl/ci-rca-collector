@@ -1,0 +1,42 @@
+# Example consumer workflow: RCA for failures of your CI workflow.
+# Documentation only — not active in this repository.
+#
+# Fork safety: `workflow_run` runs in the BASE repository with the base repo's
+# workflow definition — never in the fork's context — so a fork PR cannot change
+# what runs here or read these secrets. Nothing from the PR head is ever checked
+# out: collect reads the failed run through the API, and deliver consumes only
+# the rca/ artifact (data). Model and log text are escaped before posting.
+#
+# Rollout (delivery spec v1.3 §18): start with `deliver: false` — a dry run with
+# zero GitHub writes; read rca/delivery-preview.md in the job summary for a week,
+# then switch to `deliver: true`.
+name: rca
+
+on:
+  workflow_run:
+    workflows: [CI]            # <- the name of your CI workflow
+    types: [completed]
+
+# A reusable workflow can only narrow this token: delivery needs these scopes
+# (collect itself runs read-only inside the reusable workflow).
+permissions:
+  actions: read
+  contents: write        # commit comments
+  pull-requests: write
+  issues: write
+
+jobs:
+  rca:
+    if: github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'success'
+    uses: acme/ci-rca-collector/.github/workflows/rca.yml@v1   # replace acme with your org
+    with:
+      run-id: ${{ github.event.workflow_run.id }}
+      workflow-name: ${{ github.event.workflow_run.name }}
+      conclusion: ${{ github.event.workflow_run.conclusion }}
+      head-branch: ${{ github.event.workflow_run.head_branch }}
+      deliver: false                     # rollout stage 1: dry run
+      # platform-team: '@your-org/platform'
+      # default-notify: 'ci-oncall@example.com'
+    secrets:
+      smtp-url: ${{ secrets.RCA_SMTP_URL }}                  # optional
+      chat-webhook-url: ${{ secrets.RCA_CHAT_WEBHOOK_URL }}  # optional

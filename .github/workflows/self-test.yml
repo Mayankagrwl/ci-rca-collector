@@ -50,3 +50,35 @@ jobs:
             test -f "rca-out/$name/summary.json"
             test -f "rca-out/$name/summary.md"
           done
+
+  # Packaging self-test for Phase 3: the deliver entry point renders offline, with
+  # no write permissions and no network (dry run + --offline).
+  delivery-dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Offline delivery dry run
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          RCA_GOLDEN: tools/eval/goldens/artifactory-version-exists
+        run: |
+          set -euo pipefail
+          python -m tools.rca.cli deliver \
+            --summary "$RCA_GOLDEN/summary.json" \
+            --out rca-selftest \
+            --dry-run --offline
+          test -f rca-selftest/delivery-preview.md
+          grep -q '^severity=' "$GITHUB_OUTPUT"
+          cat rca-selftest/delivery-preview.md >> "$GITHUB_STEP_SUMMARY"

@@ -23,6 +23,10 @@ RESOLVE_COMMAND = "/resolved"
 TEXT_CAP = 300
 ASSOCIATIONS_ENV = "RCA_RESOLVE_ASSOCIATIONS"
 DEFAULT_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+# Fallback for private org members (reported as CONTRIBUTOR / NONE in event payloads):
+# their repo role, from the collaborator-permission API. Never allowed on error.
+PERMISSIONS_ENV = "RCA_RESOLVE_PERMISSIONS"
+DEFAULT_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 _COMMAND_RE = re.compile(r"^/resolved(?:[ \t]+(?P<rest>.*))?$")
 _TARGET_RE = re.compile(r"^#(?P<number>\d+)(?:[ \t]+(?P<rest>.*))?$")
 _FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
@@ -89,6 +93,13 @@ def allowed_associations(env: Mapping[str, str]) -> frozenset[str]:
     return frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
 
 
+def allowed_permissions(env: Mapping[str, str]) -> frozenset[str]:
+    raw = (env.get(PERMISSIONS_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_PERMISSIONS
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
 def is_bot(user: Mapping[str, Any] | None) -> bool:
     user = user or {}
     login = str(user.get("login") or "")
@@ -101,6 +112,7 @@ __all__ = [
     "RESOLVE_COMMAND",
     "ResolvedCommand",
     "allowed_associations",
+    "allowed_permissions",
     "is_bot",
     "parse_resolved",
     "why_not_resolved",

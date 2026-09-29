@@ -1,0 +1,175 @@
+{
+  "_note": "action.yml collect/train steps + outputs as of Step 18b (commit before Step 19). Step 19 may only add `if:` guards to these steps; everything else must stay identical.",
+  "steps": [
+    {
+      "name": "Set up Python",
+      "if": "inputs.setup-python == 'true'",
+      "uses": "actions/setup-python@v5",
+      "with": {
+        "python-version": "${{ inputs.python-version }}"
+      }
+    },
+    {
+      "name": "Install collector dependencies",
+      "shell": "bash",
+      "run": "python --version\npip --version\npip install --disable-pip-version-check -r \"$GITHUB_ACTION_PATH/requirements.txt\"\n"
+    },
+    {
+      "name": "Compute cache keys",
+      "id": "cache-keys",
+      "shell": "bash",
+      "env": {
+        "PYTHONPATH": "${{ github.action_path }}",
+        "RCA_WORKFLOW_NAME": "${{ inputs.workflow-name != '' && inputs.workflow-name || github.event.workflow_run.name || github.workflow }}",
+        "RCA_JOB_NAME": "${{ github.job }}",
+        "RCA_REPO": "${{ inputs.repository }}"
+      },
+      "run": "python -m tools.rca.cli cache-keys \\\n  --workflow-name \"$RCA_WORKFLOW_NAME\" \\\n  --job-name \"$RCA_JOB_NAME\" \\\n  --repository \"$RCA_REPO\"\n"
+    },
+    {
+      "name": "Cache Drain3 baseline",
+      "continue-on-error": true,
+      "uses": "actions/cache@v4",
+      "with": {
+        "path": "${{ inputs.drain-cache-dir }}",
+        "key": "${{ steps.cache-keys.outputs.drain-cache-key }}",
+        "restore-keys": "${{ steps.cache-keys.outputs.drain-cache-restore-key }}\n"
+      }
+    },
+    {
+      "name": "Cache fingerprint history",
+      "continue-on-error": true,
+      "uses": "actions/cache@v4",
+      "with": {
+        "path": "${{ inputs.history-dir }}",
+        "key": "${{ steps.cache-keys.outputs.history-cache-key }}",
+        "restore-keys": "${{ steps.cache-keys.outputs.history-cache-restore-key }}\nrca-history-\n"
+      }
+    },
+    {
+      "name": "Run collector",
+      "id": "collect",
+      "shell": "bash",
+      "env": {
+        "GITHUB_TOKEN": "${{ inputs.github-token }}",
+        "COMMON_ACTIONS_PAT": "${{ env.COMMON_ACTIONS_PAT }}",
+        "GITHUB_API_URL": "${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}",
+        "GITHUB_SERVER_URL": "${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}",
+        "RCA_GITHUB_API_URL": "${{ inputs.github-api-url }}",
+        "RCA_GITHUB_HOST": "${{ inputs.github-server-url }}",
+        "PYTHONPATH": "${{ github.action_path }}",
+        "RCA_DRAIN_CONFIG": "${{ github.action_path }}/drain3.ini",
+        "RCA_REDIS_URL": "${{ inputs.history-redis-url }}",
+        "RCA_MODE": "${{ inputs.mode }}",
+        "RCA_RUN_ID": "${{ inputs.run-id }}",
+        "RCA_REPO": "${{ inputs.repository }}",
+        "RCA_OUT": "${{ inputs.output-dir }}",
+        "RCA_TOKEN_BUDGET": "${{ inputs.token-budget }}",
+        "RCA_DRAIN_DIR": "${{ inputs.drain-cache-dir }}",
+        "RCA_HISTORY_DIR": "${{ inputs.history-dir }}",
+        "RCA_HISTORY_BACKEND": "${{ inputs.history-backend }}",
+        "RCA_STRICT": "${{ inputs.fail-on-error }}",
+        "RCA_SSL_VERIFY": "${{ inputs.ssl-verify }}",
+        "RCA_SSL_CERT_FILE": "${{ inputs.ssl-cert-file }}",
+        "RCA_ANALYZE_PIPELINE_LOGS": "${{ inputs.analyze-pipeline-logs }}",
+        "RCA_MAX_PIPELINE_LOG_ARTIFACTS": "${{ inputs.max-pipeline-log-artifacts }}",
+        "RCA_DRAIN_CACHE_KEY": "${{ steps.cache-keys.outputs.drain-cache-key }}",
+        "RCA_HISTORY_CACHE_KEY": "${{ steps.cache-keys.outputs.history-cache-key }}",
+        "RCA_WORKFLOW_NAME": "${{ inputs.workflow-name != '' && inputs.workflow-name || github.event.workflow_run.name || github.workflow }}",
+        "SSL_CERT_FILE": "${{ env.SSL_CERT_FILE }}",
+        "REQUESTS_CA_BUNDLE": "${{ env.REQUESTS_CA_BUNDLE }}"
+      },
+      "run": "extra=()\nif [ \"$RCA_STRICT\" = \"true\" ]; then\n  extra+=(--strict)\nfi\nif [ \"$RCA_ANALYZE_PIPELINE_LOGS\" = \"false\" ]; then\n  extra+=(--no-analyze-pipeline-logs)\nfi\nif [ -n \"$RCA_MAX_PIPELINE_LOG_ARTIFACTS\" ]; then\n  extra+=(--max-pipeline-log-artifacts \"$RCA_MAX_PIPELINE_LOG_ARTIFACTS\")\nfi\npython -m tools.rca.cli \"$RCA_MODE\" \\\n  --run-id \"$RCA_RUN_ID\" \\\n  --repo \"$RCA_REPO\" \\\n  --out \"$RCA_OUT\" \\\n  --token-budget \"$RCA_TOKEN_BUDGET\" \\\n  --drain-dir \"$RCA_DRAIN_DIR\" \\\n  --history-dir \"$RCA_HISTORY_DIR\" \\\n  --history-backend \"$RCA_HISTORY_BACKEND\" \\\n  \"${extra[@]}\"\n"
+    },
+    {
+      "name": "Report analysis",
+      "id": "analyze",
+      "if": "inputs.mode == 'collect'",
+      "shell": "bash",
+      "env": {
+        "PYTHONPATH": "${{ github.action_path }}",
+        "RCA_OUT": "${{ inputs.output-dir }}",
+        "RCA_STRICT": "${{ inputs.fail-on-error }}",
+        "RCA_SSL_VERIFY": "${{ inputs.ssl-verify }}",
+        "RCA_SSL_CERT_FILE": "${{ inputs.ssl-cert-file }}",
+        "SSL_CERT_FILE": "${{ env.SSL_CERT_FILE }}",
+        "REQUESTS_CA_BUNDLE": "${{ env.REQUESTS_CA_BUNDLE }}",
+        "RCA_MODE": "${{ inputs.mode }}",
+        "RCA_ANALYZE_ENABLED": "${{ inputs.analyze }}",
+        "RCA_ANALYZE_POLICY": "${{ inputs.analyze-policy }}",
+        "RCA_HISTORY_DIR": "${{ inputs.history-dir }}",
+        "RCA_WRITE_TELEMETRY": "${{ inputs.write-telemetry }}",
+        "RCA_REQUIRES_ANALYSIS": "${{ steps.collect.outputs.requires-analysis }}",
+        "RCA_STGPT_KEY_PRESENT": "${{ (inputs.stgpt-api-key != '' || env.STGPT_API != '') && 'true' || 'false' }}",
+        "STGPT_API": "${{ inputs.stgpt-api-key != '' && inputs.stgpt-api-key || env.STGPT_API }}",
+        "STGPT_API_URL": "${{ inputs.stgpt-api-url != '' && inputs.stgpt-api-url || env.STGPT_API_URL }}",
+        "STGPT_CLIENT_APP_NAME": "${{ inputs.stgpt-client-app-name != '' && inputs.stgpt-client-app-name || env.STGPT_CLIENT_APP_NAME }}",
+        "STGPT_PERSONA": "${{ env.STGPT_PERSONA }}"
+      },
+      "run": "extra=()\nif [ \"$RCA_STRICT\" = \"true\" ]; then\n  extra+=(--strict)\nfi\npython -m tools.rca.cli analyze \\\n  --summary \"$RCA_OUT/summary.json\" \\\n  --out \"$RCA_OUT\" \\\n  --mode \"$RCA_MODE\" \\\n  --analyze-enabled \"$RCA_ANALYZE_ENABLED\" \\\n  --analyze-policy \"$RCA_ANALYZE_POLICY\" \\\n  --history-dir \"$RCA_HISTORY_DIR\" \\\n  --write-telemetry \"$RCA_WRITE_TELEMETRY\" \\\n  --requires-analysis \"$RCA_REQUIRES_ANALYSIS\" \\\n  --stgpt-key-present \"$RCA_STGPT_KEY_PRESENT\" \\\n  \"${extra[@]}\"\n"
+    },
+    {
+      "name": "Write job summary",
+      "if": "inputs.write-job-summary == 'true' && inputs.mode == 'collect'",
+      "shell": "bash",
+      "env": {
+        "RCA_OUT": "${{ inputs.output-dir }}"
+      },
+      "run": "if [ -f \"$RCA_OUT/summary.md\" ]; then\n  cat \"$RCA_OUT/summary.md\" >> \"$GITHUB_STEP_SUMMARY\"\nfi\n"
+    }
+  ],
+  "outputs": {
+    "summary-path": "${{ steps.collect.outputs.summary-path }}",
+    "json-path": "${{ steps.collect.outputs.json-path }}",
+    "category": "${{ steps.collect.outputs.category }}",
+    "confidence": "${{ steps.collect.outputs.confidence }}",
+    "is-infra-vs-code": "${{ steps.collect.outputs.is-infra-vs-code }}",
+    "is-flaky": "${{ steps.collect.outputs.is-flaky }}",
+    "short-circuit": "${{ steps.collect.outputs.short-circuit }}",
+    "requires-analysis": "${{ steps.analyze.outputs.requires-analysis || steps.collect.outputs.requires-analysis }}",
+    "fingerprint": "${{ steps.collect.outputs.fingerprint }}",
+    "seen-count": "${{ steps.collect.outputs.seen-count }}",
+    "recurrence": "${{ steps.collect.outputs.recurrence }}",
+    "failed-job-count": "${{ steps.collect.outputs.failed-job-count }}",
+    "suspected-stage": "${{ steps.analyze.outcome == 'skipped' && steps.collect.outputs.suspected-stage || steps.analyze.outputs.suspected-stage }}",
+    "suspected-files": "${{ steps.analyze.outcome == 'skipped' && steps.collect.outputs.suspected-files || steps.analyze.outputs.suspected-files }}",
+    "deterministic-rule": "${{ steps.analyze.outcome == 'skipped' && steps.collect.outputs.deterministic-rule || steps.analyze.outputs.deterministic-rule }}",
+    "diagnosis-source": "${{ steps.analyze.outcome == 'skipped' && steps.collect.outputs.diagnosis-source || steps.analyze.outputs.diagnosis-source }}",
+    "root-cause": "${{ steps.analyze.outputs.root-cause }}",
+    "suggested-fix": "${{ steps.analyze.outputs.suggested-fix }}",
+    "rca-confidence": "${{ steps.analyze.outputs.rca-confidence }}",
+    "analysis-status": "${{ steps.analyze.outputs.analysis-status }}",
+    "analysis-notes": "${{ steps.analyze.outputs.analysis-notes }}",
+    "drain-cache-key": "${{ steps.cache-keys.outputs.drain-cache-key }}",
+    "history-cache-key": "${{ steps.cache-keys.outputs.history-cache-key }}"
+  },
+  "inputs": {
+    "run-id": null,
+    "repository": "${{ github.repository }}",
+    "mode": "collect",
+    "github-token": "${{ github.token }}",
+    "github-api-url": "",
+    "github-server-url": "",
+    "output-dir": "rca",
+    "token-budget": "6000",
+    "drain-cache-dir": ".drain",
+    "history-dir": ".rca-history",
+    "history-backend": "cache",
+    "history-redis-url": "",
+    "python-version": "3.12",
+    "setup-python": "true",
+    "write-job-summary": "true",
+    "fail-on-error": "false",
+    "ssl-verify": "true",
+    "ssl-cert-file": "",
+    "analyze": "true",
+    "analyze-policy": "auto",
+    "write-telemetry": "true",
+    "analyze-pipeline-logs": "true",
+    "max-pipeline-log-artifacts": "3",
+    "stgpt-api-key": "",
+    "stgpt-api-url": "",
+    "stgpt-client-app-name": "",
+    "workflow-name": ""
+  }
+}

@@ -234,7 +234,9 @@ def test_untrusted_authors_make_no_writes(tmp_path, fake, association, login, us
     event = _event(tmp_path, body=comment["body"], issue=dict(issue), comment_id=comment["id"],
                    association=association, login=login, user_type=user_type)
     assert _feedback(tmp_path, event, "--live") == 0
-    assert fake.writes() == [] and fake.requests == []
+    # Step 19 F1: an untrusted association triggers one read-only permission lookup.
+    assert fake.writes() == []
+    assert all(r.method == "GET" and r.path.endswith(f"/collaborators/{login}/permission") for r in fake.requests)
     assert reason in _report(tmp_path)
 
 
@@ -331,7 +333,11 @@ def test_stub_never_passes_comment_text_to_argv_or_env() -> None:
     for step in stub["jobs"]["resolved"]["steps"]:
         for field in ("run", "env", "with"):
             assert "github.event.comment" not in json.dumps(step.get(field, "")), step
-    assert "--event \"$GITHUB_EVENT_PATH\"" in raw
+    # Step 19: the stub calls the action (mode: feedback); the action's Feedback step
+    # reads the comment from the event file.
+    assert "mode: feedback" in raw
+    action = (_ROOT / "action.yml").read_text(encoding="utf-8")
+    assert 'args=(feedback --event "$GITHUB_EVENT_PATH"' in action
     assert (_ROOT / "docs" / "rca-feedback.md").exists()
 
 

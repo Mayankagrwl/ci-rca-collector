@@ -604,6 +604,16 @@ class GitHubClient:
             return None
         return self._json_object(response, f"fetch issue #{number}")
 
+    def get_collaborator_permission(self, repo: str, username: str) -> str | None:
+        """A user's role on the repo (read-only). ``role_name`` or ``permission``; 404 → None."""
+        url = f"repos/{repo}/collaborators/{quote(username, safe='')}/permission"
+        response = self._request("GET", url)
+        if response.status_code == 404:
+            return None
+        payload = self._json_object(response, f"collaborator permission for {username}")
+        value = payload.get("role_name") or payload.get("permission")
+        return str(value) if value else None
+
     def add_assignees(self, repo: str, number: int, assignees: list[str]) -> dict[str, Any]:
         """Add assignees to an issue (additive; never removes existing ones)."""
         response = self._request(

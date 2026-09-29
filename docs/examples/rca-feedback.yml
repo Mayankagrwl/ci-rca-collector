@@ -4,8 +4,10 @@
 # Security:
 # - The comment text is read by the tool from $GITHUB_EVENT_PATH (the event JSON
 #   file). It is never interpolated into `run:` or `env:`.
-# - Only the pinned RCA tool is checked out — never the pull request's code.
-# - The tool enforces author_association (OWNER/MEMBER/COLLABORATOR by default).
+# - Nothing is checked out: the action is fetched by `uses:` and no pull request
+#   code ever runs with the `issues: write` token.
+# - The tool enforces author_association (OWNER/MEMBER/COLLABORATOR by default),
+#   falling back to the author's repository permission for private org members.
 name: rca-feedback
 
 on:
@@ -24,22 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # Check out the RCA tool itself, pinned to a reviewed commit — never the PR head.
-      - uses: actions/checkout@v4
-        with:
-          repository: <owner>/<ci-rca-collector>   # the tool repository
-          ref: <pinned-commit-sha>                   # pin to a reviewed commit
-          path: rca-tool
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r rca-tool/requirements.txt
       - name: Apply /resolved
-        working-directory: rca-tool
-        run: python -m tools.rca.cli feedback --event "$GITHUB_EVENT_PATH" --live --out rca
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - name: Feedback report
-        if: always()
-        working-directory: rca-tool
-        run: cat rca/feedback-report.md >> "$GITHUB_STEP_SUMMARY"
+        uses: acme/ci-rca-collector@v1   # replace acme with your org
+        with:
+          mode: feedback
+          deliver: 'true'                # false = read-only dry run

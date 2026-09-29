@@ -1,0 +1,67 @@
+# Example consumer workflow: one-shot migration of the cache history into issues.
+# Documentation only — not active in this repository.
+#
+# Each workflow has its own history cache (key rca-history-<repo>-<workflow>), so
+# run this once per workflow. --migrate-limit caps creates per run; a re-run
+# continues where it left off and never duplicates (idempotent by fingerprint).
+# Leave `live` false first to see what would be created.
+name: rca-migrate-history
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflow-name:
+        description: 'Workflow whose RCA history to migrate (as passed to rca.yml)'
+        required: true
+        type: string
+      live:
+        description: 'Create the issues (false = list what would be created)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  issues: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Same key scheme as .github/workflows/rca.yml (snippet reused verbatim).
+      - name: Sanitize cache keys
+        id: keys
+        shell: bash
+        env:
+          WF: ${{ inputs.workflow-name }}
+          REPO: ${{ github.repository }}
+        run: |
+          sanitize() {
+            local s="${1:-unknown}"
+            s="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"
+            s="$(printf '%s' "$s" | tr -s '[:space:]' '-')"
+            s="$(printf '%s' "$s" | sed -E 's/[^a-z0-9._-]+/-/g; s/-{2,}/-/g; s/^-+//; s/-+$//; s/^$/unknown/')"
+            printf '%s' "${s:0:80}"
+          }
+          wf="$(sanitize "$WF")"
+          repo="$(sanitize "$REPO")"
+          {
+            echo "history-cache-key=rca-history-${repo}-${wf}"
+            echo "history-cache-restore-key=rca-history-${repo}-"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore fingerprint history
+        uses: actions/cache@v4
+        with:
+          path: .rca-history/
+          key: ${{ steps.keys.outputs.history-cache-key }}
+          restore-keys: |
+            ${{ steps.keys.outputs.history-cache-restore-key }}
+
+      - name: Migrate
+        uses: acme/ci-rca-collector@v1   # replace acme with your org
+        with:
+          mode: migrate-history
+          history-dir: .rca-history
+          migrate-limit: '50'
+          deliver: ${{ inputs.live && 'true' || 'false' }}

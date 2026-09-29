@@ -1,5 +1,11 @@
 name: RCA Collect (reusable)
 
+# Permissions: a reusable workflow can only NARROW the caller's token. The caller
+# job must grant `contents: write`, `pull-requests: write` and `issues: write` for
+# the deliver job to write; otherwise delivery records "403 … needs <scope>" and
+# still exits 0. Collect stays read-only (actions: read, contents: read) either way.
+# With `deliver: false` (the default) the deliver job is a dry run: zero writes.
+
 on:
   workflow_call:
     inputs:
@@ -7,18 +13,51 @@ on:
       workflow-name: { required: true,  type: string }
       conclusion:    { required: true,  type: string }
       head-branch:   { required: false, type: string, default: '' }
-      default-branch:{ required: false, type: string, default: 'main' }
+      default-branch: { required: false, type: string, default: '' }
       runs-on:       { required: false, type: string, default: 'ubuntu-latest' }
+      # ---- Phase 3 delivery (v1.3 §13) ----
+      deliver:                { required: false, type: boolean, default: false }
+      comment-on-pr:          { required: false, type: string, default: 'true' }
+      comment-on-commit:      { required: false, type: string, default: 'true' }
+      comment-on-branch-push: { required: false, type: string, default: 'false' }
+      create-issues:          { required: false, type: string, default: 'true' }
+      issue-threshold:        { required: false, type: string, default: '3' }
+      allow-fork-issues:      { required: false, type: string, default: 'false' }
+      confidence-threshold:   { required: false, type: string, default: 'medium' }
+      quiet-window-minutes:   { required: false, type: string, default: '60' }
+      platform-team:          { required: false, type: string, default: '' }
+      default-notify:         { required: false, type: string, default: '' }
+      chat-payload-field:     { required: false, type: string, default: '' }
+    secrets:
+      smtp-url:         { required: false }
+      chat-webhook-url: { required: false }
     outputs:
-      category:      { value: ${{ jobs.collect.outputs.category }} }
-      fingerprint:   { value: ${{ jobs.collect.outputs.fingerprint }} }
-      is-flaky:      { value: ${{ jobs.collect.outputs.is-flaky }} }
-      requires-analysis: { value: ${{ jobs.collect.outputs.requires-analysis }} }
-      suspected-stage: { value: ${{ jobs.collect.outputs.suspected-stage }} }
-      suspected-files: { value: ${{ jobs.collect.outputs.suspected-files }} }
-      deterministic-rule: { value: ${{ jobs.collect.outputs.deterministic-rule }} }
-      diagnosis-source: { value: ${{ jobs.collect.outputs.diagnosis-source }} }
-
+      category:
+        value: ${{ jobs.collect.outputs.category }}
+      fingerprint:
+        value: ${{ jobs.collect.outputs.fingerprint }}
+      is-flaky:
+        value: ${{ jobs.collect.outputs.is-flaky }}
+      requires-analysis:
+        value: ${{ jobs.collect.outputs.requires-analysis }}
+      suspected-stage:
+        value: ${{ jobs.collect.outputs.suspected-stage }}
+      suspected-files:
+        value: ${{ jobs.collect.outputs.suspected-files }}
+      deterministic-rule:
+        value: ${{ jobs.collect.outputs.deterministic-rule }}
+      diagnosis-source:
+        value: ${{ jobs.collect.outputs.diagnosis-source }}
+      severity:
+        value: ${{ jobs.deliver.outputs.severity }}
+      suppressed-by:
+        value: ${{ jobs.deliver.outputs.suppressed-by }}
+      delivered-to:
+        value: ${{ jobs.deliver.outputs.delivered-to }}
+      comment-url:
+        value: ${{ jobs.deliver.outputs.comment-url }}
+      issue-url:
+        value: ${{ jobs.deliver.outputs.issue-url }}
 permissions:
   actions: read
   contents: read
@@ -27,6 +66,9 @@ jobs:
   collect:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
     outputs:
       category: ${{ steps.rca.outputs.category }}
       fingerprint: ${{ steps.rca.outputs.fingerprint }}
@@ -112,3 +154,53 @@ jobs:
           name: rca-${{ inputs.run-id }}
           path: rca/
           retention-days: 30
+
+  # Delivery: a separate job with write scopes. It consumes only the rca/ artifact
+  # (data). Nothing from the failing run is checked out and no workspace code runs;
+  # model and log text in it are escaped by the renderer (v1.3 §11).
+  deliver:
+    needs: collect
+    if: inputs.conclusion == 'failure' && needs.collect.result == 'success'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write        # commit comments
+      pull-requests: write
+      issues: write
+    outputs:
+      severity: ${{ steps.deliver.outputs.severity }}
+      suppressed-by: ${{ steps.deliver.outputs.suppressed-by }}
+      delivered-to: ${{ steps.deliver.outputs.delivered-to }}
+      comment-url: ${{ steps.deliver.outputs.comment-url }}
+      issue-url: ${{ steps.deliver.outputs.issue-url }}
+    steps:
+      - name: Download rca artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rca-${{ inputs.run-id }}
+          path: rca/
+
+      - name: Deliver
+        id: deliver
+        # Pin to this action repository (same ref as the workflow_call).
+        uses: acme/ci-rca-collector@v1   # replace acme with your org
+        with:
+          mode: deliver
+          run-id: ${{ inputs.run-id }}
+          output-dir: rca
+          deliver: ${{ inputs.deliver && 'true' || 'false' }}
+          comment-on-pr: ${{ inputs.comment-on-pr }}
+          comment-on-commit: ${{ inputs.comment-on-commit }}
+          comment-on-branch-push: ${{ inputs.comment-on-branch-push }}
+          create-issues: ${{ inputs.create-issues }}
+          issue-threshold: ${{ inputs.issue-threshold }}
+          allow-fork-issues: ${{ inputs.allow-fork-issues }}
+          confidence-threshold: ${{ inputs.confidence-threshold }}
+          quiet-window-minutes: ${{ inputs.quiet-window-minutes }}
+          platform-team: ${{ inputs.platform-team }}
+          default-notify: ${{ inputs.default-notify }}
+          default-branch: ${{ inputs.default-branch }}
+          smtp-url: ${{ secrets.smtp-url }}
+          chat-webhook-url: ${{ secrets.chat-webhook-url }}
+          chat-payload-field: ${{ inputs.chat-payload-field }}

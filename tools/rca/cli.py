@@ -1413,7 +1413,13 @@ _FEEDBACK_REPORT_FILE = "feedback-report.md"
 
 def _cmd_feedback(args: argparse.Namespace) -> int:
     """``/resolved`` handler (v1.3 §12). Reads the comment from the event file only."""
-    from .deliver.feedback import allowed_associations, is_bot, parse_resolved, why_not_resolved
+    from .deliver.feedback import (
+        allowed_associations,
+        allowed_permissions,
+        is_bot,
+        parse_resolved,
+        why_not_resolved,
+    )
     from .deliver.issues import IssuesHistoryStore, marker_fingerprint
     from .deliver.render_comment import safe_text
     from .deliver.sticky import DeliveryBudget, fingerprint_of
@@ -1437,28 +1443,50 @@ def _cmd_feedback(args: argparse.Namespace) -> int:
             issue=f"#{issue.get('number')}" + (" (pull request)" if "pull_request" in issue else ""),
         )
         command = parse_resolved(comment.get("body"))
+        repo = (
+            args.repo
+            or str((event.get("repository") or {}).get("full_name") or "")
+            or (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+        )
+        trusted = False
         if event.get("action") != "created":
             notes.append(f"skipped: action is {event.get('action')!r}, not 'created'")
         elif is_bot(user):
             notes.append("skipped: comment author is a bot")
         elif command is None:
             notes.append(f"skipped: {why_not_resolved(comment.get('body'))}")
-        elif association not in allowed_associations(os.environ):
-            notes.append(f"skipped: author association {association} may not resolve failures")
+        elif association in allowed_associations(os.environ):
+            trusted = True
+        elif args.offline or not repo:
+            notes.append(
+                f"skipped: author association {association} may not resolve failures "
+                "(repository permission not checked)"
+            )
         else:
+            # Private org members show up as CONTRIBUTOR / NONE: fall back to their repo role.
+            client = _delivery_client(args)
+            try:
+                role = client.get_collaborator_permission(repo, login)
+            except Exception as exc:  # noqa: BLE001 — never allow on error
+                role = None
+                notes.append(f"repository permission lookup failed ({type(exc).__name__})")
+            facts["permission"] = role or "none"
+            if role and role.lower() in allowed_permissions(os.environ):
+                trusted = True
+            else:
+                notes.append(
+                    f"skipped: author association {association} and repository permission "
+                    f"{role or 'none'} may not resolve failures"
+                )
+        if trusted:
             facts["text"] = command.text
             facts["target"] = f"#{command.target_issue}" if command.target_issue else "(from context)"
-            repo = (
-                args.repo
-                or str((event.get("repository") or {}).get("full_name") or "")
-                or (os.environ.get("GITHUB_REPOSITORY") or "").strip()
-            )
             if args.offline:
                 notes.append("offline: target not looked up; nothing applied")
             elif not repo:
                 errors.append("no repository (--repo / event / GITHUB_REPOSITORY)")
             else:
-                client = _delivery_client(args)
+                client = client or _delivery_client(args)
                 store = IssuesHistoryStore(
                     client,
                     repo,
@@ -1530,7 +1558,7 @@ def _write_feedback_report(
     from .redact import redact_text
 
     lines = [f"# RCA feedback ({facts.get('mode', 'dry run')})", ""]
-    for key in ("issue", "author", "association", "target", "text"):
+    for key in ("issue", "author", "association", "permission", "target", "text"):
         if key in facts:
             lines.append(f"- {key}: {facts[key]}")
     lines += ["", "## Actions", ""] + ([f"- {a}" for a in actions] or ["- none"])

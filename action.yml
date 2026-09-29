@@ -8,14 +8,21 @@ branding:
 
 inputs:
   run-id:
-    description: 'Workflow run ID to analyse. Usually github.event.workflow_run.id.'
-    required: true
+    description: 'Workflow run ID to analyse (collect / train / deliver). Usually github.event.workflow_run.id.'
+    required: false
+    default: ''
   repository:
     description: 'owner/repo to analyse.'
     required: false
     default: ${{ github.repository }}
   mode:
-    description: 'collect | train. "train" builds the Drain3 baseline from a successful run.'
+    description: >-
+      collect | train | deliver | feedback | migrate-history. "train" builds the
+      Drain3 baseline from a successful run. "deliver" posts (or, with deliver
+      false, previews) the PR / commit comment, issue and notifications from a
+      downloaded rca/ artifact. "feedback" handles /resolved comments.
+      "migrate-history" copies the cache history into issues. collect / train
+      stay read-only.
     required: false
     default: 'collect'
   github-token:
@@ -47,11 +54,13 @@ inputs:
     required: false
     default: '.rca-history'
   history-backend:
-    description: 'Where failure memory is stored: cache | issues | redis | none. See §10.4.'
+    description: >-
+      Where collect keeps failure memory: cache | none. Recurring-failure issues are
+      delivery-owned (mode deliver / migrate-history), never a collect backend.
     required: false
     default: 'cache'
   history-redis-url:
-    description: 'Connection URL when history-backend is redis. Pass via a secret.'
+    description: 'Reserved and currently ignored: no redis history backend is implemented.'
     required: false
     default: ''
   python-version:
@@ -118,6 +127,77 @@ inputs:
     description: 'Failed workflow name for Drain3/history cache keys. Defaults to workflow_run.name or github.workflow.'
     required: false
     default: ''
+  deliver:
+    description: >-
+      Delivery modes only. true posts / edits comments, issues and notifications;
+      false (default) is a dry run with zero GitHub writes — rca/delivery-preview.md
+      shows exactly what would be posted.
+    required: false
+    default: 'false'
+  comment-on-pr:
+    description: 'Sticky RCA comment on the pull request.'
+    required: false
+    default: 'true'
+  comment-on-commit:
+    description: 'Commit comment for default-branch / tag failures.'
+    required: false
+    default: 'true'
+  comment-on-branch-push:
+    description: 'Commit comment for pushes to other branches (needs comment-on-commit).'
+    required: false
+    default: 'false'
+  create-issues:
+    description: 'Open / maintain one issue per failure fingerprint.'
+    required: false
+    default: 'true'
+  issue-threshold:
+    description: 'Times seen before a PR / branch failure gets an issue (default-branch, tag and schedule failures always do).'
+    required: false
+    default: '3'
+  allow-fork-issues:
+    description: 'Open issues for failures on fork pull requests.'
+    required: false
+    default: 'false'
+  confidence-threshold:
+    description: 'low | medium | high. Below it the comment omits root-cause claims.'
+    required: false
+    default: 'medium'
+  quiet-window-minutes:
+    description: 'Per-fingerprint quiet window for edits and notifications.'
+    required: false
+    default: '60'
+  platform-team:
+    description: 'Owners for infrastructure failures (e.g. @org/platform or an email). Never blamed on the actor.'
+    required: false
+    default: ''
+  default-notify:
+    description: 'Fallback owners / recipients when nothing else resolves.'
+    required: false
+    default: ''
+  smtp-url:
+    description: >-
+      Email channel, e.g. smtp://user:pass@host:587?from=ci@example.com. A credential:
+      pass it from a secret. Reaches the tool only as the RCA_SMTP_URL env var.
+    required: false
+    default: ''
+  chat-webhook-url:
+    description: >-
+      Chat webhook (https only). A credential: pass it from a secret. Reaches the
+      tool only as the RCA_CHAT_WEBHOOK_URL env var.
+    required: false
+    default: ''
+  chat-payload-field:
+    description: 'JSON field for the chat text (default text; e.g. content for some providers).'
+    required: false
+    default: ''
+  default-branch:
+    description: 'Fallback default branch. Empty uses the event repository default branch; the API lookup wins.'
+    required: false
+    default: ''
+  migrate-limit:
+    description: 'migrate-history: max issues created per run (re-runs continue).'
+    required: false
+    default: '50'
 
 outputs:
   summary-path:
@@ -139,7 +219,7 @@ outputs:
     description: 'true when the same SHA passed in another run.'
     value: ${{ steps.collect.outputs.is-flaky }}
   short-circuit:
-    description: 'infra_runner | flake_same_sha_passed | no_failed_jobs | empty string.'
+    description: 'infra_runner | infra_widespread | flake_same_sha_passed | no_failed_jobs | empty string.'
     value: ${{ steps.collect.outputs.short-circuit }}
   requires-analysis:
     description: 'false when a deterministic verdict was reached. Always set by Report analysis in collect mode.'
@@ -189,6 +269,21 @@ outputs:
   history-cache-key:
     description: 'Sanitized actions/cache key for fingerprint history (repo+workflow, not run-id).'
     value: ${{ steps.cache-keys.outputs.history-cache-key }}
+  severity:
+    description: 'deliver: critical | high | normal | low | info.'
+    value: ${{ steps.deliver.outputs.severity }}
+  suppressed-by:
+    description: 'deliver: why nothing was posted (flaky, infra_widespread, infra_runner, draft, delivery_error) or empty.'
+    value: ${{ steps.deliver.outputs.suppressed-by }}
+  delivered-to:
+    description: 'deliver: comma list of what landed (pr_comment, commit_comment, issue:*, chat, email, label:ci:flaky).'
+    value: ${{ steps.deliver.outputs.delivered-to }}
+  comment-url:
+    description: 'deliver: URL of the sticky PR / commit comment, or empty.'
+    value: ${{ steps.deliver.outputs.comment-url }}
+  issue-url:
+    description: 'deliver: URL of the fingerprint issue, or empty.'
+    value: ${{ steps.deliver.outputs.issue-url }}
 
 runs:
   using: 'composite'
@@ -208,6 +303,7 @@ runs:
 
     - name: Compute cache keys
       id: cache-keys
+      if: inputs.mode == 'collect' || inputs.mode == 'train'
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}
@@ -224,6 +320,7 @@ runs:
     # actions/cache/restore and actions/cache/save are often missing on
     # GHES mirrors ("repository not found").
     - name: Cache Drain3 baseline
+      if: inputs.mode == 'collect' || inputs.mode == 'train'
       continue-on-error: true
       uses: actions/cache@v4
       with:
@@ -233,6 +330,7 @@ runs:
           ${{ steps.cache-keys.outputs.drain-cache-restore-key }}
 
     - name: Cache fingerprint history
+      if: inputs.mode == 'collect' || inputs.mode == 'train'
       continue-on-error: true
       uses: actions/cache@v4
       with:
@@ -244,6 +342,7 @@ runs:
 
     - name: Run collector
       id: collect
+      if: inputs.mode == 'collect' || inputs.mode == 'train'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -342,4 +441,129 @@ runs:
       run: |
         if [ -f "$RCA_OUT/summary.md" ]; then
           cat "$RCA_OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    # ---- Phase 3 delivery (write scopes live only in the job that runs these modes) ----
+    # Every value reaches the scripts through env: — never ${{ }} inside run:.
+    - name: Deliver
+      id: deliver
+      if: inputs.mode == 'deliver'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}
+        GITHUB_API_URL: ${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}
+        GITHUB_SERVER_URL: ${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}
+        RCA_GITHUB_API_URL: ${{ inputs.github-api-url }}
+        RCA_GITHUB_HOST: ${{ inputs.github-server-url }}
+        PYTHONPATH: ${{ github.action_path }}
+        RCA_SSL_VERIFY: ${{ inputs.ssl-verify }}
+        RCA_SSL_CERT_FILE: ${{ inputs.ssl-cert-file }}
+        SSL_CERT_FILE: ${{ env.SSL_CERT_FILE }}
+        REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
+        RCA_OUT: ${{ inputs.output-dir }}
+        RCA_REPO: ${{ inputs.repository }}
+        RCA_STRICT: ${{ inputs.fail-on-error }}
+        RCA_DELIVER: ${{ inputs.deliver }}
+        RCA_WRITE_SUMMARY: ${{ inputs.write-job-summary }}
+        RCA_COMMENT_ON_PR: ${{ inputs.comment-on-pr }}
+        RCA_COMMENT_ON_COMMIT: ${{ inputs.comment-on-commit }}
+        RCA_COMMENT_ON_BRANCH_PUSH: ${{ inputs.comment-on-branch-push }}
+        RCA_CREATE_ISSUES: ${{ inputs.create-issues }}
+        RCA_ISSUE_THRESHOLD: ${{ inputs.issue-threshold }}
+        RCA_ALLOW_FORK_ISSUES: ${{ inputs.allow-fork-issues }}
+        RCA_CONFIDENCE_THRESHOLD: ${{ inputs.confidence-threshold }}
+        RCA_QUIET_WINDOW_MINUTES: ${{ inputs.quiet-window-minutes }}
+        RCA_PLATFORM_TEAM: ${{ inputs.platform-team }}
+        RCA_DEFAULT_NOTIFY: ${{ inputs.default-notify }}
+        RCA_SMTP_URL: ${{ inputs.smtp-url }}
+        RCA_CHAT_WEBHOOK_URL: ${{ inputs.chat-webhook-url }}
+        RCA_CHAT_PAYLOAD_FIELD: ${{ inputs.chat-payload-field }}
+        RCA_DEFAULT_BRANCH: ${{ inputs.default-branch != '' && inputs.default-branch || github.event.repository.default_branch }}
+      run: |
+        if [ -n "$RCA_SMTP_URL" ]; then echo "::add-mask::$RCA_SMTP_URL"; fi
+        if [ -n "$RCA_CHAT_WEBHOOK_URL" ]; then echo "::add-mask::$RCA_CHAT_WEBHOOK_URL"; fi
+        args=(deliver --summary "$RCA_OUT/summary.json" --out "$RCA_OUT")
+        if [ -n "$RCA_REPO" ]; then args+=(--repo "$RCA_REPO"); fi
+        if [ -f "$RCA_OUT/analysis.json" ]; then args+=(--analysis "$RCA_OUT/analysis.json"); fi
+        if [ "$RCA_DELIVER" = "true" ]; then args+=(--live); else args+=(--dry-run); fi
+        opt() { if [ -n "$2" ]; then args+=("$1" "$2"); fi; }
+        opt --comment-on-pr "$RCA_COMMENT_ON_PR"
+        opt --comment-on-commit "$RCA_COMMENT_ON_COMMIT"
+        opt --comment-on-branch-push "$RCA_COMMENT_ON_BRANCH_PUSH"
+        opt --create-issues "$RCA_CREATE_ISSUES"
+        opt --issue-threshold "$RCA_ISSUE_THRESHOLD"
+        opt --allow-fork-issues "$RCA_ALLOW_FORK_ISSUES"
+        opt --confidence-threshold "$RCA_CONFIDENCE_THRESHOLD"
+        opt --quiet-window-minutes "$RCA_QUIET_WINDOW_MINUTES"
+        opt --platform-team "$RCA_PLATFORM_TEAM"
+        opt --default-notify "$RCA_DEFAULT_NOTIFY"
+        if [ "$RCA_STRICT" = "true" ]; then args+=(--strict); fi
+        python -m tools.rca.cli "${args[@]}"
+        if [ "$RCA_WRITE_SUMMARY" = "true" ] && [ -f "$RCA_OUT/delivery-preview.md" ]; then
+          { echo "## RCA delivery"; echo; cat "$RCA_OUT/delivery-preview.md"; } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Feedback
+      id: feedback
+      if: inputs.mode == 'feedback'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}
+        GITHUB_API_URL: ${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}
+        GITHUB_SERVER_URL: ${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}
+        RCA_GITHUB_API_URL: ${{ inputs.github-api-url }}
+        RCA_GITHUB_HOST: ${{ inputs.github-server-url }}
+        PYTHONPATH: ${{ github.action_path }}
+        RCA_SSL_VERIFY: ${{ inputs.ssl-verify }}
+        RCA_SSL_CERT_FILE: ${{ inputs.ssl-cert-file }}
+        SSL_CERT_FILE: ${{ env.SSL_CERT_FILE }}
+        REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
+        RCA_OUT: ${{ inputs.output-dir }}
+        RCA_REPO: ${{ inputs.repository }}
+        RCA_STRICT: ${{ inputs.fail-on-error }}
+        RCA_DELIVER: ${{ inputs.deliver }}
+        RCA_WRITE_SUMMARY: ${{ inputs.write-job-summary }}
+      run: |
+        args=(feedback --event "$GITHUB_EVENT_PATH" --out "$RCA_OUT")
+        if [ -n "$RCA_REPO" ]; then args+=(--repo "$RCA_REPO"); fi
+        if [ "$RCA_DELIVER" = "true" ]; then args+=(--live); else args+=(--dry-run); fi
+        if [ "$RCA_STRICT" = "true" ]; then args+=(--strict); fi
+        python -m tools.rca.cli "${args[@]}"
+        if [ "$RCA_WRITE_SUMMARY" = "true" ] && [ -f "$RCA_OUT/feedback-report.md" ]; then
+          { echo "## RCA feedback"; echo; cat "$RCA_OUT/feedback-report.md"; } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Migrate history
+      id: migrate
+      if: inputs.mode == 'migrate-history'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}
+        GITHUB_API_URL: ${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}
+        GITHUB_SERVER_URL: ${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}
+        RCA_GITHUB_API_URL: ${{ inputs.github-api-url }}
+        RCA_GITHUB_HOST: ${{ inputs.github-server-url }}
+        PYTHONPATH: ${{ github.action_path }}
+        RCA_SSL_VERIFY: ${{ inputs.ssl-verify }}
+        RCA_SSL_CERT_FILE: ${{ inputs.ssl-cert-file }}
+        SSL_CERT_FILE: ${{ env.SSL_CERT_FILE }}
+        REQUESTS_CA_BUNDLE: ${{ env.REQUESTS_CA_BUNDLE }}
+        RCA_OUT: ${{ inputs.output-dir }}
+        RCA_REPO: ${{ inputs.repository }}
+        RCA_STRICT: ${{ inputs.fail-on-error }}
+        RCA_DELIVER: ${{ inputs.deliver }}
+        RCA_WRITE_SUMMARY: ${{ inputs.write-job-summary }}
+        RCA_HISTORY_DIR: ${{ inputs.history-dir }}
+        RCA_MIGRATE_LIMIT: ${{ inputs.migrate-limit }}
+      run: |
+        args=(deliver --migrate-history --history-dir "$RCA_HISTORY_DIR" --migrate-limit "$RCA_MIGRATE_LIMIT" --out "$RCA_OUT")
+        if [ -n "$RCA_REPO" ]; then args+=(--repo "$RCA_REPO"); fi
+        if [ "$RCA_DELIVER" = "true" ]; then args+=(--live); else args+=(--dry-run); fi
+        if [ "$RCA_STRICT" = "true" ]; then args+=(--strict); fi
+        python -m tools.rca.cli "${args[@]}"
+        if [ "$RCA_WRITE_SUMMARY" = "true" ] && [ -f "$RCA_OUT/history-migration.md" ]; then
+          { echo "## RCA history migration"; echo; cat "$RCA_OUT/history-migration.md"; } >> "$GITHUB_STEP_SUMMARY"
         fi
