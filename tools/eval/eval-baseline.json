@@ -3,15 +3,14 @@
     "n_goldens": 10,
     "n_runs": 1,
     "category_accuracy": {
-      "mean": 0.9,
+      "mean": 1.0,
       "stdev": 0.0,
-      "min": 0.9,
-      "max": 0.9
+      "min": 1.0,
+      "max": 1.0
     },
     "category_confusion": {
-      "dependency": {
-        "unknown": 1,
-        "dependency": 1
+      "release": {
+        "release": 1
       },
       "test_failure": {
         "test_failure": 3
@@ -25,6 +24,9 @@
       "compile": {
         "compile": 1
       },
+      "dependency": {
+        "dependency": 1
+      },
       "oom": {
         "oom": 1
       },
@@ -33,10 +35,10 @@
       }
     },
     "infra_vs_code_accuracy": {
-      "mean": 0.9,
+      "mean": 1.0,
       "stdev": 0.0,
-      "min": 0.9,
-      "max": 0.9
+      "min": 1.0,
+      "max": 1.0
     },
     "flake_detection": {
       "precision": 1.0,
@@ -97,18 +99,18 @@
       "min": 0.0,
       "max": 0.0
     },
-    "median_golden_age_days": 27,
+    "median_golden_age_days": 28,
     "stale_goldens": []
   },
   "per_golden": [
     {
       "slug": "artifactory-version-exists",
-      "category": "unknown",
-      "infra_vs_code": "unknown",
+      "category": "release",
+      "infra_vs_code": "code",
       "is_flaky": false,
       "short_circuit": null,
-      "category_correct": false,
-      "infra_vs_code_correct": false,
+      "category_correct": true,
+      "infra_vs_code_correct": true,
       "is_flaky_correct": true,
       "short_circuit_correct": true
     },
@@ -218,7 +220,7 @@
     "prompt_version": "p2.4",
     "prompt_hash": "c523049962df1f75",
     "collector_version": "0.1.0",
-    "git_sha": "b4805d85a5c5e8a605b79aa332bbf9adf8328c97",
+    "git_sha": "22403dcfbd7de5e171d3c21f7328341599d4c208",
     "runs": 3,
     "seed": null
   },

@@ -127,7 +127,7 @@ outputs:
     description: 'Path to summary.json.'
     value: ${{ steps.collect.outputs.json-path }}
   category:
-    description: 'Heuristic classification: oom, dependency, compile, test_failure, etc.'
+    description: 'Heuristic classification: oom, dependency, compile, test_failure, release (version/package already published), etc.'
     value: ${{ steps.collect.outputs.category }}
   confidence:
     description: 'high | medium | low.'

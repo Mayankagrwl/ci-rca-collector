@@ -144,10 +144,20 @@ def analyze_decision(record: AnalysisRecord) -> str:
     return "called"
 
 
+def _answered_source(record: AnalysisRecord) -> str:
+    """ok/cached record → the shown card's own source (deterministic | ai).
+
+    An ok record whose model answer was replaced by the deterministic card
+    (Step 2 grounding gate) is not an AI diagnosis.
+    """
+    src = ((record.result.source if record.result is not None else "") or "").strip()
+    return "deterministic" if src.lower() == "deterministic" else "ai"
+
+
 def diagnosis_source(summary: Summary, record: AnalysisRecord | None = None) -> str:
     if record is not None:
         if record.status in {"ok", "cached"}:
-            return "ai"
+            return _answered_source(record)
         code = record.reason_code or (record.notes[0] if record.notes else "")
         if record.status in {"skipped", "gated"}:
             if code in {"deterministic_sufficient", "short_circuit"}:
@@ -219,7 +229,7 @@ def analysis_outputs(
     """Map an AnalysisRecord to GITHUB_OUTPUT keys. Single-line; never tokens."""
     result = record.result
     source = diagnosis_source(summary, record) if summary is not None else (
-        "ai"
+        _answered_source(record)
         if record.status in {"ok", "cached"}
         else "gated"
         if record.status in {"gated", "skipped"}

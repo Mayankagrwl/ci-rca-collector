@@ -297,7 +297,10 @@ def _apply_grounding_gate(
                 notes.append("focused re-ask grounded on failed step")
                 return record.model_copy(update={"result": retry, "notes": notes})
 
-        det = analysis_result_from_summary(summary, source="hybrid")
+        # The replacement card is 100% deterministic (model text survives only in
+        # notes), so it is labelled deterministic; "hybrid" is reserved for model
+        # prose re-anchored on the failed step.
+        det = analysis_result_from_summary(summary, source="deterministic")
         if is_grounded(det, anchor):
             notes = list(record.notes)
             notes.append(f"model root_cause: {record.result.root_cause}")

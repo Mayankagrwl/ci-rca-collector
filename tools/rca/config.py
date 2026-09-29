@@ -102,12 +102,21 @@ _EVIDENCE_INFRA = [
     "first_error_window",
     "deterministic_hint",
 ]
+# Release/version-gate failures: the failing line names the fix; no templates needed.
+_EVIDENCE_RELEASE = [
+    "primary_failure_line",
+    "failed_step_excerpt",
+    "first_error_window",
+    "deterministic_hint",
+    "change_context",
+]
 EVIDENCE_PROFILE_DEFAULT: list[str] = list(_EVIDENCE_CODE)
 EVIDENCE_PROFILES: dict[str, list[str]] = {
     "compile": list(_EVIDENCE_CODE),
     "crash": list(_EVIDENCE_CODE),
     "test_failure": list(_EVIDENCE_CODE),
     "dependency": list(_EVIDENCE_DEPENDENCY),
+    "release": list(_EVIDENCE_RELEASE),
     "oom": list(_EVIDENCE_INFRA),
     "timeout": list(_EVIDENCE_INFRA),
     "disk_space": list(_EVIDENCE_INFRA),
@@ -171,30 +180,59 @@ def resolve_stgpt_client_app_name(explicit: str | None = None) -> str:
 # Case-insensitive regex tables driving Step 3 terminal-cause / symptom demotion.
 # Extend by editing these lists, never by branching in code.
 #
-# TERMINAL_CAUSE_PATTERNS: a line that ALONE explains the exit. Seeded as a
-# superset of extract._SEMANTIC_CAUSE and diagnose._SPECIFIC_CAUSE_RE markers
-# (kept working there) plus quality-gate / compile / dependency shapes.
-TERMINAL_CAUSE_PATTERNS: list[str] = [
+# TERMINAL_CAUSE_RULES: a line that ALONE explains the exit, and the category
+# it proves. Single source of truth: TERMINAL_CAUSE_PATTERNS is derived from it.
+# Seeded as a superset of extract._SEMANTIC_CAUSE and diagnose._SPECIFIC_CAUSE_RE
+# markers plus quality-gate / compile / dependency shapes. ``category`` is used
+# only to gap-fill a verdict no classify rule produced; ``None`` = no honest
+# category (the line still counts as a terminal cause). ``category_match_case``
+# makes the category apply only on a case-sensitive match (terminal detection
+# itself stays case-insensitive).
+class _TerminalCauseRuleBase(TypedDict):
+    pattern: str
+    category: str | None
+
+
+class TerminalCauseRule(_TerminalCauseRuleBase, total=False):
+    category_match_case: bool
+
+
+TERMINAL_CAUSE_RULES: list[TerminalCauseRule] = [
     # "already exists" only in a publish/version failure context — never the
     # bare Docker layer line "<hex> Already exists 0B".
-    r"(?:release|version|tag|artifact|image|package)\b[^\n]*already exists",
-    r"already exists[^\n]*(?:you need to update|update (?:the )?package|overwrite|on\s+\w+)",
-    r"version exists",
-    r"must update",
-    r"you need to update",
-    r"ERESOLVE",
-    r"No matching distribution",
-    r"Could not find a version",
-    r"ModuleNotFoundError",
-    r"Cannot find module",
-    r"error TS\d+",
-    r"cannot find symbol",
-    r"AssertionError",
-    r"\bFAILED\s+\S+",
-    r"ENOSPC",
-    r"quality gate (?:failed|not passed)",
-    r"coverage .*(?:below|threshold|did not meet)",
+    {
+        "pattern": r"(?:release|version|tag|artifact|image|package)\b[^\n]*already exists",
+        "category": "release",
+    },
+    {
+        "pattern": (
+            r"already exists[^\n]*(?:you need to update|update (?:the )?package|"
+            r"overwrite|on\s+\w+)"
+        ),
+        "category": "release",
+    },
+    {"pattern": r"version exists", "category": "release"},
+    {"pattern": r"must update", "category": "release"},
+    {"pattern": r"you need to update", "category": "release"},
+    {"pattern": r"ERESOLVE", "category": "dependency"},
+    {"pattern": r"No matching distribution", "category": "dependency"},
+    {"pattern": r"Could not find a version", "category": "dependency"},
+    {"pattern": r"ModuleNotFoundError", "category": "dependency"},
+    {"pattern": r"Cannot find module", "category": "dependency"},
+    {"pattern": r"error TS\d+", "category": "compile"},
+    {"pattern": r"cannot find symbol", "category": "compile"},
+    {"pattern": r"AssertionError", "category": "test_failure"},
+    # pytest-style "FAILED tests/x.py::test_y" — not prose like "build failed for".
+    {"pattern": r"\bFAILED\s+\S+", "category": "test_failure", "category_match_case": True},
+    {"pattern": r"ENOSPC", "category": "disk_space"},
+    {"pattern": r"quality gate (?:failed|not passed)", "category": None},
+    {"pattern": r"coverage .*(?:below|threshold|did not meet)", "category": None},
 ]
+TERMINAL_CAUSE_PATTERNS: list[str] = [rule["pattern"] for rule in TERMINAL_CAUSE_RULES]
+# Categories a terminal cause can gap-fill (e.g. "release", which no classify rule emits).
+TERMINAL_CAUSE_CATEGORIES: frozenset[str] = frozenset(
+    rule["category"] for rule in TERMINAL_CAUSE_RULES if rule["category"] is not None
+)
 
 # BENIGN_LINE_PATTERNS: normal/informational output that must NEVER be treated
 # as a cause (terminal cause, primary_failure_line, first-error anchor, or
@@ -383,7 +421,9 @@ __all__ = [
     "PIPELINE_PHASE_TOKENS",
     "PIPELINE_STAGE_MAP",
     "SYMPTOM_PATTERNS",
+    "TERMINAL_CAUSE_CATEGORIES",
     "TERMINAL_CAUSE_PATTERNS",
+    "TERMINAL_CAUSE_RULES",
     "PIPELINE_STREAM_MAX_BYTES",
     "PIPELINE_STREAM_MAX_LINES",
     "CODE_HUNK_MAX_FILES",

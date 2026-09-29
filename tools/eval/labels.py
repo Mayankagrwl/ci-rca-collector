@@ -14,13 +14,15 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, field_validator
 
-from tools.rca.config import CLASSIFY_RULES
+from tools.rca.config import CLASSIFY_RULES, TERMINAL_CAUSE_CATEGORIES
 from tools.rca.models import Summary
 
 # Stage-5 categories the labels are validated against: the CLASSIFY_RULES
-# categories plus the short-circuit / residual categories a verdict can carry.
+# categories, the terminal-cause gap-fill categories (e.g. "release"), plus the
+# short-circuit / residual categories a verdict can carry.
 VALID_CATEGORIES: frozenset[str] = frozenset(
     {rule["category"] for rule in CLASSIFY_RULES}
+    | TERMINAL_CAUSE_CATEGORIES
     | {"infra_runner", "infra_widespread", "unknown"}
 )
 

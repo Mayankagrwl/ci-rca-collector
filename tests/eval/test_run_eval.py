@@ -130,13 +130,16 @@ def test_malformed_label_fails_and_names_file(tmp_path: Path) -> None:
 # --- #15: category metrics include a full confusion matrix ------------------
 
 
-def test_confusion_matrix_is_full_and_captures_the_artifactory_miss() -> None:
+def test_confusion_matrix_is_full_and_diagonal_on_seed_goldens() -> None:
     result = run_eval.run(goldens_dir=_GOLDENS, runs=1, no_llm=True, filters={}, seed=0)
     matrix = result["metrics"]["category_confusion"]
     assert isinstance(matrix, dict)
-    # artifactory's true dependency is predicted as unknown (a captured miss).
-    assert matrix["dependency"]["unknown"] >= 1
-    assert matrix["dependency"]["dependency"] >= 1  # npm-eresolve hit
+    # Step 12b: artifactory-version-exists (relabelled release) was the one miss
+    # (predicted unknown); the terminal-cause gap-fill now predicts release.
+    assert matrix["release"] == {"release": 1}
+    assert matrix["dependency"] == {"dependency": 1}  # npm-eresolve hit
+    for true_cat, row in matrix.items():
+        assert set(row) == {true_cat}, f"off-diagonal entry for {true_cat}: {row}"
 
 
 # --- #16: flake detection reports precision/recall/F1 -----------------------
@@ -171,8 +174,11 @@ def test_provenance_recorded(tmp_path: Path) -> None:
 def test_filter_narrows_goldens() -> None:
     result = run_eval.run(goldens_dir=_GOLDENS, runs=1, no_llm=True,
                           filters={"true_category": "dependency"}, seed=0)
-    # artifactory-version-exists + npm-eresolve are both labelled dependency.
-    assert result["metrics"]["n_goldens"] == 2
+    # npm-eresolve only; artifactory-version-exists is labelled release (Step 12b).
+    assert result["metrics"]["n_goldens"] == 1
+    release = run_eval.run(goldens_dir=_GOLDENS, runs=1, no_llm=True,
+                           filters={"true_category": "release"}, seed=0)
+    assert release["metrics"]["n_goldens"] == 1
     result2 = run_eval.run(goldens_dir=_GOLDENS, runs=1, no_llm=True,
                            filters={"is_infra_vs_code": "infra"}, seed=0)
     assert result2["metrics"]["n_goldens"] >= 2  # timeout, image_pull, infra_runner

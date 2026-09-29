@@ -28,6 +28,7 @@ from tools.rca.models import (
     Summary,
     Verdict,
 )
+from tools.rca.outputs import analysis_outputs
 from tools.rca.stgpt_client import ChatResult
 
 _CAUSE = "STEP-CAUSE config key MISSING_TOKEN is required but was unset"
@@ -209,7 +210,10 @@ def test_deterministic_wins_when_model_stays_ungrounded(tmp_path) -> None:
     record = analyze_summary(summary, chat_fn=caller, cache_dir=tmp_path / "cache")
 
     assert record.result is not None
-    assert record.result.source in {"deterministic", "hybrid"}
+    # Step 12b: the replacement card is 100% deterministic (model text only in
+    # notes), so it is labelled deterministic, not hybrid.
+    assert record.result.source == "deterministic"
+    assert analysis_outputs(record, summary)["diagnosis-source"] == "deterministic"
     assert record.grounded is True  # the chosen (deterministic) card cites the step
     assert record.result.confidence in {"low", "medium"}
     # The model's text is preserved for the record, not thrown away.

@@ -1,16 +1,33 @@
 # CI RCA Collector — agent rules
 
-This repo implements **Phase 1 only** of `docs/ci-rca-collector-spec-v8.md`.
+## Phases
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 — collect | Collection + deterministic diagnosis + rendering (`docs/ci-rca-collector-spec-v8.md`) | shipped |
+| 2 — analyze | STGPT analysis of the collected summary | shipped |
+| eval | Offline eval harness under `tools/eval/` (`docs/rca-eval-spec-v1.md`) | shipped |
+| 3 — delivery | PR / commit comments, issues, labels, reactions (`docs/rca-delivery-spec-v1.3.md`) | in progress |
+
+## Build discipline
+
+1. One slice per step prompt under `docs/cc-prompt-step*.md`. Implement exactly that slice; do not build later steps early.
+2. Keep `pytest tests/rca -q` and `pytest tests/eval -q` green.
+3. The acceptance-35 grep stays empty:
+   `rg -n "job_id|run_id|github_api" tools/rca/cleaner.py tools/rca/drain_index.py tools/rca/budget.py tools/rca/redact.py tools/rca/history.py`
+4. Schema lives only in `tools/rca/models.py`.
 
 ## Non-negotiables
 
-1. Follow the spec's **build order** (§6). Do not implement later modules first.
-2. Phase 1 is collection + rendering. **No LLM calls, no PR comments, no issue creation, no kubectl.**
-3. `cleaner.py`, `drain_index.py`, `budget.py`, `redact.py`, `history.py` must **never** import GitHub-specific modules or mention `job_id` / `run_id`.
-4. GitHub host is **not hardcoded**. All REST calls go through `tools/rca/github_api.py`, which reads host/token from env (see `config.py`).
-5. Never log tokens. Never write tokens into `summary.json` / `summary.md`.
-6. Collector must not fail the workflow: catch exceptions, emit partial summary, exit 0 unless `--strict`.
-7. Keep dependencies minimal: `pydantic>=2`, `httpx`, `drain3`, `python-dateutil`. No PyGithub.
+1. **Permissions.** Collect stays `actions: read`, `contents: read`. GitHub writes (comments, issues, labels, reactions) happen **only** in `tools/rca/deliver/` via `github_api.py`, **only** in the separate delivery job, and **only** when `deliver` is enabled.
+2. **Source-agnostic modules** never import GitHub-specific modules and never mention `job_id` / `run_id`: `cleaner.py`, `drain_index.py`, `budget.py`, `redact.py`, `history.py`, `extract.py`, `classify.py`, `pipeline_logs.py`.
+3. **All GitHub HTTP goes through `tools/rca/github_api.py`**, which reads host/token from env (see `config.py`). Never hardcode `api.github.com`.
+4. `tools/rca/` never imports `tools/eval/`.
+5. Never print rule ids (`R<n>`) in any user-facing channel (summary, card, action outputs, comments, issues).
+6. Never log tokens. Never write tokens into `summary.json` / `summary.md` or any delivered text.
+7. Never fail the workflow: catch exceptions, emit a partial summary, exit 0 unless `--strict`.
+8. Nothing is hardcoded to a project, message, or vendor — rules are table- or structure-driven (`config.py`).
+9. Dependencies: `pydantic>=2`, `httpx`, `drain3`, `python-dateutil`, `pyyaml`. No PyGithub.
 
 ## GitHub.com vs GitHub Enterprise
 
@@ -31,7 +48,3 @@ Token resolution order:
 3. `COMMON_ACTIONS_PAT`
 4. `GITHUB_TOKEN`
 5. `GH_TOKEN`
-
-## What to implement now
-
-Phase 1 action + CLI + tests/fixtures. Schema lives only in `tools/rca/models.py`.

@@ -1,4 +1,4 @@
-"""Deterministic RCA rules R1–R18. Pure functions on Summary. No HTTP, no LLM."""
+"""Deterministic RCA rules R1–R19. Pure functions on Summary. No HTTP, no LLM."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .config import (
     RUNNER_FAILURE_PATTERNS,
     SYMPTOM_PATTERNS,
     TERMINAL_CAUSE_PATTERNS,
+    TERMINAL_CAUSE_RULES,
 )
 from .extract import extract_source_paths, is_benign_line
 from .models import (
@@ -81,6 +82,7 @@ _FIX_BY_RULE = {
     "R16": "Treat as flaky; the same fingerprint failed on another branch.",
     "R17": "Diagnose from the pipeline/docker log, not the job tail.",
     "R18": "Inspect the collector evidence bundle and compare with last green.",
+    "R19": "Fix the terminal cause named in the failed step's log line.",
 }
 _FIX_PREFIX = (
     "roll back",
@@ -109,6 +111,7 @@ SIGNATURE_CATEGORIES = frozenset(
         "auth",
         "test_failure",
         "disk_space",
+        "release",
     }
 )
 _PKG_RES = [
@@ -127,12 +130,17 @@ _WORKFLOW_SYNTAX_RE = re.compile(
     r"you have an error in your yaml|Error in the workflow file",
     re.I,
 )
+# No bare vendor words (e.g. a registry name): an echo such as "Checking if
+# version X exists in <registry>" must never be read as the cause.
 _SPECIFIC_CAUSE_RE = re.compile(
-    r"already exists|artifactory|ERESOLVE|error TS\d+|"
+    r"already exists|ERESOLVE|error TS\d+|"
     r"\bFAILED\s+\S+|AssertionError|No matching distribution|"
     r"Could not find a version|ENOSPC|error TS",
     re.I,
 )
+# Any rule id (R1, R18, R19, ...) — must never leak into user-facing text.
+_RULE_ID_RE = re.compile(r"\bR\d+\b")
+_RULE_ID_PREFIX_RE = re.compile(r"\bR\d+\s*:\s*")
 _SHORT_CIRCUITS = frozenset(
     {"infra_runner", "infra_widespread", "flake_same_sha_passed", "no_failed_jobs"}
 )
@@ -162,6 +170,18 @@ _IMAGE_OR_WORKFLOW_RE = re.compile(
 )
 _RUNNER_RES = [re.compile(p, re.IGNORECASE) for p in RUNNER_FAILURE_PATTERNS]
 _TERMINAL_CAUSE_RES = [re.compile(p, re.IGNORECASE) for p in TERMINAL_CAUSE_PATTERNS]
+# (terminal regex, category regex, category or None) — drives the R19 gap-fill.
+_TERMINAL_RULE_RES = [
+    (
+        re.compile(rule["pattern"], re.IGNORECASE),
+        re.compile(
+            rule["pattern"], 0 if rule.get("category_match_case") else re.IGNORECASE
+        ),
+        rule["category"],
+    )
+    for rule in TERMINAL_CAUSE_RULES
+]
+_RELEASE_RES = [rx for rx, _cat_rx, category in _TERMINAL_RULE_RES if category == "release"]
 _SYMPTOM_RES = [re.compile(p, re.IGNORECASE) for p in SYMPTOM_PATTERNS]
 _RULE_RES = [
     (rule["category"], re.compile(rule["pattern"], re.IGNORECASE), rule["confidence"])
@@ -251,7 +271,7 @@ def diagnose(summary: Summary) -> DeterministicVerdict:
 
     r14 = _rule_config_only(summary, hit)
     if r14 is not None:
-        return finish(r14)
+        return finish(_gap_fill(summary, r14, stage))
 
     r15 = _rule_history_resolution(summary, hit)
     if r15 is not None:
@@ -269,7 +289,8 @@ def diagnose(summary: Summary) -> DeterministicVerdict:
     if r_sig is not None:
         return finish(r_sig)
 
-    return finish(_rule_r18(summary, hit, stage, files_from_logs))
+    residual = _rule_r18(summary, hit, stage, files_from_logs)
+    return finish(_gap_fill(summary, residual, stage))
 
 
 def apply_verdict(summary: Summary, verdict: DeterministicVerdict) -> Summary:
@@ -328,7 +349,7 @@ def looks_like_fix(text: str | None) -> bool:
 
 
 def _contains_rule_id(text: str | None) -> bool:
-    return bool(re.search(r"\bR(?:1[0-8]|[1-9])\b", text or ""))
+    return bool(_RULE_ID_RE.search(text or ""))
 
 
 def extract_package_name(summary: Summary) -> str | None:
@@ -401,6 +422,24 @@ def _line_is_terminal(line: str) -> bool:
     return any(rx.search(line) for rx in _TERMINAL_CAUSE_RES)
 
 
+def _line_is_release(line: str) -> bool:
+    return any(rx.search(line) for rx in _RELEASE_RES)
+
+
+def _terminal_category(line: str) -> tuple[bool, str | None, str | None]:
+    """(is_terminal, category, pattern) for the first terminal rule with a category.
+
+    A line matching only ``category: None`` rules is terminal with no category.
+    """
+    matched = False
+    for rx, category_rx, category in _TERMINAL_RULE_RES:
+        if rx.search(line):
+            matched = True
+            if category is not None and category_rx.search(line):
+                return True, category, rx.pattern
+    return matched, None, None
+
+
 def _stream_is_teardown(stream: PipelineLogStream) -> bool:
     return getattr(stream, "phase", None) == "teardown"
 
@@ -422,6 +461,15 @@ def specific_log_cause(summary: Summary) -> str | None:
     terminal-cause line itself).
     """
     terminal = terminal_cause_present(summary)
+    # The failed step's own cause line (Step 1) outranks any scanned line.
+    for job in summary.failed_jobs:
+        line = (job.primary_failure_line or "").strip()
+        if not line or is_benign_line(line):
+            continue
+        if terminal and _line_is_symptom(line) and not _line_is_terminal(line):
+            continue
+        if _SPECIFIC_CAUSE_RE.search(line) or _line_is_terminal(line):
+            return line[:240]
     candidates: list[str] = []
     for job in summary.failed_jobs:
         for err in job.error_lines:
@@ -463,7 +511,7 @@ def _copy_from_specific_line(
     line: str, verdict: DeterministicVerdict
 ) -> tuple[str, str]:
     lowered = line.lower()
-    if "already exists" in lowered or "artifactory" in lowered:
+    if _line_is_release(line):
         return (
             line[:240],
             "Bump the package version (for example in package.json) and republish; "
@@ -554,6 +602,18 @@ def user_facing(verdict: DeterministicVerdict, summary: Summary):
     elif cat == "disk_space":
         root = "The job ran out of disk space (ENOSPC)."
         fix = "Free disk space or use a larger runner disk."
+    elif cat == "release":
+        # The terminal line itself is the root cause (it names what already exists).
+        line = (verdict.one_liner or "").strip()
+        if not _line_is_terminal(line):
+            line = specific_log_cause(summary) or line
+        root = _RULE_ID_PREFIX_RE.sub("", line).strip()[:240] or (
+            "The release/package version being published already exists."
+        )
+        fix = (
+            "Bump the release/package version and republish; "
+            "the existing version cannot be overwritten."
+        )
     elif verdict.is_flaky or verdict.short_circuit == "flake_same_sha_passed":
         root = (
             "This job failed on a SHA that previously succeeded, "
@@ -581,8 +641,8 @@ def user_facing(verdict: DeterministicVerdict, summary: Summary):
     else:
         root = verdict.one_liner or "The collector named this failure from the logs."
         fix = verdict.fix_one_liner or fix_for_rule(verdict.rule_id)
-        root = re.sub(r"\bR(?:1[0-8]|[1-9])\s*:\s*", "", root).strip()
-        fix = re.sub(r"\bR(?:1[0-8]|[1-9])\s*:\s*", "", fix).strip()
+        root = _RULE_ID_PREFIX_RE.sub("", root).strip()
+        fix = _RULE_ID_PREFIX_RE.sub("", fix).strip()
 
     extras = [pkg] if pkg else []
     if test_name:
@@ -1434,6 +1494,63 @@ def _rule_signature(summary: Summary, hit: ClassificationHit) -> DeterministicVe
         requires_analysis=False,
         suspected_stage=_suspected_stage(summary, hit),
     )
+
+
+def _gap_fill(
+    summary: Summary, residual: DeterministicVerdict, stage: str | None
+) -> DeterministicVerdict:
+    """Replace an R14/R18 verdict that carries no category with R19, if one applies.
+
+    Gap-filling only: a residual that already names a category (some classify
+    rule matched) is returned unchanged.
+    """
+    if residual.rule_id not in {"R14", "R18"} or residual.category != "unknown":
+        return residual
+    return _rule_terminal_category(summary, stage) or residual
+
+
+def _rule_terminal_category(
+    summary: Summary, stage: str | None
+) -> DeterministicVerdict | None:
+    """R19 gap-fill: a terminal cause at the failed step that no category rule claimed.
+
+    Called only where the chain would otherwise return R14/R18. The first
+    non-benign anchor line that is a terminal cause (primary_failure_line first)
+    decides; it must map to a non-None category. Never raises.
+    """
+    try:
+        if not terminal_cause_present(summary):
+            return None
+        from .prompt import failed_step_anchor_text
+
+        job = summary.failed_jobs[0] if summary.failed_jobs else None
+        lines: list[str] = []
+        if job is not None and job.primary_failure_line:
+            lines.append(job.primary_failure_line)
+        lines.extend(failed_step_anchor_text(summary).splitlines())
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("### ") or is_benign_line(line):
+                continue
+            is_terminal, category, pattern = _terminal_category(line)
+            if not is_terminal:
+                continue
+            if category is None:
+                return None
+            return _v(
+                "R19",
+                line[:240],
+                category=category,
+                confidence="high",
+                is_infra_vs_code=_side(category),
+                requires_analysis=False,
+                suspected_stage=stage,
+                matched_stream=_job_stream_id(job) if job is not None else None,
+                matched_pattern=pattern,
+            )
+    except Exception:  # noqa: BLE001 — a gap-fill must never crash diagnosis
+        return None
+    return None
 
 
 def _rule_r18(

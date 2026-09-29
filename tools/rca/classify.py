@@ -34,7 +34,7 @@ _INFRA_CATEGORIES = frozenset(
         "image_pull",
     }
 )
-_CODE_CATEGORIES = frozenset({"dependency", "compile", "test_failure", "crash"})
+_CODE_CATEGORIES = frozenset({"dependency", "compile", "test_failure", "crash", "release"})
 
 _RUNNER_RES = [re.compile(p, re.IGNORECASE) for p in RUNNER_FAILURE_PATTERNS]
 _RULE_RES = [
