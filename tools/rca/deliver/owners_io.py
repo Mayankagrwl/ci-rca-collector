@@ -31,10 +31,15 @@ def load_codeowners(
         if budget.exceeded(clock()):
             notes.append(f"CODEOWNERS lookup stopped: {BUDGET_EXCEEDED}")
             return None, notes
+        meta: dict[str, Any] = {}
         try:
-            text = client.get_file(repo, path, ref, allow_empty=True)
+            text = client.get_file(repo, path, ref, allow_empty=True, meta=meta)
         except Exception as exc:  # noqa: BLE001 — never guess a later file after an error
             notes.append(f"CODEOWNERS lookup failed at {path}@{ref}: {type(exc).__name__}")
+            return None, notes
+        if meta.get("too_large"):
+            # It exists (so it wins), but the contents API cannot return it.
+            notes.append(f"{path}@{ref} too large for the contents API; ignored")
             return None, notes
         if text is None:
             continue

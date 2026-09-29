@@ -770,6 +770,13 @@ def _delivery_clock() -> float:
     return time.monotonic()
 
 
+# Test hooks for the notification senders (never the GitHub client / token).
+_notify_chat_transport: Any = None  # httpx transport for the chat webhook
+_notify_smtp_factory: Any = None  # (host, port, timeout, implicit_tls) -> SMTP-like
+CHAT_BEGIN = "<!-- BEGIN RCA CHAT TEXT (posted verbatim) -->"
+CHAT_END = "<!-- END RCA CHAT TEXT -->"
+
+
 def _migrate_sleep(seconds: float) -> None:
     """Pacing between migration creates. Test hook: monkeypatch to record instead of sleep."""
     time.sleep(seconds)
@@ -1016,6 +1023,20 @@ def _plan_delivery(
                 notes=notes,
                 errors=errors,
             )
+            # Lowest-priority write: after the issue and the comment, before housekeeping.
+            _deliver_notifications(
+                outcome,
+                summary=summary,
+                record=record,
+                inputs=inputs,
+                client=client,
+                repo=repo or "",
+                online=not isinstance(client, _OfflineClient),
+                now=now,
+                budget=budget,
+                notes=notes,
+                errors=errors,
+            )
         finally:
             # Housekeeping only after the comment, so it can never starve it (F1).
             _finish_issue(outcome, now=now, notes=notes, errors=errors)
@@ -1122,6 +1143,7 @@ def _deliver_issue(
             owners=list(outcome.get("owners", [])),
         )
         outcome["issue_action"] = result.action
+        outcome["issue_previous_updated_at"] = result.previous_updated_at
         if result.number is not None and result.action not in {"failed", "skipped"}:
             outcome["issue_ref"] = result.number
             outcome["issue_url"] = result.url
@@ -1136,6 +1158,183 @@ def _deliver_issue(
         if store is not None:
             outcome["_issue_store"] = store  # swept + flushed after the comment (F1)
             outcome["issue_write_failed"] = outcome.get("issue_write_failed") or store.write_failed
+
+
+def _deliver_notifications(
+    outcome: dict[str, Any],
+    *,
+    summary: Summary,
+    record: Any,
+    inputs: Any,
+    client: Any,
+    repo: str,
+    online: bool,
+    now: datetime,
+    budget: Any,
+    notes: list[str],
+    errors: list[str],
+) -> None:
+    """Email + chat (v1.3 §10). Never raises; never blocks the issue or the comment."""
+    from .deliver.notify import (
+        ChatSender,
+        SmtpSender,
+        elect_leader,
+        notify_config,
+        plan_notification,
+        platform_path,
+    )
+    from .deliver.sticky import BUDGET_EXCEEDED
+    from .deliver.suppress import evaluate
+
+    config = notify_config(inputs, os.environ)
+    scrub = config.scrubber()
+    status: dict[str, str] = {}
+    outcome["notify_status"] = status
+    try:
+        context = outcome["context"]
+        live = bool(outcome.get("live"))
+        decision = outcome.get("decision") or evaluate(
+            summary, record, context, inputs, existing=None, now=now
+        )
+        leader = None
+        leader_note = None
+        if config.configured and platform_path(decision) is not None:
+            if not online:
+                leader_note = "platform leader not determined (no API access)"
+            else:
+                try:
+                    runs = client.list_runs(repo, status="failure", per_page=100)
+                    leader = elect_leader(
+                        runs,
+                        run_id=summary.run.run_id,
+                        workflow=summary.run.workflow_name,
+                        branch=summary.run.head_branch,
+                        now=now,
+                        window_minutes=inputs.quiet_window_minutes,
+                    )
+                except Exception as exc:  # noqa: BLE001 — a duplicate beats a missed outage
+                    leader_note = f"platform leader lookup failed ({type(exc).__name__}); sending anyway"
+        plan = plan_notification(
+            config,
+            summary=summary,
+            record=record,
+            decision=decision,
+            context=context,
+            route_notify=list(outcome["plan"].notify),
+            severity=outcome["severity"],
+            inputs=inputs,
+            owners=list(outcome.get("owners", [])),
+            owner_resolved_by=outcome.get("owner_resolved_by"),
+            issue_url=outcome.get("issue_url"),
+            previous_updated_at=outcome.get("issue_previous_updated_at"),
+            now=now,
+            leader=leader,
+            leader_note=leader_note,
+        )
+        outcome["notify_plan"] = plan
+        notes.extend(scrub(n) for n in plan.notes)
+        if not plan.send:
+            for channel, url in (("chat", config.chat_url), ("email", config.smtp_url)):
+                if url:
+                    status[channel] = f"skipped ({plan.reason})"
+            return
+
+        failed = False
+        if config.chat_url:
+            chat = ChatSender(
+                config.chat_url, payload_field=config.payload_field, transport=_notify_chat_transport
+            )
+            problem = chat.config_error()
+            if problem:
+                status["chat"] = "skipped (configuration)"
+                notes.append(problem)
+            elif not live:
+                status["chat"] = "would send"
+            else:
+                timeout = _send_timeout(budget)
+                if timeout <= 0:
+                    status["chat"] = "skipped (budget)"
+                    errors.append(f"chat skipped: {BUDGET_EXCEEDED}")
+                else:
+                    sent = chat.send(plan.chat_text, timeout=timeout)
+                    if sent.ok:
+                        status["chat"] = "sent"
+                        outcome["delivered_to"].append("chat")
+                    else:
+                        status["chat"] = "failed"
+                        errors.append(scrub(sent.detail))
+                        failed = True
+        if config.smtp_url:
+            smtp = SmtpSender(config.smtp_url, smtp_factory=_notify_smtp_factory)
+            problem = smtp.config_error()
+            notes.extend(smtp.config_notes())
+            if problem:
+                status["email"] = "skipped (configuration)"
+                notes.append(problem)
+            elif not plan.emails:
+                status["email"] = "skipped (no email recipients)"
+            elif not live:
+                status["email"] = f"would send to {', '.join(plan.emails)}"
+            else:
+                timeout = _send_timeout(budget)
+                if timeout <= 0:
+                    status["email"] = "skipped (budget)"
+                    errors.append(f"email skipped: {BUDGET_EXCEEDED}")
+                else:
+                    message = smtp.message(plan.subject, plan.email_body, plan.emails)
+                    sent = smtp.send(message, timeout=timeout)
+                    if sent.ok:
+                        status["email"] = f"sent to {', '.join(plan.emails)}"
+                        outcome["delivered_to"].append("email")
+                    else:
+                        status["email"] = "failed"
+                        errors.append(scrub(sent.detail))
+                        failed = True
+        _settle_delivery_error(outcome, notify_failed=failed)
+    except Exception as exc:  # noqa: BLE001
+        _LOG.error("notification delivery failed: %s", type(exc).__name__)
+        errors.append(scrub(f"notification delivery failed: {_first_line(exc)}"))
+
+
+def _send_timeout(budget: Any) -> float:
+    """min(10s, what is left of the delivery budget)."""
+    from .deliver.notify import SEND_TIMEOUT_S
+
+    remaining = budget.seconds - (_delivery_clock() - budget.started_at)
+    return max(0.0, min(SEND_TIMEOUT_S, remaining))
+
+
+def _settle_delivery_error(outcome: dict[str, Any], *, notify_failed: bool) -> None:
+    """A notification failure counts only when it was the only channel attempted."""
+    if not outcome.get("live"):
+        return
+    delivered = outcome["delivered_to"]
+    if outcome.get("suppressed_by") == "delivery_error" and delivered:
+        outcome["suppressed_by"] = None  # something landed after all
+        return
+    issue_action = str(outcome.get("issue_action") or "")
+    issue_attempted = bool(issue_action) and not issue_action.startswith(("none", "would"))
+    other_attempted = bool(outcome.get("comment_action")) or issue_attempted
+    if notify_failed and not delivered and not other_attempted and outcome.get("suppressed_by") is None:
+        outcome["suppressed_by"] = "delivery_error"
+
+
+def _notification_lines(outcome: dict[str, Any]) -> list[str]:
+    plan = outcome.get("notify_plan")
+    status = outcome.get("notify_status") or {}
+    lines = ["", "## Notifications", ""]
+    if plan is None or plan.reason == "none configured":
+        return lines + ["- notifications: none configured"]
+    lines.append(f"- decision: {'send' if plan.send else 'skip'} ({plan.reason})")
+    if plan.platform:
+        lines.append(f"- platform path: {plan.platform}")
+    for channel in ("chat", "email"):
+        if channel in status:
+            lines.append(f"- {channel}: {status[channel]}")
+    if plan.send:
+        lines.append(f"- audience: {', '.join(plan.audience) or 'none'}")
+        lines.append(f"- email subject: {plan.subject}")
+    return lines
 
 
 def _finish_issue(
@@ -1429,8 +1628,7 @@ def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
             f"- issue: {_issue_line(outcome)}",
             f"- owner: {', '.join(outcome.get('owners') or []) or 'none'} "
             f"(resolved by {outcome.get('owner_resolved_by') or 'none'})",
-            f"- notify intent: {', '.join(plan.notify) or 'none'} "
-            "(channels are decided in Step 18)",
+            f"- notify intent: {', '.join(plan.notify) or 'none'}",
         ]
         if outcome.get("label_action"):
             lines.append(f"- label: {outcome['label_action']}")
@@ -1458,8 +1656,14 @@ def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
         lines += ["", "## Notes", ""]
         lines += [f"- {note}" for note in report.notes]
         lines += [f"- error: {err}" for err in report.errors]
+    if context is not None:
+        lines += _notification_lines(outcome)
     header = "\n".join(lines) + "\n"
     header, _ = redact_text(header)
+    notify_plan = outcome.get("notify_plan")
+    if notify_plan is not None and notify_plan.send and notify_plan.chat_text:
+        # Verbatim: byte-identical to the JSON field value POSTed to the webhook.
+        header += f"\n## Chat text\n\n{CHAT_BEGIN}\n{notify_plan.chat_text}\n{CHAT_END}\n"
 
     body = outcome.get("body")
     if body is None:

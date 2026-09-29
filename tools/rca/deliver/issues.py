@@ -276,6 +276,9 @@ class IssueResult:
     count_after: int | None = None
     delivered: list[str] = field(default_factory=list)
     error: str | None = None
+    # The issue's updated_at *before* this run touched it — the notification quiet-window
+    # clock. Never this run's own write (that would make every run look quiet).
+    previous_updated_at: datetime | None = None
 
 
 @dataclass
@@ -537,6 +540,7 @@ class IssuesHistoryStore:
         title = issue_title(merged, fork=args.fork)
         closed = issue.get("state") == "closed"
         result = IssueResult("unchanged", number, url, before, merged.count)
+        result.previous_updated_at = _parse_time(issue.get("updated_at"))
         if not closed and body == issue.get("body") and title == issue.get("title"):
             self._assign(issue, args.owners, result)
             return result
@@ -601,6 +605,7 @@ class IssuesHistoryStore:
             update = self._update(kept, record, args)
             result.delivered.extend(update.delivered)
             result.count_before, result.count_after = update.count_before, update.count_after
+            result.previous_updated_at = update.previous_updated_at
             result.url = update.url or result.url
             if update.error:
                 result.error = update.error
@@ -650,12 +655,23 @@ class IssuesHistoryStore:
             self.notes.append(f"could not assign #{number}: {BUDGET_EXCEEDED}")
             return
         try:
-            self.client.add_assignees(self.repo, number, logins)
+            response = self.client.add_assignees(self.repo, number, logins)
         except Exception as exc:  # noqa: BLE001 — a note, never a delivery error
             self.notes.append(f"could not assign #{number} to {', '.join(logins)}: {_describe(exc)}")
             return
-        issue["assignees"] = [{"login": login} for login in logins]
-        result.delivered.append("issue:assigned")
+        # GitHub answers 201 but silently drops logins it cannot assign.
+        present = {
+            str(a.get("login", "")).lower()
+            for a in (response.get("assignees") or [])
+            if isinstance(a, dict)
+        }
+        landed = [login for login in logins if login.lower() in present]
+        for login in logins:
+            if login not in landed:
+                self.notes.append(f"GitHub did not assign {login} to #{number} (not assignable)")
+        issue["assignees"] = list(response.get("assignees") or [])
+        if landed:
+            result.delivered.append("issue:assigned")
 
     # -- internals: bookkeeping --
 
@@ -695,6 +711,15 @@ def _describe(exc: BaseException) -> str:
     if isinstance(exc, GitHubAPIError):
         return f"{exc} (status {status})" if status is not None else str(exc)
     return type(exc).__name__
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return _aware(date_parser.isoparse(value))
+    except (ValueError, OverflowError):
+        return None
 
 
 def _aware(value: datetime) -> datetime:

@@ -180,14 +180,30 @@ def resolve_path_owners(
     *,
     workspace: str | None,
     known_files: list[str] | None = None,
+    notes: list[str] | None = None,
 ) -> OwnerMatch | None:
-    """Pick one candidate: a known repo file, else the longest non-catch-all match, else catch-all."""
+    """Pick one candidate: a known repo file, else the longest non-catch-all match, else catch-all.
+
+    A known file maps only when it is a suffix of a candidate (always safe). The
+    reverse — a known file *ending in* the path — is allowed only for the original
+    relative path with ≥ 2 segments and exactly one such known file; a bare or
+    ambiguous name (``pom.xml``, ``index.ts``) must never borrow another file's owner.
+    """
     candidates = repo_relative_candidates(path, workspace=workspace)
     known = [k.strip("/") for k in (known_files or []) if k]
     for cand in candidates:
-        for k in known:
-            if cand == k or cand.endswith("/" + k) or k.endswith("/" + cand):
-                return owners_for(k, rules)
+        hits = [k for k in known if cand == k or cand.endswith("/" + k)]
+        if hits:
+            return owners_for(max(hits, key=len), rules)
+    original = _original_relative(path, workspace)
+    if original and original.count("/") >= 1:
+        reverse = [k for k in known if k.endswith("/" + original)]
+        if len(reverse) == 1:
+            return owners_for(reverse[0], rules)
+        if len(reverse) > 1 and notes is not None:
+            notes.append(
+                f"{original} matches {len(reverse)} changed files; not mapped (ambiguous)"
+            )
     catch_all: OwnerMatch | None = None
     for cand in candidates:
         match = owners_for(cand, rules)
@@ -198,6 +214,20 @@ def resolve_path_owners(
         if catch_all is None:
             catch_all = match
     return catch_all
+
+
+def _original_relative(path: str, workspace: str | None) -> str | None:
+    """The path as given, when it was already repo-relative (or workspace-relative)."""
+    candidates = repo_relative_candidates(path, workspace=workspace)
+    p = (path or "").strip().replace("\\", "/")
+    if p.startswith("file://"):
+        p = p[len("file://") :]
+    ws = (workspace or "").strip().replace("\\", "/").rstrip("/")
+    first = p.split("/", 1)[0]
+    relative = not p.startswith("/") and not _DRIVE_RE.match(first)
+    if (relative or (ws and p.startswith(ws + "/"))) and len(candidates) == 1:
+        return candidates[0]
+    return None
 
 
 # ---- resolution (v1.3 §9) -------------------------------------------------------------------------
@@ -238,12 +268,12 @@ def resolve_owner(
         notes.append("CODEOWNERS unavailable; file-based ownership skipped")
     else:
         suspected = _dedupe(_trusted_analysis_files(analysis) + _diagnosis_files(summary))
-        owners = _union(suspected[:MAX_SUSPECTED_PATHS], rules, workspace, known)
+        owners = _union(suspected[:MAX_SUSPECTED_PATHS], rules, workspace, known, notes)
         if owners:
             return OwnerResolution(_cap(owners), "codeowners_suspected", notes)
         if known:
             notes.append("changes.files carry no change counts; used in listed order")
-            owners = _union(_dedupe(known)[:MAX_CHANGED_PATHS], rules, workspace, known)
+            owners = _union(_dedupe(known)[:MAX_CHANGED_PATHS], rules, workspace, known, notes)
             if owners:
                 return OwnerResolution(_cap(owners), "codeowners_changes", notes)
 
@@ -279,10 +309,16 @@ def _diagnosis_files(summary: Any) -> list[str]:
     return list(diag.suspected_files or []) if diag is not None else []
 
 
-def _union(paths: list[str], rules: list[OwnerRule], workspace: str | None, known: list[str]) -> list[str]:
+def _union(
+    paths: list[str],
+    rules: list[OwnerRule],
+    workspace: str | None,
+    known: list[str],
+    notes: list[str] | None = None,
+) -> list[str]:
     owners: list[str] = []
     for path in paths:
-        match = resolve_path_owners(path, rules, workspace=workspace, known_files=known)
+        match = resolve_path_owners(path, rules, workspace=workspace, known_files=known, notes=notes)
         if match is None:
             continue
         owners.extend(match.owners)  # an explicitly unowned match adds nothing

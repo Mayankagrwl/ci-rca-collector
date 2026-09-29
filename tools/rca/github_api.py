@@ -377,11 +377,19 @@ class GitHubClient:
         return response.content
 
     def get_file(
-        self, repo: str, path: str, ref: str, *, allow_empty: bool = False
+        self,
+        repo: str,
+        path: str,
+        ref: str,
+        *,
+        allow_empty: bool = False,
+        meta: dict[str, Any] | None = None,
     ) -> str | None:
         """Fetch a file at *ref*. 404/403 return None; never raises for those.
 
         An existing empty file is ``None`` too unless ``allow_empty`` (then ``""``).
+        Files over 1 MB come back with ``content: ""`` (``encoding: "none"``): that is
+        ``None``, never an empty file, and ``meta["too_large"]`` is set when given.
         """
         quoted = quote(path.lstrip("/"), safe="/")
         url = f"repos/{repo}/contents/{quoted}?ref={quote(str(ref), safe='')}"
@@ -405,6 +413,10 @@ class GitHubClient:
         if payload.get("type") and payload.get("type") != "file":
             return None
         content = payload.get("content")
+        if content == "" and (payload.get("encoding") == "none" or (payload.get("size") or 0) > 0):
+            if meta is not None:
+                meta["too_large"] = True
+            return None
         if allow_empty and content == "":
             return ""
         if not isinstance(content, str) or not content.strip():

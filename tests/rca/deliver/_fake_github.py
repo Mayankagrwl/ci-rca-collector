@@ -68,13 +68,21 @@ class FakeGitHub:
     tags: set[str] = field(default_factory=set)
     runs: list[dict[str, Any]] = field(default_factory=list)
     page_size: int = 100
-    start: datetime = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
+    # Stamps start 6h before real "now": old enough to be outside any quiet window,
+    # recent enough for stale-sweep maths; tests seed explicit times when they care.
+    start: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=6)
+    )
     issue_comments: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     commit_comments: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     labels: dict[int, list[str]] = field(default_factory=dict)
     issues: dict[int, dict[str, Any]] = field(default_factory=dict)
     # Repo files served by the contents API: {(path, ref): text}; ref None = any ref.
     files: dict[tuple[str, str | None], str] = field(default_factory=dict)
+    # Paths the contents API reports as over 1 MB (content "", encoding "none").
+    large_files: set[str] = field(default_factory=set)
+    # When set, POST .../assignees silently drops logins outside it (like GitHub).
+    assignable: set[str] | None = None
     requests: list[Recorded] = field(default_factory=list)
     faults: list[Fault] = field(default_factory=list)
     # Called after each request is served (e.g. to simulate a concurrent run).
@@ -196,6 +204,10 @@ class FakeGitHub:
                 return httpx.Response(201, json=comment)
         if method == "GET" and (m := re.fullmatch(r"/contents/(.+)", rest)):
             ref = parse_qs(request.url.query.decode()).get("ref", [None])[0]
+            if m[1] in self.large_files:
+                return httpx.Response(
+                    200, json={"type": "file", "encoding": "none", "content": "", "size": 2_000_000}
+                )
             text = self.files.get((m[1], ref), self.files.get((m[1], None)))
             if text is None:
                 return _not_found()
@@ -206,6 +218,8 @@ class FakeGitHub:
             if issue is None:
                 return _not_found()
             for login in body.get("assignees", []):
+                if self.assignable is not None and login not in self.assignable:
+                    continue
                 if login not in [a["login"] for a in issue["assignees"]]:
                     issue["assignees"].append({"login": login})
             return httpx.Response(201, json=dict(issue))
