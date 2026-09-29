@@ -71,9 +71,13 @@ class FakeGitHub:
     issue_comments: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     commit_comments: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     labels: dict[int, list[str]] = field(default_factory=dict)
+    issues: dict[int, dict[str, Any]] = field(default_factory=dict)
     requests: list[Recorded] = field(default_factory=list)
     faults: list[Fault] = field(default_factory=list)
+    # Called after each request is served (e.g. to simulate a concurrent run).
+    after_request: list[Any] = field(default_factory=list)
     _next_id: int = 1000
+    _next_issue: int = 100
     _ticks: int = 0
 
     # ---- client ----------------------------------------------------------------------
@@ -101,6 +105,39 @@ class FakeGitHub:
         self.commit_comments.setdefault(sha, []).append(comment)
         return comment
 
+    def seed_issue(
+        self,
+        title: str,
+        body: str,
+        *,
+        labels: list[str],
+        state: str = "open",
+        number: int | None = None,
+    ) -> dict[str, Any]:
+        if number is None:
+            self._next_issue += 1
+            number = self._next_issue
+        stamp = self._stamp()
+        issue = {
+            "number": number,
+            "title": title,
+            "body": body,
+            "state": state,
+            "labels": [{"name": name} for name in labels],
+            "html_url": f"{WEB}/acme/widgets/issues/{number}",
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+        self.issues[number] = issue
+        self._next_issue = max(self._next_issue, number)
+        return issue
+
+    def issue_comments_on(self, number: int) -> list[str]:
+        return [c["body"] for c in self.issue_comments.get(number, [])]
+
+    def search_calls(self) -> list[Recorded]:
+        return [r for r in self.requests if r.path.startswith("/search")]
+
     # ---- transport ---------------------------------------------------------------------
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -114,6 +151,8 @@ class FakeGitHub:
         if fault is not None and fault.status is not None:
             return httpx.Response(fault.status, json={"message": f"fake {fault.status}"})
         response = self._route(request, body)
+        for hook in list(self.after_request):
+            hook(self, self.requests[-1])
         if fault is not None and fault.lost_response:
             raise httpx.ReadTimeout("fake timeout after write", request=request)
         return response
@@ -128,6 +167,8 @@ class FakeGitHub:
         return None
 
     def _route(self, request: httpx.Request, body: Any) -> httpx.Response:
+        if request.url.path.startswith("/search"):
+            return httpx.Response(200, json={"total_count": 0, "items": []})
         match = _REPO_PATH.match(request.url.path)
         if not match:
             return _not_found()
@@ -149,6 +190,26 @@ class FakeGitHub:
                 comment = self._new_comment(body["body"], f"{WEB}/acme/widgets/pull/{m[1]}", "bot")
                 items.append(comment)
                 return httpx.Response(201, json=comment)
+        if rest == "/issues":
+            if method == "GET":
+                return self._list_issues(request)
+            if method == "POST":
+                issue = self.seed_issue(body["title"], body.get("body") or "", labels=body.get("labels") or [])
+                return httpx.Response(201, json=dict(issue))
+        if m := re.fullmatch(r"/issues/(\d+)", rest):
+            issue = self.issues.get(int(m[1]))
+            if issue is None:
+                return _not_found()
+            if method == "GET":
+                return httpx.Response(200, json=dict(issue))
+            if method == "PATCH":
+                for key in ("title", "body", "state"):
+                    if key in body:
+                        issue[key] = body[key]
+                if "labels" in body:
+                    issue["labels"] = [{"name": n} for n in body["labels"]]
+                issue["updated_at"] = self._stamp()
+                return httpx.Response(200, json=dict(issue))
         if method == "PATCH" and (m := re.fullmatch(r"/issues/comments/(\d+)", rest)):
             return self._patch(self.issue_comments, int(m[1]), body)
         if m := re.fullmatch(r"/commits/([^/]+)/comments", rest):
@@ -168,6 +229,18 @@ class FakeGitHub:
                     current.append(label)
             return httpx.Response(200, json=[{"name": name} for name in current])
         return _not_found()
+
+    def _list_issues(self, request: httpx.Request) -> httpx.Response:
+        query = parse_qs(request.url.query.decode())
+        wanted = [x for x in query.get("labels", [""])[0].split(",") if x]
+        state = query.get("state", ["open"])[0]
+        items = [
+            i
+            for i in sorted(self.issues.values(), key=lambda i: -i["number"])  # newest first
+            if (state == "all" or i["state"] == state)
+            and all(name in [l["name"] for l in i["labels"]] for name in wanted)
+        ]
+        return self._page(request, items)
 
     def _page(self, request: httpx.Request, items: list[dict[str, Any]]) -> httpx.Response:
         query = parse_qs(request.url.query.decode())

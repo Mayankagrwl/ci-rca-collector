@@ -100,6 +100,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "cache-keys":
             return _cmd_cache_keys(args)
         if args.cmd == "deliver":
+            if getattr(args, "migrate_history", False):
+                return _cmd_migrate_history(args)
+            if not args.summary:
+                parser.error("deliver requires --summary (or --migrate-history)")
             return _cmd_deliver(args)
         parser.error(f"unknown command {args.cmd}")
     except Exception as exc:  # noqa: BLE001 — collector must not fail the workflow
@@ -234,7 +238,7 @@ def _build_parser() -> argparse.ArgumentParser:
     keys.add_argument("--repository", default=None, help="owner/repo")
 
     deliver = sub.add_parser("deliver", parents=[parent])
-    deliver.add_argument("--summary", required=True, help="path to summary.json")
+    deliver.add_argument("--summary", default=None, help="path to summary.json")
     deliver.add_argument("--analysis", default=None, help="path to analysis.json")
     deliver.add_argument("--out", default="rca", help="directory for delivery-preview.md")
     deliver.add_argument(
@@ -262,6 +266,13 @@ def _build_parser() -> argparse.ArgumentParser:
     deliver.add_argument("--quiet-window-minutes", type=int, default=None)
     deliver.add_argument("--platform-team", default=None)
     deliver.add_argument("--default-notify", default=None)
+    deliver.add_argument(
+        "--migrate-history",
+        action="store_true",
+        help="one-shot: create issues for cache-history fingerprints not yet tracked",
+    )
+    deliver.add_argument("--history-dir", default=".rca-history", help="cache history directory")
+    deliver.add_argument("--migrate-limit", type=int, default=50, help="max issues created per run")
     return parser
 
 
@@ -716,7 +727,9 @@ COMMENT_BEGIN = "<!-- BEGIN RCA COMMENT BODY (posted verbatim) -->"
 COMMENT_END = "<!-- END RCA COMMENT BODY -->"
 _DRY_RUN_NOTE = "dry run: nothing posted (pass --live to post)"
 _FLAKY_LABEL = "ci:flaky"
-_ISSUES_PENDING = "pending Step 16"
+_OWNER_PENDING = "assignees: none (owner resolution is Step 17)"
+_MIGRATE_PACE_S = 1.0  # GitHub secondary rate limit on content creation
+_MIGRATION_REPORT_FILE = "history-migration.md"
 _DELIVERY_TIMEOUT_S = 15
 _DELIVERY_INPUT_FLAGS = (
     "comment_on_pr",
@@ -756,6 +769,11 @@ class _OfflineClient:
 def _delivery_clock() -> float:
     """Wall-clock for the 30s delivery budget. Test hook: monkeypatch to a fake clock."""
     return time.monotonic()
+
+
+def _migrate_sleep(seconds: float) -> None:
+    """Pacing between migration creates. Test hook: monkeypatch to record instead of sleep."""
+    time.sleep(seconds)
 
 
 def _delivery_client(args: argparse.Namespace) -> GitHubClient:
@@ -862,6 +880,7 @@ def _cmd_deliver(args: argparse.Namespace) -> int:
         suppressed_by=outcome.get("suppressed_by"),
         delivered_to=list(outcome.get("delivered_to", [])),
         comment_url=outcome.get("comment_url"),
+        issue_url=outcome.get("issue_url"),
         dry_run=not live,
         errors=errors,
         notes=notes,
@@ -957,6 +976,20 @@ def _plan_delivery(
             "live": live,
             "delivered_to": [],
         }
+        # The issue goes first so the comment footer can say "tracked in #N".
+        _deliver_issue(
+            outcome,
+            summary=summary,
+            record=record,
+            inputs=inputs,
+            client=client,
+            repo=repo or "",
+            online=not isinstance(client, _OfflineClient),
+            now=now,
+            budget=budget,
+            notes=notes,
+            errors=errors,
+        )
         _deliver_comment(
             outcome,
             summary=summary,
@@ -974,6 +1007,170 @@ def _plan_delivery(
         if closer is not None:
             closer.close()
     return outcome
+
+
+def _deliver_issue(
+    outcome: dict[str, Any],
+    *,
+    summary: Summary,
+    record: Any,
+    inputs: Any,
+    client: Any,
+    repo: str,
+    online: bool,
+    now: datetime,
+    budget: Any,
+    notes: list[str],
+    errors: list[str],
+) -> None:
+    """Open / maintain the fingerprint issue (v1.3 §8.2). Never blocks the comment."""
+    from .deliver.issues import (
+        IssuesHistoryStore,
+        default_labels,
+        record_from_summary,
+        recurrence_comment,
+    )
+    from .deliver.render_comment import card_headline
+    from .deliver.suppress import evaluate
+
+    context = outcome["context"]
+    live = outcome["live"]
+    decision = evaluate(summary, record, context, inputs, existing=None, now=now)
+    if not outcome.get("open_issue"):
+        outcome["issue_action"] = "none (policy)"
+        return
+    if decision.suppressed_by is not None:
+        outcome["issue_action"] = f"none (suppressed by {decision.suppressed_by})"
+        return
+    if not online:
+        outcome["issue_action"] = "would create or update (not looked up)"
+        return
+    store = None
+    try:
+        headline, fix = card_headline(summary, record, decision)
+        failure = record_from_summary(summary, headline, now)
+        store = IssuesHistoryStore(
+            client, repo, budget=budget, clock=_delivery_clock, dry_run=not live
+        )
+        cls = summary.classification
+        result = store.sync(
+            failure,
+            labels=default_labels(
+                cls.category, infra=cls.is_infra_vs_code == "infra", flaky=bool(cls.is_flaky)
+            ),
+            fix=fix,
+            run_url=summary.run.html_url,
+            recurrence=recurrence_comment(summary, fork=context.is_fork),
+            fork=context.is_fork,
+        )
+        outcome["issue_action"] = result.action
+        if result.number is not None and result.action not in {"failed", "skipped"}:
+            outcome["issue_ref"] = result.number
+            outcome["issue_url"] = result.url
+        if result.action in {"created", "would create issue"}:
+            notes.append(_OWNER_PENDING)
+        if live:
+            outcome["delivered_to"].extend(result.delivered)
+            store.sweep_stale(now, exclude={result.number} if result.number else set())
+    except Exception as exc:  # noqa: BLE001 — an issue failure never blocks the comment
+        _LOG.exception("issue delivery failed")
+        errors.append(f"issue delivery failed: {_first_line(exc)}")
+        outcome["issue_action"] = "failed"
+        outcome["issue_write_failed"] = True
+    finally:
+        if store is not None:
+            store.close()
+            notes.extend(store.notes)
+            errors.extend(store.errors)
+            outcome["issue_write_failed"] = outcome.get("issue_write_failed") or store.write_failed
+
+
+def _issue_line(outcome: dict[str, Any]) -> str:
+    action = outcome.get("issue_action") or "none"
+    ref = outcome.get("issue_ref")
+    if ref is None:
+        return action
+    url = outcome.get("issue_url")
+    return f"{action} — #{ref}" + (f" ({url})" if url else "")
+
+
+def _cmd_migrate_history(args: argparse.Namespace) -> int:
+    """One-shot: create issues for cache fingerprints not yet tracked (v1.3 §8.1).
+
+    Idempotent by fingerprint; paced; capped by --migrate-limit; read-only on the
+    cache directory. Without --live it only lists what would be created.
+    """
+    import math
+
+    from .deliver.issues import IssuesHistoryStore, default_labels
+    from .deliver.sticky import DeliveryBudget
+    from .history import CacheHistoryStore
+
+    out = Path(args.out)
+    live = bool(args.live) and not args.offline and not args.dry_run
+    lines = [
+        "# RCA history migration" + (" (LIVE)" if live else " (dry run)"),
+        "",
+    ]
+    errors: list[str] = []
+    try:
+        root = Path(args.history_dir)
+        repo = args.repo or (os.environ.get("GITHUB_REPOSITORY") or "").strip() or None
+        if not root.is_dir():  # never create it: the cache store would mkdir
+            lines.append(f"- history dir {root} not found; nothing to migrate")
+        else:
+            records = sorted(
+                CacheHistoryStore(root).all_records(), key=lambda r: (r.first_seen, r.fingerprint)
+            )
+            lines.append(f"- cache records: {len(records)}")
+            if args.offline or not repo:
+                why = "offline" if args.offline else "no repository (--repo / GITHUB_REPOSITORY)"
+                lines.append(f"- not looked up ({why}); nothing created")
+            else:
+                client = _delivery_client(args)
+                store = IssuesHistoryStore(
+                    client,
+                    repo,
+                    budget=DeliveryBudget(started_at=0.0, seconds=math.inf),  # pacing, not budget
+                    clock=_delivery_clock,
+                    dry_run=not live,
+                )
+                try:
+                    created = 0
+                    for rec in records:
+                        short = rec.fingerprint[:12]
+                        if store.get(rec.fingerprint) is not None:
+                            lines.append(f"- {short}: already tracked; left untouched")
+                            continue
+                        if created >= args.migrate_limit:
+                            lines.append(
+                                f"- limit {args.migrate_limit} reached; re-run to continue"
+                            )
+                            break
+                        if live and created > 0:
+                            _migrate_sleep(_MIGRATE_PACE_S)
+                        result = store.sync(rec, labels=default_labels(rec.category))
+                        ref = f" #{result.number}" if result.number is not None else ""
+                        lines.append(f"- {short}: {result.action}{ref}")
+                        if result.action in {"created", "would create issue"}:
+                            created += 1
+                finally:
+                    store.close()
+                    client.close()
+                lines += [f"- note: {n}" for n in store.notes]
+                errors += store.errors
+    except Exception as exc:  # noqa: BLE001 — never fail the workflow
+        _LOG.exception("history migration failed")
+        errors.append(f"migration failed: {_first_line(exc)}")
+    lines += [f"- error: {e}" for e in errors]
+    text = "\n".join(lines) + "\n"
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / _MIGRATION_REPORT_FILE).write_text(text, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        _LOG.exception("failed to write migration report")
+    sys.stdout.write(text)
+    return 1 if (args.strict and errors) else 0
 
 
 def _deliver_comment(
@@ -1041,7 +1238,9 @@ def _deliver_comment(
             notes.append("existing comments not looked up (no API access)")
         decision = evaluate(summary, record, context, inputs, existing=existing, now=now)
         try:
-            body = render_comment(summary, record, context, decision)
+            body = render_comment(
+                summary, record, context, decision, issue_ref=outcome.get("issue_ref")
+            )
         except Exception as exc:  # noqa: BLE001 — the preview/report still get written
             _LOG.exception("comment rendering failed")
             errors.append(f"comment rendering failed: {_first_line(exc)}")
@@ -1100,6 +1299,7 @@ def _deliver_comment(
                 write_failed = True
 
     suppressed_by = decision.suppressed_by
+    write_failed = write_failed or bool(outcome.get("issue_write_failed"))
     if suppressed_by is None and live and write_failed and not delivered:
         suppressed_by = SUPPRESSED_DELIVERY_ERROR  # A5: a write was attempted, nothing landed
     outcome.update(
@@ -1152,8 +1352,8 @@ def _delivery_preview(report: Any, outcome: dict[str, Any]) -> str:
             "",
             "- job summary: yes (written by collect)",
             f"- comment: {comment}",
-            f"- issue policy: {plan.issue or 'none'} · would open an issue: {issue}"
-            + (f" ({_ISSUES_PENDING})" if outcome.get("open_issue") else ""),
+            f"- issue policy: {plan.issue or 'none'} · would open an issue: {issue}",
+            f"- issue: {_issue_line(outcome)}",
             f"- notify intent: {', '.join(plan.notify) or 'none'} "
             "(channels are decided in Step 18)",
         ]

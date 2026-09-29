@@ -126,15 +126,17 @@ def test_different_fingerprint_creates_a_second_comment(tmp_path, fake) -> None:
 
 
 def test_push_default_commit_comment_and_edit(tmp_path, fake) -> None:  # AC #3
+    # Step 16: push_default now also opens its issue first (was "pending Step 16"),
+    # so only the commit-comment writes are asserted here; issues are in test_deliver_issues.
     summary = _stage(tmp_path, event="push", branch="main", pr=None)
     assert _run(summary, "--live") == 0
-    assert _delivery(summary)["delivered_to"] == ["commit_comment"]
+    assert _delivery(summary)["delivered_to"] == ["issue:created", "commit_comment"]
     assert len(fake.commit_comments[SHA]) == 1
-    text = _preview(summary)
-    assert "would open an issue: yes (pending Step 16)" in text
+    assert "would open an issue: yes" in _preview(summary)
     summary = _stage(tmp_path, event="push", branch="main", pr=None, seen=3)
     assert _run(summary, "--live") == 0
-    assert [(r.method, r.path.rsplit("/", 2)[-2]) for r in fake.writes()] == [
+    commit_writes = [r for r in fake.writes() if "/commits/" in r.path or re.search(r"/comments/\d+$", r.path)]
+    assert [(r.method, r.path.rsplit("/", 2)[-2]) for r in commit_writes] == [
         ("POST", SHA),
         ("PATCH", "comments"),
     ]

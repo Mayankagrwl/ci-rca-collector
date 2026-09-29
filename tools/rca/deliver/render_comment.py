@@ -81,7 +81,9 @@ def render_comment(
     record: AnalysisRecord | None,
     context: DeliveryContext,
     decision: SuppressionDecision,
+    issue_ref: int | None = None,
 ) -> str:
+    """The comment body. ``issue_ref`` adds "tracked in #N"; without it the output is unchanged."""
     fork = bool(context.is_fork)
     headline, fix, confidence, needs_review = _headline(summary, record, decision)
 
@@ -107,10 +109,11 @@ def render_comment(
         head.extend(["", f"**Suggested fix** — {prose(fix, MAX_FIX_CHARS)}"])
 
     seen = (summary.history.seen_count if summary.history is not None else 0) + 1
+    tracked = f"tracked in #{int(issue_ref)} · " if issue_ref is not None else ""
     footer = [
         "",
         "---",
-        f"<sub>Seen {seen}× · [full report]({summary.run.html_url}) · "
+        f"<sub>Seen {seen}× · {tracked}[full report]({summary.run.html_url}) · "
         "reply `/resolved <what fixed it>`</sub>",
     ]
 
@@ -120,6 +123,30 @@ def render_comment(
 
 
 # ---- headline (v1.3 §7.1) -----------------------------------------------------
+
+
+def card_headline(
+    summary: Summary, record: AnalysisRecord | None, decision: SuppressionDecision
+) -> tuple[str | None, str | None]:
+    """(headline, fix) exactly as the comment would state them (v1.3 §7.1); raw, unescaped.
+
+    ``None`` headline when the root cause is omitted (confidence below threshold).
+    """
+    headline, fix, _confidence, _needs_review = _headline(summary, record, decision)
+    return headline, fix
+
+
+def safe_text(text: str | None, limit: int, *, fork: bool = False) -> str:
+    """One line of model/log-derived prose made safe for any GitHub channel.
+
+    Redacted first, @mentions and rule ids defused, clipped, HTML-escaped for forks.
+    """
+    return _prose(text, limit, fork=fork)
+
+
+def fence_for(lines: list[str]) -> str:
+    """A code fence longer than any backtick run inside ``lines``."""
+    return _fence(lines)
 
 
 def _headline(
@@ -295,9 +322,12 @@ __all__ = [
     "CATEGORY_WORDS",
     "MAX_BODY_CHARS",
     "UNVERIFIED_BANNER",
+    "card_headline",
     "category_words",
+    "fence_for",
     "evidence_lines",
     "marker",
     "marker_line",
     "render_comment",
+    "safe_text",
 ]

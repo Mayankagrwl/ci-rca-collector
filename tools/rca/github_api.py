@@ -578,6 +578,13 @@ class GitHubClient:
         )
         return self._json_object(response, "create issue")
 
+    def get_issue(self, repo: str, number: int) -> dict[str, Any] | None:
+        """One issue by number (read-only). 404 → None."""
+        response = self._request("GET", f"repos/{repo}/issues/{int(number)}")
+        if response.status_code == 404:
+            return None
+        return self._json_object(response, f"fetch issue #{number}")
+
     def update_issue(self, repo: str, number: int, **fields: Any) -> dict[str, Any]:
         payload = {key: value for key, value in fields.items() if value is not None}
         response = self._request("PATCH", f"repos/{repo}/issues/{number}", json=payload)
