@@ -43,9 +43,14 @@ jobs:
         run: python -m tools.eval.check_goldens_redacted --goldens tools/eval/goldens
 
       - name: Run eval
+        env:
+          RCA_EVAL_RUNS: ${{ github.event.inputs.runs || '3' }}
         run: |
           set -euo pipefail
-          RUNS="${{ github.event.inputs.runs || '3' }}"
+          RUNS=3
+          if [[ "$RCA_EVAL_RUNS" =~ ^[0-9]+$ ]] && [ "$RCA_EVAL_RUNS" -gt 0 ]; then
+            RUNS="$RCA_EVAL_RUNS"
+          fi
           EXTRA=()
           if [ -z "${STGPT_API:-}" ]; then
             # No LLM creds available → deterministic-only run (network-free).

@@ -144,17 +144,16 @@ def test_history_backend_description_is_honest() -> None:
 
 
 def _all_workflow_docs() -> dict[str, Any]:
-    # AC #18 scope: the action, the reusable workflow, the self-test and the examples.
+    # Step 19b: every file in .github/workflows/ and docs/examples/, not a fixed list.
     docs = {"action.yml": ACTION}
-    workflows = ROOT / ".github" / "workflows"
-    for path in [workflows / "rca.yml", workflows / "self-test.yml", *EXAMPLES.glob("*.yml")]:
+    for path in [*(ROOT / ".github" / "workflows").glob("*.y*ml"), *EXAMPLES.glob("*.y*ml")]:
         docs[str(path.relative_to(ROOT))] = yaml.safe_load(path.read_text(encoding="utf-8"))
     return docs
 
 
 def test_no_expression_inside_any_run_body() -> None:
     docs = _all_workflow_docs()
-    assert len(docs) >= 6
+    assert len(docs) >= 7 and ".github/workflows/eval.yml".replace("/", os.sep) in docs
     for name, doc in docs.items():
         for body in _runs(doc):
             assert "${{" not in body, f"{name}: {body[:80]}"
@@ -179,7 +178,7 @@ def test_secrets_reach_the_script_only_as_masked_env() -> None:
 
 def test_deliver_env_resolves_host_like_collect() -> None:
     collect, deliver = STEPS["Run collector"]["env"], STEPS["Deliver"]["env"]
-    for key in ("GITHUB_TOKEN", "COMMON_ACTIONS_PAT", "GITHUB_API_URL", "GITHUB_SERVER_URL",
+    for key in ("GITHUB_TOKEN", "GITHUB_API_URL", "GITHUB_SERVER_URL",
                 "RCA_GITHUB_API_URL", "RCA_GITHUB_HOST", "PYTHONPATH", "RCA_SSL_VERIFY",
                 "RCA_SSL_CERT_FILE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
         assert deliver[key] == collect[key], key
@@ -354,9 +353,10 @@ def test_migrate_example_reuses_the_history_key_scheme() -> None:
         assert line in rca_raw and line in raw
     assert doc["permissions"] == {"issues": "write"}
     assert set(_on(doc)["workflow_dispatch"]["inputs"]) == {"workflow-name", "live"}
-    migrate = doc["jobs"]["migrate"]["steps"][-1]
+    steps = {step["name"]: step for step in doc["jobs"]["migrate"]["steps"]}
+    migrate = steps["Migrate"]
     assert migrate["with"]["mode"] == "migrate-history"
-    restore = doc["jobs"]["migrate"]["steps"][1]
+    restore = steps["Restore fingerprint history"]
     assert restore["with"]["path"] == ".rca-history/"
 
 
@@ -397,3 +397,71 @@ def test_agents_and_readme_sections() -> None:
     for name in ("rca-consumer.yml", "rca-feedback.yml", "rca-migrate.yml"):
         assert name in readme
     assert "Inferred resolution" in readme and "concurrent_" in readme
+
+
+# ---- Step 19b ----------------------------------------------------------------------------------------------
+
+
+WRITE_MODE_STEPS = ("Deliver", "Feedback", "Migrate history")
+
+
+@pytest.mark.parametrize("name", WRITE_MODE_STEPS)
+def test_write_modes_use_the_job_token_never_the_org_pat(name: str) -> None:  # fix 1
+    step = STEPS[name]
+    assert step["env"]["RCA_GITHUB_TOKEN"] == "${{ inputs.github-token }}"
+    assert "COMMON_ACTIONS_PAT" not in step["env"]
+    assert "COMMON_ACTIONS_PAT" not in json.dumps(step)
+    assert "job's permissions" in " ".join(ACTION["inputs"]["github-token"]["description"].split())
+
+
+def test_collect_still_passes_the_pat_unchanged() -> None:  # fix 1: collect untouched
+    old = next(step for step in PRE19["steps"] if step["name"] == "Run collector")
+    assert STEPS["Run collector"]["env"] == old["env"]
+    assert "RCA_GITHUB_TOKEN" not in STEPS["Run collector"]["env"]
+
+
+def test_migrate_example_restores_exact_key_only() -> None:  # fix 2
+    raw = (EXAMPLES / "rca-migrate.yml").read_text(encoding="utf-8")
+    doc = yaml.safe_load(raw)
+    steps = {step["name"]: step for step in doc["jobs"]["migrate"]["steps"]}
+    restore = steps["Restore fingerprint history"]
+    assert restore["uses"] == "actions/cache/restore@v4"
+    assert restore["id"] == "restore"
+    assert restore["with"]["key"] == "${{ steps.keys.outputs.history-cache-key }}"
+    assert "restore-keys" not in restore["with"]
+    assert "actions/cache@v4" not in [step.get("uses") for step in doc["jobs"]["migrate"]["steps"]]
+    assert steps["Migrate"]["if"] == "steps.restore.outputs.cache-hit == 'true'"
+    miss = steps["No history cache"]
+    assert miss["if"] == "steps.restore.outputs.cache-hit != 'true'"
+    assert miss["env"] == {"WF": "${{ inputs.workflow-name }}"}
+    assert "nothing to migrate" in miss["run"] and "$WF" in miss["run"]
+    assert "without actions/cache/restore" in raw  # the GHES note
+
+
+def test_rca_upload_overwrites_on_rerun() -> None:  # fix 3
+    upload = RCA["jobs"]["collect"]["steps"][-1]
+    assert upload["uses"] == "actions/upload-artifact@v4"
+    assert upload["with"]["overwrite"] is True
+
+
+def test_eval_runs_input_via_env_and_validated() -> None:  # fix 5
+    doc = yaml.safe_load((ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"))
+    step = next(st for job in doc["jobs"].values() for st in job["steps"] if st.get("name") == "Run eval")
+    assert step["env"]["RCA_EVAL_RUNS"] == "${{ github.event.inputs.runs || '3' }}"
+    assert '[[ "$RCA_EVAL_RUNS" =~ ^[0-9]+$ ]]' in step["run"]
+    assert "${{" not in step["run"]
+
+
+@pytestmark_bash
+@pytest.mark.parametrize(("value", "runs"), [("5", "5"), ("", "3"), ("0", "3"), ("3; rm -rf /", "3"), ("abc", "3")])
+def test_eval_runs_validation(tmp_path, value, runs) -> None:  # fix 5, executed
+    doc = yaml.safe_load((ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"))
+    body = next(st for job in doc["jobs"].values() for st in job["steps"] if st.get("name") == "Run eval")["run"]
+    script = tmp_path / "eval.sh"
+    script.write_text(
+        'python() { :; }\n' + body.replace('python -m tools.eval.run_eval', 'echo "RUNS=$RUNS"; python'),
+        encoding="utf-8", newline="\n",
+    )
+    env = {**os.environ, "RCA_EVAL_RUNS": value, "STGPT_API": "set"}
+    out = subprocess.run([BASH, str(script).replace("\\", "/")], env=env, capture_output=True, text=True, check=True)
+    assert f"RUNS={runs}" in out.stdout

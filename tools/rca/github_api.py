@@ -7,6 +7,7 @@ import logging
 import ssl
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -32,6 +33,14 @@ _MAX_LIST_PAGES = 10
 _REACTIONS_ACCEPT = (
     "application/vnd.github.squirrel-girl-preview+json, application/vnd.github+json"
 )
+
+
+@dataclass(frozen=True)
+class CollaboratorPermission:
+    """``role_name`` may be a custom role (e.g. ``dev-write``); ``permission`` is its base level."""
+
+    role_name: str | None
+    permission: str | None
 
 
 class GitHubAPIError(Exception):
@@ -604,15 +613,17 @@ class GitHubClient:
             return None
         return self._json_object(response, f"fetch issue #{number}")
 
-    def get_collaborator_permission(self, repo: str, username: str) -> str | None:
-        """A user's role on the repo (read-only). ``role_name`` or ``permission``; 404 → None."""
+    def get_collaborator_permission(
+        self, repo: str, username: str
+    ) -> CollaboratorPermission | None:
+        """A user's role on the repo (read-only): both ``role_name`` and ``permission``; 404 → None."""
         url = f"repos/{repo}/collaborators/{quote(username, safe='')}/permission"
         response = self._request("GET", url)
         if response.status_code == 404:
             return None
         payload = self._json_object(response, f"collaborator permission for {username}")
-        value = payload.get("role_name") or payload.get("permission")
-        return str(value) if value else None
+        role, base = payload.get("role_name"), payload.get("permission")
+        return CollaboratorPermission(str(role) if role else None, str(base) if base else None)
 
     def add_assignees(self, repo: str, number: int, assignees: list[str]) -> dict[str, Any]:
         """Add assignees to an issue (additive; never removes existing ones)."""

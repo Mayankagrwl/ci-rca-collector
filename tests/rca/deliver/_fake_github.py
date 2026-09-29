@@ -208,10 +208,13 @@ class FakeGitHub:
                 items.append(comment)
                 return httpx.Response(201, json=comment)
         if method == "GET" and (m := re.fullmatch(r"/collaborators/([^/]+)/permission", rest)):
-            role = self.permissions.get(m[1])
-            if role is None:
+            entry = self.permissions.get(m[1])
+            if entry is None:
                 return _not_found()
-            legacy = {"maintain": "write", "triage": "read"}.get(role, role)
+            # A plain role maps to its base level; a (role_name, permission) tuple is a custom role.
+            role, legacy = entry if isinstance(entry, tuple) else (
+                entry, {"maintain": "write", "triage": "read"}.get(entry, entry)
+            )
             return httpx.Response(200, json={"permission": legacy, "role_name": role})
         if method == "GET" and (m := re.fullmatch(r"/contents/(.+)", rest)):
             ref = parse_qs(request.url.query.decode()).get("ref", [None])[0]

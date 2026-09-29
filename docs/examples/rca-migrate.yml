@@ -50,18 +50,31 @@ jobs:
             echo "history-cache-restore-key=rca-history-${repo}-"
           } >> "$GITHUB_OUTPUT"
 
+      # Restore ONLY, with the EXACT key and no restore-keys: a prefix fallback would
+      # restore another workflow's history, and a post-job save would then store it
+      # under this workflow's key, poisoning the cache rca.yml's collect job restores.
+      # GHES mirrors without actions/cache/restore: use actions/cache@v4 with the same
+      # exact key and NO restore-keys, and accept the post-job save of the unchanged cache.
       - name: Restore fingerprint history
-        uses: actions/cache@v4
+        id: restore
+        uses: actions/cache/restore@v4
         with:
           path: .rca-history/
           key: ${{ steps.keys.outputs.history-cache-key }}
-          restore-keys: |
-            ${{ steps.keys.outputs.history-cache-restore-key }}
 
       - name: Migrate
+        if: steps.restore.outputs.cache-hit == 'true'
         uses: acme/ci-rca-collector@v1   # replace acme with your org
         with:
           mode: migrate-history
           history-dir: .rca-history
           migrate-limit: '50'
           deliver: ${{ inputs.live && 'true' || 'false' }}
+
+      - name: No history cache
+        if: steps.restore.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          WF: ${{ inputs.workflow-name }}
+        run: |
+          echo "no history cache for $WF; nothing to migrate" >> "$GITHUB_STEP_SUMMARY"

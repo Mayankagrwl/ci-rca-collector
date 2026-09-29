@@ -1466,17 +1466,22 @@ def _cmd_feedback(args: argparse.Namespace) -> int:
             # Private org members show up as CONTRIBUTOR / NONE: fall back to their repo role.
             client = _delivery_client(args)
             try:
-                role = client.get_collaborator_permission(repo, login)
+                perm = client.get_collaborator_permission(repo, login)
             except Exception as exc:  # noqa: BLE001 — never allow on error
-                role = None
+                perm = None
                 notes.append(f"repository permission lookup failed ({type(exc).__name__})")
-            facts["permission"] = role or "none"
-            if role and role.lower() in allowed_permissions(os.environ):
+            role = perm.role_name if perm is not None else None
+            base = perm.permission if perm is not None else None
+            shown = f"role {role or 'none'} / base {base or 'none'}"
+            facts["permission"] = shown
+            allowed = allowed_permissions(os.environ)
+            # A custom role (role_name "dev-write") counts through its base permission.
+            if any(value and value.lower() in allowed for value in (role, base)):
                 trusted = True
             else:
                 notes.append(
                     f"skipped: author association {association} and repository permission "
-                    f"{role or 'none'} may not resolve failures"
+                    f"({shown}) may not resolve failures"
                 )
         if trusted:
             facts["text"] = command.text

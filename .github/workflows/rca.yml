@@ -154,6 +154,7 @@ jobs:
           name: rca-${{ inputs.run-id }}
           path: rca/
           retention-days: 30
+          overwrite: true   # re-runs of the same run-id replace, never fail
 
   # Delivery: a separate job with write scopes. It consumes only the rca/ artifact
   # (data). Nothing from the failing run is checked out and no workspace code runs;

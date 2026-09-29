@@ -26,7 +26,9 @@ inputs:
     required: false
     default: 'collect'
   github-token:
-    description: 'Token with actions:read and contents:read.'
+    description: >-
+      Token with actions:read and contents:read. Delivery modes write with this token
+      (default: the job's GITHUB_TOKEN, limited by the job's permissions:).
     required: false
     default: ${{ github.token }}
   github-api-url:
@@ -451,7 +453,9 @@ runs:
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
-        COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}
+        # Writes use this token (RCA_GITHUB_TOKEN wins over any org PAT), so the
+        # job's permissions: block bounds what delivery can do (v1.3 §3).
+        RCA_GITHUB_TOKEN: ${{ inputs.github-token }}
         GITHUB_API_URL: ${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}
         GITHUB_SERVER_URL: ${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}
         RCA_GITHUB_API_URL: ${{ inputs.github-api-url }}
@@ -510,7 +514,9 @@ runs:
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
-        COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}
+        # Writes use this token (RCA_GITHUB_TOKEN wins over any org PAT), so the
+        # job's permissions: block bounds what delivery can do (v1.3 §3).
+        RCA_GITHUB_TOKEN: ${{ inputs.github-token }}
         GITHUB_API_URL: ${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}
         GITHUB_SERVER_URL: ${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}
         RCA_GITHUB_API_URL: ${{ inputs.github-api-url }}
@@ -541,7 +547,9 @@ runs:
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
-        COMMON_ACTIONS_PAT: ${{ env.COMMON_ACTIONS_PAT }}
+        # Writes use this token (RCA_GITHUB_TOKEN wins over any org PAT), so the
+        # job's permissions: block bounds what delivery can do (v1.3 §3).
+        RCA_GITHUB_TOKEN: ${{ inputs.github-token }}
         GITHUB_API_URL: ${{ inputs.github-api-url != '' && inputs.github-api-url || env.GITHUB_API_URL }}
         GITHUB_SERVER_URL: ${{ inputs.github-server-url != '' && inputs.github-server-url || env.GITHUB_SERVER_URL }}
         RCA_GITHUB_API_URL: ${{ inputs.github-api-url }}

@@ -32,7 +32,7 @@ def test_private_member_with_write_is_allowed(tmp_path, fake) -> None:
     issue = _resolve_as(tmp_path, fake, "CONTRIBUTOR", "--live")
     assert fake.issues[issue["number"]]["state"] == "closed"
     assert [r.path for r in _perm_calls(fake)] == ["/repos/acme/widgets/collaborators/alice/permission"]
-    assert "- permission: write" in _report(tmp_path)
+    assert "- permission: role write / base write" in _report(tmp_path)
 
 
 @pytest.mark.parametrize("role", ["maintain", "admin"])
@@ -47,13 +47,27 @@ def test_read_permission_is_refused(tmp_path, fake) -> None:
     issue = _resolve_as(tmp_path, fake, "CONTRIBUTOR", "--live")
     assert fake.issues[issue["number"]]["state"] == "open"
     assert fake.writes() == []
-    assert "repository permission read may not resolve" in _report(tmp_path)
+    assert "repository permission (role read / base read) may not resolve" in _report(tmp_path)
 
 
 def test_not_a_collaborator_404_is_refused(tmp_path, fake) -> None:
     issue = _resolve_as(tmp_path, fake, "CONTRIBUTOR", "--live")
     assert fake.issues[issue["number"]]["state"] == "open" and fake.writes() == []
-    assert "repository permission none may not resolve" in _report(tmp_path)
+    assert "repository permission (role none / base none) may not resolve" in _report(tmp_path)
+
+
+def test_custom_role_with_write_base_is_allowed(tmp_path, fake) -> None:  # Step 19b fix 4
+    fake.permissions["alice"] = ("dev-write", "write")
+    issue = _resolve_as(tmp_path, fake, "CONTRIBUTOR", "--live")
+    assert fake.issues[issue["number"]]["state"] == "closed"
+    assert "- permission: role dev-write / base write" in _report(tmp_path)
+
+
+def test_triage_with_read_base_is_refused(tmp_path, fake) -> None:  # Step 19b fix 4
+    fake.permissions["alice"] = ("triage", "read")
+    issue = _resolve_as(tmp_path, fake, "CONTRIBUTOR", "--live")
+    assert fake.issues[issue["number"]]["state"] == "open" and fake.writes() == []
+    assert "(role triage / base read) may not resolve" in _report(tmp_path)
 
 
 def test_api_error_is_refused_never_allowed(tmp_path, fake) -> None:
